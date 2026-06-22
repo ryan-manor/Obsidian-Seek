@@ -1,0 +1,18 @@
+node_modules/
+main.js
+main.js.map
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+data.json
+.idea/
+.vscode/
+
+# Local perf/diagnostic captures (powermetrics dumps, procs.tsv, build backups).
+# Kept locally for analysis; too large + throwaway to belong in history.
+captures/
+
+# Throwaway diagnostic probes / scratch HTML (e.g. lazyrelease-probe). Local-only.
+experiments/

@@ -1,0 +1,1073 @@
+/* Seek — search modal styling.
+ *
+ * Every colour, shadow, and font is sourced from an Obsidian theme variable so
+ * the modal inherits whatever theme/snippet the user runs (the redesign's
+ * theme-proof requirement). No hard-coded colours; accent tints use color-mix
+ * over --interactive-accent so they stay legible in light and dark. */
+
+/* ---- modal shell: narrow, pinned high (quick-switcher feel) ---- */
+
+.modal-container.seek-modal-container {
+    align-items: flex-start;
+}
+
+.seek-modal.modal {
+    width: min(640px, 94vw);
+    max-width: 94vw;
+    max-height: 74vh;
+    margin-top: 11vh;
+    padding: 0;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 14px;
+    box-shadow: var(--shadow-l);
+    overflow: hidden;
+}
+
+/* ---- mobile shell: full-width, keyboard-aware height ----
+ *
+ * The desktop sizing above is `vh`-based (74vh tall, pinned 11vh down). On mobile
+ * `vh` ignores the soft keyboard, so that lower half renders behind it — the
+ * results can't be seen or scrolled and the footer is buried. SeekSearchModal
+ * tags the modal `.seek-mobile` and feeds it `--seek-vvh` (window.visualViewport
+ * height = the area ABOVE the keyboard), so the whole modal lives in the visible
+ * gap: full width, pinned to the top, footer resting just above the keyboard.
+ * --seek-vvh falls back to 100vh for the first frame before the JS sets it.
+ *
+ * visualViewport.height accounts for the keyboard but NOT the status bar — on
+ * iOS the status bar overlays the top of the layout viewport (viewport-fit=cover),
+ * so margin-top:0 tucks the query row under the clock/signal icons. Shift the
+ * modal down by --seek-top (status-bar inset + a deliberate gap) to clear it, and
+ * subtract that same offset from max-height so the bottom edge stays pinned at
+ * --seek-vvh (footer just above the keyboard). env() resolves to 0 where there's
+ * no inset.
+ *
+ * --seek-mobile-gap is the extra drop below the status bar: it leaves the top of
+ * the page you came from visible behind the panel (the quick-switcher / Omnisearch
+ * "sheet" feel) instead of butting the query row against the status bar. The top
+ * corners round so the panel reads as an overlay, not a full-bleed takeover. Tune
+ * the look by changing this one value. */
+.seek-modal.seek-mobile.modal {
+    --seek-mobile-gap: 2rem;
+    --seek-top: calc(env(safe-area-inset-top, 0px) + var(--seek-mobile-gap));
+    width: 100vw;
+    max-width: 100vw;
+    margin-top: var(--seek-top);
+    border: none;
+    border-radius: 14px 14px 0 0;
+    /* overflow:hidden (base .seek-modal.modal) clips children to the rounded top */
+    max-height: calc(var(--seek-vvh, 100vh) - var(--seek-top));
+}
+
+/* ---- tablet shell: a centred wide column, not a full-bleed sheet ----
+ *
+ * Tablets are Platform.isMobile, so the rule above stretches the panel across
+ * the whole viewport — right on a phone, janky on an iPad: result rows span
+ * edge-to-edge and the snippets read too wide. SeekSearchModal adds
+ * `.seek-tablet` (Platform.isTablet) so this 4-class rule outspecifies the
+ * 3-class mobile shell and caps the width to a readable column — still wide
+ * (820px ≫ the 640px desktop modal, deliberately good for skimming snippets),
+ * just no longer wall-to-wall. It centres for free: .modal-container only
+ * overrides align-items, so justify-content stays `center`. Now that it floats
+ * clear of the screen edges, round all four corners and put the border back so
+ * it reads as a panel, not a top-pinned sheet. The keyboard-aware vertical
+ * sizing (margin-top / max-height) is inherited from the mobile rule. */
+.seek-modal.seek-mobile.seek-tablet.modal {
+    width: min(820px, 90vw);
+    max-width: 90vw;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 14px;
+}
+
+.seek-modal.seek-mobile .modal-content {
+    max-height: calc(var(--seek-vvh, 100vh) - var(--seek-top));
+}
+
+/* The footer legend is all physical-keyboard hints (↑↓ / ↵ / ⌘↵ / tab / esc) —
+   meaningless with a touch keyboard, and it steals vertical room from results.
+   Drop the hint groups on mobile but keep the "N results" count + the spacer
+   that right-aligns it. */
+.seek-modal.seek-mobile .seek-foot-grp {
+    display: none;
+}
+
+/* On a plain Modal (we're not a SuggestModal, which is why Omnisearch has no X
+   and we do) Obsidian injects its own close button — class .modal-header-button
+   from app.css, a direct child of .modal. We keep it as-is: it's a familiar
+   native affordance and esc / click-outside close too, so suppressing it earns
+   nothing. (Note for future edits: it is NOT .modal-close-button — a stale rule
+   for that class matched nothing and let the button show regardless.)
+
+   The content wrapper below becomes a flex column whose middle region (results)
+   scrolls while the footer stays pinned. */
+.seek-modal .modal-content {
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    max-height: 74vh;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* The empty .modal-header band contributes no content but its margin pushes
+   .modal-content down ~11px. Collapse it so the query row starts at the modal
+   top. The close button is a direct child of .modal (not of .modal-header), so
+   hiding the band leaves the X untouched. */
+.seek-modal .modal-header {
+    display: none;
+}
+
+/* Pin the native close button ourselves rather than inheriting the theme's
+   default top/right (which vary by theme and snippet, so the X visibly drifts).
+   12px from the top sits its 28px hit area level with the query-field glyph row
+   (.seek-q has 14px top padding); 12px from the right clears the 14px corner
+   radius. The two-class selector outspecifies app.css's single-class rule. */
+.seek-modal .modal-header-button {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    /* The query field's .seek-editwrap is a full-width positioned element that
+       paints over this button (later in the DOM, z-index:auto) and would steal
+       its clicks. Lift the button above the field content so it stays
+       hit-testable. */
+    z-index: 3;
+}
+
+/* Mobile renders .modal-header-button as a large circular tap target, so the
+   shared top:12px (tuned for the 28px desktop button) lets it hang past the
+   query-field divider — it straddled the field/results line. Center it on the
+   24px glyph row instead (.seek-q 14px top pad + 12px half-glyph = 26px) so a
+   button of any rendered size stays within the field, clear of the divider; the
+   translateY keeps it centered regardless of the mobile button's height. The
+   desktop single-class base rule above is untouched. */
+.seek-modal.seek-mobile .modal-header-button {
+    top: 26px;
+    transform: translateY(-50%);
+}
+
+/* ---- Component 1: the token/pill query field ---- */
+
+.seek-q {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    /* Inline-end padding clears the native close button (12px inset + 28px wide)
+       so pills and text never run beneath it. */
+    padding-block: 14px;
+    padding-inline: 16px 52px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    flex: 0 0 auto;
+}
+
+.seek-mag {
+    display: flex;
+    align-items: center;
+    /* Pin the glyph to the field's first text line (line-height 1.5 × 16px =
+       24px) and center the svg in it, rather than nudging with a magic
+       padding-top. A fixed 24px box self-centers any glyph size and tracks the
+       text line exactly — no per-pixel fudge to drift out of sync. */
+    height: 24px;
+    /* Model-state affordance. The glyph RESTS dimmed — its honest default is
+       "model not (yet) loaded" — and brightens to full strength only once the
+       embedder actually resolves (.is-ready). A subtle "heating up" nudge that
+       replaces the old "model loaded" toast. Driven by
+       PillQueryField.setModelReady. The ~600 ms ease softens the
+       (instantaneous) ready event into a fade rather than a flick. On a warm
+       open .is-ready is set synchronously before first paint, so it shows full
+       with no animation. */
+    color: var(--text-faint);
+    opacity: 0.55;
+    transition: color 600ms ease, opacity 600ms ease;
+}
+
+.seek-mag.is-ready {
+    color: var(--text-normal);
+    opacity: 1;
+}
+
+.seek-mag svg {
+    width: 18px;
+    height: 18px;
+    /* A touch heavier than Obsidian's default --icon-stroke (1.75) so the
+       magnifier reads as crisp as the monospace UI around it. */
+    stroke-width: 2px;
+}
+
+.seek-field {
+    position: relative;
+    flex: 1 1 auto;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    min-height: 24px;
+    font-size: 16px;
+    line-height: 1.5;
+    /* The whole row is a click target for the editable (see the field
+       mousedown handler in query-field.ts) — show the text cursor over it. */
+    cursor: text;
+}
+
+/* Committed operator pill: accent-tinted, theme-safe. */
+.seek-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 4px 1px 7px;
+    border-radius: 7px;
+    font-size: 13.5px;
+    font-weight: 500;
+    white-space: nowrap;
+    background: color-mix(in srgb, var(--interactive-accent) 13%, var(--background-primary));
+    border: 1px solid color-mix(in srgb, var(--interactive-accent) 34%, transparent);
+}
+
+.seek-pill-k {
+    color: var(--interactive-accent);
+}
+
+.seek-pill-v {
+    color: var(--text-normal);
+}
+
+.seek-pill-x {
+    all: unset;
+    cursor: pointer;
+    padding: 0 3px;
+    border-radius: 4px;
+    color: var(--text-muted);
+    line-height: 1;
+}
+
+.seek-pill-x:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
+/* A tag pill that binds to no real vault tag (exact + hierarchical). */
+.seek-pill-warn {
+    background: color-mix(in srgb, var(--text-warning, var(--text-error)) 12%, var(--background-primary));
+    border-color: var(--text-warning, var(--text-error));
+}
+
+.seek-pill-warn .seek-pill-k {
+    color: var(--text-warning, var(--text-error));
+}
+
+/* The uncontrolled contenteditable + its inline ghost + placeholder overlay. */
+.seek-editwrap {
+    position: relative;
+    flex: 1 1 80px;
+    min-width: 80px;
+    /* Hold a full text line even when the contenteditable is empty. An empty
+       inline editable collapses to height 0, and since .seek-field is
+       align-items:center that 0-height box centers on the field midline —
+       which drops the absolutely-positioned placeholder (top:0) ~12px and makes
+       the glyph look like it floated up. A one-line floor keeps the placeholder
+       and caret on the same baseline as the glyph, focused or not. */
+    min-height: 24px;
+}
+
+.seek-edit {
+    display: inline;
+    outline: none;
+    color: var(--text-normal);
+    caret-color: var(--interactive-accent);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.seek-ghost {
+    color: var(--text-faint);
+    pointer-events: none;
+    white-space: pre;
+}
+
+/* Synthetic caret — see the .seek-caret note in query-field.ts. Hidden by
+   default; shown only while the field is focused AND the editable is empty (the
+   one state the native caret can't paint, notably iOS WKWebView after a pill).
+   A 2px accent bar blinking on the text line, right where the next character
+   would land (after the pills, before any ghost). */
+.seek-caret {
+    display: none;
+    width: 2px;
+    height: 1.1em;
+    vertical-align: text-bottom;
+    margin-bottom: 1px;
+    background: var(--interactive-accent);
+    border-radius: 1px;
+}
+
+.seek-q.is-focused.is-empty-edit .seek-caret {
+    display: inline-block;
+    animation: seek-caret-blink 1.06s infinite;
+}
+
+/* A non-blinking caret is still a valid focus cue — honor reduced-motion. */
+@media (prefers-reduced-motion: reduce) {
+    .seek-q.is-focused.is-empty-edit .seek-caret { animation: none; }
+}
+
+/* While our caret is up, blank the native one so they never show together
+   (desktop DOES paint a native caret in the empty editable). The moment text or
+   a ghost appears the editable leaves is-empty-edit and the native caret — its
+   color restored by .seek-edit's own rule — takes back over. */
+.seek-q.is-focused.is-empty-edit .seek-edit {
+    caret-color: transparent;
+}
+
+@keyframes seek-caret-blink {
+    0%, 50% { opacity: 1; }
+    50.01%, 100% { opacity: 0; }
+}
+
+.seek-ph {
+    position: absolute;
+    left: 0;
+    top: 0;
+    color: var(--text-faint);
+    pointer-events: none;
+}
+
+/* Suggestion dropdown — raised panel below the field. */
+.seek-sugg {
+    position: absolute;
+    top: 100%;
+    left: 16px;
+    right: 16px;
+    z-index: 2;
+    margin: 4px 0 0;
+    padding: 4px;
+    list-style: none;
+    background: var(--background-secondary-alt, var(--background-secondary));
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 10px;
+    box-shadow: var(--shadow-l);
+    max-height: 280px;
+    overflow-y: auto;
+}
+
+/* While the dropdown is open, reserve enough modal-body height to hold it. The
+   dropdown is position:absolute (top:100% of the query row), so it adds no
+   layout height of its own — when the result set is short, .modal-content
+   collapses below the menu and its overflow:hidden clips the lower suggestions
+   (they "pile up" at the cut edge). PillQueryField.renderSugg toggles this class
+   only while the menu is shown, so the compact short/empty state is untouched
+   when it's closed. Desktop only: on mobile the keyboard already constrains the
+   height and forcing a min would bury the footer. min(…, 74vh) keeps the reserve
+   inside the modal's own cap on short viewports. */
+.seek-modal:not(.seek-mobile) .modal-content.seek-sugg-open {
+    min-height: min(380px, 74vh);
+}
+
+.seek-sugg-hint {
+    padding: 5px 10px;
+    font-size: 12px;
+    color: var(--text-faint);
+}
+
+.seek-sugg-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 13.5px;
+}
+
+.seek-sugg-item.is-active {
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+}
+
+.seek-sugg-label {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.seek-sugg-meta {
+    flex: 0 0 auto;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.seek-sugg-item.is-active .seek-sugg-meta {
+    color: var(--text-on-accent);
+    opacity: 0.8;
+}
+
+/* ---- Component 2: result list + row ---- */
+
+.seek-results {
+    position: relative; /* make it the offsetParent so row.offsetTop matches scrollTop space */
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 6px;
+}
+
+/* Non-destructive "searching" state: dim the existing results in place while
+   the next set is fetched, so a fast warm search shows no flash. */
+.seek-results.is-loading {
+    opacity: 0.55;
+    transition: opacity 80ms ease;
+}
+
+/* Cold-search skeleton: placeholder rows shown while a cold index build runs and
+   there are no existing results to dim. The shimmer sweep animates `transform`
+   only, so it runs on the compositor thread and keeps moving even when the JS main
+   thread is blocked by the cold build — what a static status line read as a freeze.
+   Un-gated by platform so the loading feel is identical on desktop and mobile. */
+.seek-skeleton {
+    pointer-events: none;
+}
+.seek-skeleton-line {
+    position: relative;
+    overflow: hidden;
+    height: 0.95em;
+    border-radius: 6px;
+    background: var(--background-modifier-border);
+}
+.seek-skeleton-title { width: 52%; }
+.seek-skeleton-path {
+    width: 78%;
+    height: 0.7em;
+    margin-top: 7px;
+    opacity: 0.65;
+}
+.seek-skeleton-line::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+        90deg,
+        transparent,
+        var(--background-modifier-hover),
+        transparent
+    );
+    animation: seek-shimmer 1.9s linear infinite;
+}
+@keyframes seek-shimmer {
+    to { transform: translateX(100%); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .seek-skeleton-line::after { animation: none; }
+}
+
+.seek-result {
+    position: relative;
+    padding: 9px 12px;
+    border-radius: 9px;
+    cursor: pointer;
+}
+
+/* Infinite-scroll tail target. Present only while more rows remain to reveal
+   (the modal removes it once the window reaches the full result set). Kept
+   visually silent — just a small layout box for the IntersectionObserver to
+   track — so it reads as "the list simply continues" rather than a control. */
+.seek-load-sentinel {
+    height: 8px;
+}
+
+/* Selection is driven by the keyboard model AND by hover (mousemove sets the
+   selected index), so a single .is-selected state covers both. */
+.seek-result.is-selected {
+    background: color-mix(in srgb, var(--interactive-accent) 15%, var(--background-primary));
+}
+
+.seek-result-top {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+
+.seek-result-title {
+    flex: 0 1 auto;
+    font-size: 14.5px;
+    font-weight: 600;
+    color: var(--text-normal);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Heading-path breadcrumb (`› Agenda › Intern pgm`). Lives on its own line
+   directly under the title; font + color match the created/tags meta line. */
+.seek-result-path {
+    min-width: 0;
+    margin-top: 2px;
+    font-size: 11.5px;
+    color: var(--text-faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Single-line snippet: force the markdown-rendered blocks inline + clip. */
+.seek-result-snippet {
+    margin-top: 2px;
+    font-size: 13px;
+    line-height: 1.4;
+    /* Reserve the single line up front. applyRow() empty()s this block and then
+       fills it via an ASYNC MarkdownRenderer.render — without a floor the block
+       collapses to 0 in between, so every row with a snippet shrinks-then-grows
+       on each search and the rows below it visibly jump (and applySelection's
+       synchronous offsetTop/offsetHeight read lands on collapsed rows). 1.4em
+       == the line-height box, so empty and filled are identical; min-height (not
+       height) lets a rare tall inline span grow rather than clip. Snippet-less
+       rows toggle display:none, so this never reserves a phantom line for them. */
+    min-height: 1.4em;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.seek-result-snippet :is(div, p, ul, ol, h1, h2, h3, h4, h5, h6) {
+    display: inline;
+    margin: 0;
+    font-size: inherit;
+    font-weight: inherit;
+}
+
+.seek-result-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
+    font-size: 11.5px;
+    color: var(--text-faint);
+}
+
+.seek-meta-dot {
+    color: var(--text-faint);
+}
+
+.seek-meta-tag {
+    color: var(--text-faint);
+}
+
+/* Per-result score line (gated on the Display scores setting): the calibrated
+   Matching % plus recency and title-boost bonuses. Faint monospace with tabular
+   figures so the numbers don't reflow as rows repaint on each keystroke. */
+.seek-result-score {
+    margin-top: 4px;
+    font-size: 11.5px;
+    color: var(--text-faint);
+    font-family: var(--font-monospace);
+    font-variant-numeric: tabular-nums;
+}
+
+/* The ↵ keycap on the selected row. */
+.seek-result-kbd {
+    position: absolute;
+    right: 12px;
+    top: 9px;
+}
+
+.seek-empty {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 32px 16px;
+}
+
+.seek-empty-sub {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-faint);
+}
+
+/* Cold-start onboarding state (empty index) */
+.seek-noindex-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-normal);
+}
+.seek-noindex-btn {
+    margin-top: 14px;
+    cursor: pointer;
+}
+
+/* ---- Component 3: footer hotkey bar ---- */
+
+.seek-foot {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 8px 14px;
+    border-top: 1px solid var(--background-modifier-border);
+    background: var(--background-secondary);
+    font-size: 11.5px;
+    color: var(--text-muted);
+}
+
+.seek-foot-grp {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    white-space: nowrap;
+}
+
+.seek-foot-spacer {
+    flex: 1 1 auto;
+}
+
+/* "Copy link" footer action — a real button styled as a footer hint. */
+.seek-foot-link {
+    cursor: pointer;
+    color: var(--text-muted);
+}
+.seek-foot-link:hover {
+    color: var(--text-normal);
+    text-decoration: underline;
+}
+
+/* Shared <kbd> cap (footer hints + the row ↵). */
+.seek-modal kbd {
+    font-family: var(--font-monospace);
+    font-size: 10.5px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 5px;
+    color: var(--text-muted);
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-bottom-width: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .seek-results.is-loading {
+        transition: none;
+    }
+}
+
+/* ============================================================================
+   Settings tab (settings-tab.ts). Theme-native: every color is sourced from an
+   Obsidian CSS variable or a color-mix() of one, so the tab absorbs the user's
+   theme + dark mode and never hardcodes a palette. See the redesign plan.
+   ========================================================================== */
+
+/* ---- shared bits ---- */
+.seek-settings .seek-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 8px 0;
+}
+.seek-settings .seek-faint {
+    color: var(--text-faint);
+    font-size: 12px;
+}
+.seek-settings .seek-model-id {
+    margin-top: 2px;
+}
+.seek-settings .seek-desc-list {
+    margin: 4px 0;
+    padding-left: 18px;
+}
+.seek-settings .seek-desc-list li {
+    margin: 2px 0;
+}
+.seek-settings .seek-inline-warn {
+    font-size: 12.5px;
+    color: var(--text-warning, var(--color-yellow));
+    background: color-mix(in srgb, var(--color-yellow) 10%, transparent);
+    border-left: 2px solid var(--color-yellow);
+    padding: 6px 10px;
+    border-radius: 4px;
+    margin: 4px 0 12px;
+}
+
+/* status dots — five health tones from theme status colors, with a soft halo */
+.seek-settings .seek-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    display: inline-block;
+}
+.seek-settings .seek-dot-good {
+    background: var(--color-green);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-green) 22%, transparent);
+}
+.seek-settings .seek-dot-mid {
+    background: var(--text-muted);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-muted) 20%, transparent);
+}
+.seek-settings .seek-dot-accent {
+    background: var(--interactive-accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--interactive-accent) 22%, transparent);
+}
+.seek-settings .seek-dot-bad {
+    background: var(--color-red);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-red) 22%, transparent);
+}
+
+/* ---- Index: status card ---- */
+.seek-settings .seek-status-card {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+    padding: 12px 16px;
+    margin: 8px 0 16px;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 10px;
+}
+.seek-settings .seek-status-health {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+.seek-settings .seek-status-label {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-normal);
+}
+.seek-settings .seek-status-sep {
+    width: 1px;
+    align-self: stretch;
+    background: var(--background-modifier-border);
+}
+.seek-settings .seek-status-metric {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+.seek-settings .seek-status-value {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-normal);
+    font-variant-numeric: tabular-nums;
+}
+.seek-settings .seek-status-mlabel {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.seek-settings .seek-status-last {
+    margin-left: auto;
+    text-align: right;
+}
+.seek-settings .seek-status-stamp {
+    font-size: 12.5px;
+    font-weight: 500;
+}
+/* faint secondary line: a catch-up that ran after the last full reindex */
+.seek-settings .seek-status-updated {
+    font-size: 11px;
+    color: var(--text-faint);
+    margin-top: 2px;
+}
+
+/* ---- Index: reindex progress ---- */
+.seek-settings .seek-progress-row {
+    padding: 10px 0;
+}
+.seek-settings .seek-progress-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 7px;
+}
+.seek-settings .seek-progress-count {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+.seek-settings .seek-progress-track {
+    height: 6px;
+    background: var(--background-modifier-border);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.seek-settings .seek-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--interactive-accent);
+    border-radius: 3px;
+    transition: width 0.2s ease;
+}
+
+/* ---- Relevance: intro + pipeline diagram ---- */
+.seek-settings .seek-rel-intro {
+    margin: 6px 0 4px;
+}
+/* Section headings (Index / Relevance / Display / Model) — larger + bolder so each
+   section clearly anchors its block instead of blending into the body text around it. */
+.seek-settings .setting-item-heading {
+    padding-top: 16px;
+}
+.seek-settings .setting-item-heading .setting-item-name {
+    font-size: 19px;
+    font-weight: 700;
+    color: var(--text-normal);
+    letter-spacing: -0.01em;
+}
+.seek-settings .seek-rel-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-normal);
+    margin-bottom: 2px;
+}
+.seek-settings .seek-pipe {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 12px;
+    margin: 10px 0;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 10px;
+    font-size: 12px;
+}
+.seek-settings .seek-pipe-box {
+    padding: 6px 10px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 7px;
+    background: var(--background-primary);
+    color: var(--text-normal);
+    text-align: center;
+    line-height: 1.2;
+    transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+}
+.seek-settings .seek-pipe-arrow {
+    color: var(--text-faint);
+}
+.seek-settings .seek-pipe-branch {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+.seek-settings .seek-pipe-dense,
+.seek-settings .seek-pipe-kw {
+    font-size: 11.5px;
+}
+/* Keyword box elevates ONLY in Keyword-focused mode (Concept mode was cut). */
+.seek-settings .seek-pipe-kw.is-elevated {
+    font-weight: 700;
+    transform: scale(1.05);
+    border-color: var(--interactive-accent);
+    box-shadow: 0 1px 8px color-mix(in srgb, var(--interactive-accent) 30%, transparent);
+}
+/* Fusion is the accent-highlighted stage (derived from the theme accent). */
+.seek-settings .seek-pipe-fuse {
+    border-color: var(--interactive-accent);
+    background: color-mix(in srgb, var(--interactive-accent) 12%, var(--background-primary));
+    color: var(--interactive-accent);
+    font-weight: 600;
+}
+.seek-settings .seek-pipe-bonus {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.seek-settings .seek-pipe-subs {
+    font-size: 10px;
+    color: var(--text-muted);
+}
+/* recency·title sub-labels: dim+strike when Off, bold when on, bolder at High. */
+.seek-settings .seek-pipe-sub.is-off {
+    opacity: 0.4;
+    text-decoration: line-through;
+}
+.seek-settings .seek-pipe-sub.is-on {
+    font-weight: 600;
+    color: var(--text-normal);
+}
+.seek-settings .seek-pipe-sub.is-high {
+    font-weight: 800;
+    color: var(--text-normal);
+}
+
+/* ---- Relevance: advanced disclosure ---- */
+.seek-settings .seek-disclosure {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+    padding: 10px 0;
+    margin-top: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-normal);
+}
+.seek-settings .seek-disclosure:hover {
+    color: var(--interactive-accent);
+}
+.seek-settings .seek-disclosure-chev {
+    width: 12px;
+    color: var(--text-muted);
+}
+
+/* ---- segmented (pill) control ---- */
+.seek-settings .seek-seg {
+    display: inline-flex;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 7px;
+    overflow: hidden;
+    background: var(--background-primary);
+}
+.seek-settings .seek-seg-opt {
+    padding: 4px 11px;
+    font-size: 12px;
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--background-modifier-border);
+    border-radius: 0;
+    box-shadow: none;
+    color: var(--text-muted);
+    cursor: pointer;
+}
+.seek-settings .seek-seg-opt:last-child {
+    border-right: none;
+}
+.seek-settings .seek-seg-opt:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+.seek-settings .seek-seg-opt.is-active,
+.seek-settings .seek-seg-opt.is-active:hover {
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+    font-weight: 600;
+}
+
+/* recency date picker dimmed while recency is Off */
+.seek-settings .seek-dimmed {
+    opacity: 0.45;
+}
+
+/* ---- Model: download spinner (indeterminate — no byte progress available) ---- */
+.seek-settings .seek-spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    vertical-align: middle;
+    border: 2px solid var(--background-modifier-border);
+    border-top-color: var(--interactive-accent);
+    border-radius: 50%;
+    animation: seek-spin 0.7s linear infinite;
+}
+@keyframes seek-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ---- About footer ---- */
+.seek-settings .seek-about {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 22px;
+    padding-top: 14px;
+    border-top: 1px solid var(--background-modifier-border);
+}
+.seek-settings .seek-about-left {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+.seek-settings .seek-about-name {
+    font-weight: 600;
+    color: var(--text-normal);
+}
+.seek-settings .seek-about-ver {
+    font-size: 11px;
+    color: var(--text-faint);
+}
+.seek-settings .seek-about-links {
+    display: flex;
+    gap: 8px;
+}
+.seek-settings .seek-about-ic {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 7px;
+    color: var(--text-muted);
+    cursor: pointer;
+}
+.seek-settings .seek-about-ic:hover {
+    color: var(--interactive-accent);
+    border-color: var(--interactive-accent);
+}
+.seek-settings .seek-about-ic svg {
+    width: 17px;
+    height: 17px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .seek-settings .seek-pipe-box,
+    .seek-settings .seek-progress-fill { transition: none; }
+    .seek-settings .seek-spinner { animation: none; }
+}
+
+/* ============================================================================
+   Mobile (phones). The reported squish: on the full-screen settings modal the
+   segmented controls and the pipeline diagram are cramped into the side-by-side
+   row layout. Stack each setting row so its control gets the full width, flex the
+   segmented options into even tap targets, give the recency segmented + date
+   dropdown their own lines, and flow the pipeline top-to-bottom instead of
+   wrapping mid-arrow. Scoped to .is-phone (Obsidian sets it on <body>) so the
+   roomier desktop/tablet modal is untouched.
+   ========================================================================== */
+.is-phone .seek-settings .setting-item {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+}
+.is-phone .seek-settings .setting-item-control {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+/* segmented: full width, options split evenly with bigger touch targets */
+.is-phone .seek-settings .seek-seg {
+    display: flex;
+    width: 100%;
+}
+.is-phone .seek-settings .seek-seg-opt {
+    flex: 1 1 0;
+    padding: 9px 6px;
+    font-size: 13px;
+}
+/* the recency row pairs a segmented + a date dropdown — each gets its own full line */
+.is-phone .seek-settings .setting-item-control .dropdown,
+.is-phone .seek-settings .setting-item-control select {
+    width: 100%;
+}
+
+/* pipeline: a horizontal wrap reads as broken on a narrow screen — flow it
+   vertically, boxes full-width, the two retrieval branches side by side, arrows down */
+.is-phone .seek-settings .seek-pipe {
+    flex-direction: column;
+    align-items: stretch;
+}
+.is-phone .seek-settings .seek-pipe > .seek-pipe-box,
+.is-phone .seek-settings .seek-pipe-branch {
+    width: 100%;
+}
+.is-phone .seek-settings .seek-pipe-branch {
+    flex-direction: row;
+}
+.is-phone .seek-settings .seek-pipe-branch > .seek-pipe-box {
+    flex: 1 1 0;
+}
+.is-phone .seek-settings .seek-pipe-arrow {
+    align-self: center;
+    transform: rotate(90deg);
+}

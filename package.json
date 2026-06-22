@@ -1,0 +1,30 @@
+{
+    "name": "seek",
+    "version": "0.0.1",
+    "description": "Obsidian plugin for on-device hybrid semantic and lexical vault search.",
+    "main": "main.js",
+    "scripts": {
+        "dev": "node esbuild.config.mjs",
+        "build": "node esbuild.config.mjs production",
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run"
+    },
+    "keywords": [
+        "obsidian",
+        "semantic-search",
+        "embeddings",
+        "transformers.js"
+    ],
+    "author": "Ryan Manor",
+    "license": "MIT",
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "esbuild": "^0.24.0",
+        "obsidian": "^1.7.2",
+        "typescript": "^5.6.0",
+        "vitest": "^2.1.0"
+    },
+    "dependencies": {
+        "minisearch": "^7.2.0"
+    }
+}

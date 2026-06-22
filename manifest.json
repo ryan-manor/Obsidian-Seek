@@ -1,0 +1,10 @@
+{
+    "id": "seek",
+    "name": "Seek",
+    "version": "0.0.1",
+    "minAppVersion": "1.4.0",
+    "description": "Search your vault with hybrid semantic and lexical retrieval, powered by an on-device embedding model.",
+    "author": "Ryan Manor",
+    "authorUrl": "https://github.com/ryan-manor",
+    "isDesktopOnly": false
+}

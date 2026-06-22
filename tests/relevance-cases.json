@@ -1,0 +1,162 @@
+{
+  "meta": {
+    "source": "Illustrative relevance cases — synthetic examples of common hybrid-search ranking failure modes (constructed for documentation, not measurements from a specific vault).",
+    "vault": "Demo Vault",
+    "captured_on": "2026-06-08",
+    "config_at_capture": {
+      "alpha": 0.7,
+      "blendMode": "rrf",
+      "rrfK": 60,
+      "recencyWeight": 0.09,
+      "navTitleBoost": 0.15,
+      "titleBoost": 3,
+      "aliasBoost": 2,
+      "tagBoost": 2,
+      "fuzzyEnabled": true
+    },
+    "categories": {
+      "ranking-fusion": "Correct note IS retrieved but ranked too low. Fix lever = fusion weights (alpha / recencyWeight / navTitleBoost) in ranker.ts DEFAULT_RANKING_CONFIG.",
+      "recall-chunking": "Correct note is NOT retrieved at all (absent from candidate pool). Fix lever = chunker.ts / candidate generation / index freshness.",
+      "parser-operator": "An inline query operator silently no-ops. Fix lever = query-parser.ts (parseQuery / compileMatcher).",
+      "freshness": "Note created same-day was not yet in the index at capture time. Fix lever = incremental indexing latency, not ranking.",
+      "display": "Relevance is correct; the rendered result is confusing. Fix lever = search-modal.ts / suggest.ts rendering, not ranking."
+    },
+    "scoring": "rank is 1-based over the fused result list. A case PASSES when every path in `relevant` satisfies its assertion. Re-run after each config change to detect regressions."
+  },
+  "cases": [
+    {
+      "id": "alex-workstreams-episodic",
+      "query": "alex workstreams",
+      "intent": "episodic",
+      "category": "ranking-fusion",
+      "status": "illustrative",
+      "relevant": ["Inbox/Alex 1x1 2026-06-08.md"],
+      "assertion": { "type": "max_rank", "path": "Inbox/Alex 1x1 2026-06-08.md", "rank": 1 },
+      "observed": { "Inbox/Alex 1x1 2026-06-08.md": 3 },
+      "outranked_by": [
+        "Notes/Meetings/Alex staff - 2024-11-13.md",
+        "Notes/Meetings/1x1s/Alex 1x1 - 2025-02-11.md"
+      ],
+      "user_comment": "The most recent 1x1 note is the relevant one here.",
+      "evidence": "Target note has dense 1.00 AND recency 0.98 yet ranks 3; two older notes win on higher bm25.",
+      "root_cause_hypothesis": "recencyWeight 0.09 too weak to break ties; alpha 0.7 lets bm25 from stale notes dominate a dense+recent winner.",
+      "fix_lever": "raise recencyWeight (ideally episodic-intent-gated) and/or raise alpha toward 0.9"
+    },
+    {
+      "id": "alex-1x1-recency-tiebreak",
+      "query": "alex 1x1",
+      "intent": "episodic",
+      "category": "ranking-fusion",
+      "status": "illustrative",
+      "relevant": ["Notes/Meetings/1x1s/Alex 1x1 2026-06-01.md", "Inbox/Alex 1x1 2026-06-08.md"],
+      "assertion": { "type": "newest_of_matches_in_top", "k": 1, "match_glob": "**/Alex 1x1*.md", "date_from": "filename_or_created" },
+      "observed": { "rank1": "Notes/Meetings/1x1s/Alex 1x1 2026-05-19.md (recency 0.36)", "most_recent_present": false },
+      "user_comment": "This string matches against many notes — why is recency not the tie breaker?",
+      "evidence": "Among ~15 near-identical 'Alex 1x1 <date>' titles, the rank-1 note was 2026-05-19, not the newest. Dense score is driven by body content, so the title-match tie is broken by body, not recency.",
+      "root_cause_hypothesis": "For known-item title-collision queries, dense body similarity dominates and recencyWeight is too small to act as the intended tie-breaker.",
+      "fix_lever": "raise recencyWeight; consider title-exact-match boost so identical-title notes are tie-broken by recency not body"
+    },
+    {
+      "id": "alex-1x1-2026-year-filter",
+      "query": "alex 1x1 2026",
+      "intent": "episodic",
+      "category": "ranking-fusion",
+      "status": "illustrative",
+      "relevant": [],
+      "assertion": { "type": "none_dated_before_in_top", "k": 3, "year_floor": 2026 },
+      "observed": { "rank2": "Notes/Meetings/1x1s/Alex - 2025-11-19.md" },
+      "user_comment": "2025 results creeping in...",
+      "evidence": "Query explicitly contains '2026' yet a 2025 note ranks 2. The literal year token is not acting as a strong lexical/recency constraint.",
+      "root_cause_hypothesis": "Year token '2026' contributes weak BM25 (common across corpus) and there is no date-aware parsing of bare years in the query.",
+      "fix_lever": "consider parsing bare 4-digit years as a soft recency/date constraint in query-parser.ts; or raise recencyWeight"
+    },
+    {
+      "id": "atlas-home-vs-task",
+      "query": "project atlas",
+      "intent": "known-item",
+      "category": "ranking-fusion",
+      "status": "illustrative",
+      "relevant": ["Notes/Project Atlas.md"],
+      "assertion": { "type": "max_rank", "path": "Notes/Project Atlas.md", "rank": 1 },
+      "observed": { "Notes/Project Atlas.md": 2, "rank1": "Notes/Tasks/Build up atlas clusters.md" },
+      "outranked_by": ["Notes/Tasks/Build up atlas clusters.md"],
+      "user_comment": "recent task out-ranking project home with exact name match",
+      "evidence": "The project HOME note (exact name match) is beaten by a recent task note (dense 1.00, recency 0.87). A controlled A/B raising navTitleBoost 0.025 -> 0.25 moved Project Atlas.md to rank 1 (score 1.01).",
+      "root_cause_hypothesis": "navTitleBoost too low to let an exact-title home note beat a dense+recent task; pageType not factored into ranking.",
+      "fix_lever": "raise navTitleBoost (caveat: widens the score distribution, complicating any future thresholding); consider pageType-aware boost for hub/home notes",
+      "ab_observed": { "navTitleBoost=0.025": "Project Atlas.md rank 2", "navTitleBoost=0.25": "Project Atlas.md rank 1 (score 1.01)" }
+    },
+    {
+      "id": "atlas-pageType-exclude-operator",
+      "query": "atlas project -[pageType:task]",
+      "intent": "structural",
+      "category": "parser-operator",
+      "status": "illustrative",
+      "relevant": ["Notes/Project Atlas.md"],
+      "assertion": { "type": "no_results_with_property", "property": "pageType", "value": "task" },
+      "observed": { "rank1": "Notes/Tasks/Build up atlas clusters.md (pageType: task — should be excluded)" },
+      "user_comment": "pageType filter not working?",
+      "evidence": "Results were byte-identical to the unfiltered 'atlas project' query. The negated property filter parsed to a no-op; a pageType:task note remained at rank 1.",
+      "root_cause_hypothesis": "query-parser.ts does not handle negated bracket property filters '-[key:value]' (or the cleanedQuery stripped it without building a matcher).",
+      "fix_lever": "query-parser.ts: support negation on [key:value] filters; add a vitest case",
+      "vitest_target": "src/query-parser.test.ts"
+    },
+    {
+      "id": "atlas-file-operator",
+      "query": "file:project atlas",
+      "intent": "known-item",
+      "category": "parser-operator",
+      "status": "illustrative",
+      "relevant": ["Notes/Project Atlas.md"],
+      "assertion": { "type": "max_rank", "path": "Notes/Project Atlas.md", "rank": 1 },
+      "observed": { "Notes/Project Atlas.md": 2, "rank1": "Notes/Tasks/Build up atlas clusters.md" },
+      "user_comment": "why is file: not working here?",
+      "evidence": "'file:' was expected to scope the match to filename/title. It had no effect — the task note still ranked 1, identical to no operator.",
+      "root_cause_hypothesis": "'file:' operator is not implemented in query-parser.ts (parsed-and-dropped or treated as a literal term).",
+      "fix_lever": "query-parser.ts: implement file:/path scoping to the title/filename field; add a vitest case",
+      "vitest_target": "src/query-parser.test.ts"
+    },
+    {
+      "id": "graphdb-recall",
+      "query": "graphdb",
+      "intent": "known-item",
+      "category": "recall-chunking",
+      "status": "illustrative",
+      "relevant": ["Clippings/GraphDB.md"],
+      "assertion": { "type": "max_rank", "path": "Clippings/GraphDB.md", "rank": 1 },
+      "observed": { "Clippings/GraphDB.md": "absent from top 10", "top_results": "graph-adjacent notes, dense ~1.0, bm25 0.0" },
+      "user_comment": "top results seem confidently wrong...?",
+      "evidence": "Clippings/GraphDB.md exists with a full body ('GraphDB is an in-memory graph database...') but was NOT retrieved. Its title frontmatter is 'The Graph Engine for AI Context' (no 'graphdb'); the term appears only in body + filename. created: same day as capture.",
+      "root_cause_hypothesis": "AMBIGUOUS — either (a) freshness: clipped after the last reindex so not yet a candidate, or (b) field mismatch: 'graphdb' is in body/filename but not the title field the ranker weights. Verify by reindexing then re-querying.",
+      "fix_lever": "if (a): incremental index latency; if (b): include filename as a searchable field / fall back to filename when title frontmatter lacks the term. Re-test after reindex to disambiguate."
+    },
+    {
+      "id": "metrics-dashboard-snippet",
+      "query": "metrics dashboard",
+      "intent": "known-item-snippet",
+      "category": "recall-chunking",
+      "status": "illustrative",
+      "relevant": ["Notes/Programs/Analytics/Analytics Home.md"],
+      "assertion": { "type": "max_rank", "path": "Notes/Programs/Analytics/Analytics Home.md", "rank": 5 },
+      "observed": { "Notes/Programs/Analytics/Analytics Home.md": "absent from top 10" },
+      "user_comment": "I can't find snippets within notes. I'm looking for the metrics dashboard I believe is in my analytics home note.",
+      "evidence": "Analytics Home.md (11KB) contains the exact target — '[Quarterly metrics dashboard](https://analytics.example.com/...)' at line 23 — but never surfaced. The single 'dashboard' link is diluted across a large multi-chunk note; meeting notes outranked it.",
+      "root_cause_hypothesis": "Chunk granularity / rare-term dilution: the chunk holding the dashboard link scores low because the surrounding chunk is generic, and BM25 for the rare term is spread thin in a long note.",
+      "fix_lever": "chunker.ts granularity for long notes; consider surfacing best-matching chunk/section; verify BM25 term frequency handling for rare in-note terms"
+    },
+    {
+      "id": "web-widgets-known-item",
+      "query": "web widgets",
+      "intent": "known-item",
+      "category": "display",
+      "status": "passing-ranking",
+      "relevant": ["Notes/Web Widgets.md"],
+      "assertion": { "type": "max_rank", "path": "Notes/Web Widgets.md", "rank": 1 },
+      "observed": { "Notes/Web Widgets.md": 1 },
+      "user_comment": "Relevance is fine, rendering needs work. We need to better call out the note title vs the section heading that matched.",
+      "evidence": "Ranking is CORRECT (rank 1, dense 1.0 bm25 1.0). This case is a passing-ranking baseline + a separate DISPLAY bug: the result UI does not distinguish note title from the matched section heading.",
+      "root_cause_hypothesis": "Not a ranking issue. Rendering in search-modal.ts conflates note title and matched heading.",
+      "fix_lever": "search-modal.ts / suggest.ts: visually separate note title from matched section heading. Keep this case to guard against ranking regressions on a clean known-item query."
+    }
+  ]
+}
