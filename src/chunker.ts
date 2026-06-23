@@ -100,8 +100,12 @@ export function chunkIdFor(notePath: string, title: string, content: string, den
 // files chunk per-VIEW via chunkBase (base-as-document model, 2026-06-23) — one
 // base now yields a base-level chunk + one per non-generic view instead of a
 // single mashed doc, so every base chunk's title/content (and id) changed and a
-// pre-6 sidecar's base vectors are unreproducible.
-export const CHUNKER_VERSION = 6;
+// pre-6 sidecar's base vectors are unreproducible. 7 = within-section overlap
+// (token-budget.ts OVERLAP_FRACTION, 2026-06-23): a split super-section's later
+// parts now carry the prior part's trailing paragraph(s), so every multi-part
+// section's part content (and ids) changed and a pre-7 sidecar's vectors for
+// those notes are unreproducible.
+export const CHUNKER_VERSION = 7;
 
 export interface ChunkerOptions {
     minChunkChars?: number;
