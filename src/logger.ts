@@ -12,7 +12,8 @@
 //   .obsidian/plugins/seek/logs/seek-log-<deviceId>.ndjson      — append-only stream of LogEntry rows
 //   .obsidian/plugins/seek/logs/seek-init-<deviceId>.json       — overwritten each load with last init payload
 //   .obsidian/plugins/seek/logs/seek-captures-<deviceId>.ndjson — LEGACY relevance-debug captures; no longer written, only swept in from the vault root
-//   seek-report.md                                              — generated on demand ("Generate logging report"), kept at vault root so it can be opened
+//   seek-report.json                                            — generated on demand: full structured diagnostic (all devices merged), the parse target
+//   seek-report.md                                              — generated on demand: ~20-line human summary pointing at seek-report.json; kept at vault root so it can be opened
 //   seek-log.ndjson                                             — LEGACY pre-v9 shared file; migrated into LOG_DIR, read into the
 //                                                                 report (attributed to deviceId 'legacy'), never written
 //
@@ -52,6 +53,31 @@ const LOG_DIR = '.obsidian/plugins/seek/logs';
 // resolves files outside the config folder). Safe under iCloud because it's never
 // appended to from two devices at once.
 const REPORT_PATH = 'seek-report.md';
+// The full structured diagnostic, written alongside the .md summary on each report
+// generation. One JSON object (a metadata header + a flat, type-tagged `entries`
+// array) — the parse target for jq / pandas; the .md is just a human glance over it.
+const REPORT_JSON_PATH = 'seek-report.json';
+// Per-type recency caps for the generated report (NOT the raw NDJSON, which keeps
+// everything and is bounded separately by rotateIfOversize). The report is a recent-
+// activity snapshot kept small enough to email + parse fast; high-volume types keep
+// their most recent N, while types ABSENT here (crash-detected, init, platform, reset,
+// model-*, webgpu-event) are kept in full — rare and diagnostically critical. Without
+// this the report is the entire history across every device (15+ MB after two weeks,
+// ~82% of it search traces). entryCount vs includedCount + the `caps` field make any
+// truncation explicit — no silent capping.
+const REPORT_CAPS: Record<string, number> = {
+    search: 150,
+    error: 300,
+    'index-progress': 50,
+    'index-complete': 100,
+    'sidecar-hydrate': 50,
+    'memory-pressure': 100,
+    'long-task': 100,
+    'storage-snapshot': 50,
+    'app-local-fetch': 50,
+    click: 100,
+    load: 50,
+};
 // Legacy single-file log from before per-device files (schema ≤ v8). Still read
 // into the report (its entries are attributed to deviceId 'legacy') so history
 // isn't lost; never written to again. The basename is matched both at the vault
@@ -61,6 +87,27 @@ const LEGACY_LOG_PATH = `${LOG_DIR}/${LEGACY_LOG_BASE}`;
 const LOG_PREFIX = 'seek-log-';     // per-device: seek-log-<deviceId>.ndjson
 const INIT_PREFIX = 'seek-init-';   // per-device: seek-init-<deviceId>.json
 const CAPTURE_PREFIX = 'seek-captures-';
+// Append-only logs have no natural ceiling. On load (rotateIfOversize, after the
+// root-file migration) a per-device log past MAX_LOG_BYTES is tail-truncated to the
+// most recent KEEP_LOG_BYTES, snapped forward to a newline so the retained head is a
+// whole JSON line. Byte budgets are approximate (a stat size in bytes is compared,
+// then the string is sliced by JS length) — fine for a coarse retention cap.
+const MAX_LOG_BYTES = 1 * 1024 * 1024;   // rotate once a device log passes ~1 MB
+const KEEP_LOG_BYTES = 512 * 1024;       // …retaining ~the most recent 512 KB (file stays bounded at ~1 MB)
+// Errors are deduped by MESSAGE (the failure identity) — NOT context+message, because
+// the same fault is logged from many call sites (an "iframe not initialized" storm
+// carries ~hundreds of distinct contexts but one message, so context+message would
+// barely collapse it). The first occurrence is written in full (with stack); after that
+// only exponential milestones (counts 2,4,8,…) are written, each carrying the running
+// `repeated` total — so a chronic fault that fires thousands of times costs ~log2(N)
+// rows, not N. flushErrorAggregates emits the exact final tally at report time. Keying
+// and counting are memory-only (per session); the first occurrence is always persisted.
+const ERROR_KEYS_MAX = 512;              // backstop: the distinct-message dedup map never grows past this
+const ERROR_KEY_MAXLEN = 256;            // cap the dedup key length (messages can embed long paths/ids)
+// Orphan-log GC: a log file OTHER than this device's whose newest entry is older than
+// this is treated as abandoned and removed on load (rotateIfOversize only caps the
+// CURRENT device's file). Age is read from content, not mtime — iCloud re-stamps mtime.
+const ORPHAN_LOG_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;   // 30 days
 // localStorage key holding this install's stable device id. localStorage is
 // device-local (NOT vault-synced) and survives plugin reloads — exactly the
 // scope we need: desktop and phone get distinct ids even on the same vault.
@@ -90,6 +137,23 @@ function resolveDeviceId(): string {
     return id;
 }
 
+// The structured payload serialized to seek-report.json. A small metadata header
+// plus the full merged firehose as one flat, type-tagged array — deliberately not
+// pre-grouped, so a consumer filters by `entry.type` (jq / pandas) however they like.
+interface ReportData {
+    generated: string;
+    schemaVersion: number;
+    thisDevice: string;
+    thisSession: string;
+    entryCount: number;
+    includedCount: number;
+    firstTimestamp: string | null;
+    lastTimestamp: string | null;
+    devices: Array<{ id: string; count: number }>;
+    caps: Record<string, number>;
+    entries: LogEntry[];
+}
+
 export class SeekLogger {
     private app: App;
     // Stable across reloads (localStorage); identifies the physical device.
@@ -97,6 +161,10 @@ export class SeekLogger {
     // Fresh per plugin load; identifies this run so the report can show only
     // the current session's Init/Platform/Loads instead of a cross-device mix.
     readonly sessionId: string;
+    // Per-message dedup state (memory-only, per session). The first occurrence of each
+    // distinct message is always persisted, so a crash never hides an error; subsequent
+    // identical messages are counted and only milestone-sampled to disk. See appendError.
+    private errAgg = new Map<string, { count: number; lastWritten: number; firstTs: string; lastTs: string; lastContext: string }>();
     constructor(app: App) {
         this.app = app;
         this.deviceId = resolveDeviceId();
@@ -148,8 +216,6 @@ export class SeekLogger {
                 console.error('[seek] log read+rewrite also failed:', e2);
             }
         }
-        // Echo to console too — useful when running with Obsidian dev tools open.
-        console.log(`[seek][${entry.type}]`, stamped);
     }
 
     async writeInit(entry: InitEntry): Promise<void> {
@@ -162,16 +228,41 @@ export class SeekLogger {
     }
 
     async appendError(context: string, e: unknown): Promise<void> {
-        const entry: ErrorEntry = {
-            type: 'error',
-            timestamp: new Date().toISOString(),
-            context,
-            message: e instanceof Error ? e.message : String(e),
-            stack: e instanceof Error ? (e.stack ?? null) : null,
-        };
+        const message = e instanceof Error ? e.message : String(e);
+        const stack = e instanceof Error ? (e.stack ?? null) : null;
+        const ts = new Date().toISOString();
+        const now = Date.now();
+        // Console always fires — live dev visibility is never throttled; only the on-disk
+        // NDJSON is deduped.
         console.error(`[seek] error in "${context}":`, e);
-        if (e instanceof Error && e.stack) console.error('[seek] stack:', e.stack);
-        await this.append(entry);
+        if (stack) console.error('[seek] stack:', stack);
+        // Dedup identical errors (same context+message) within ERROR_DEDUP_WINDOW_MS: the
+        // first is written immediately (crash-safe — the throttle never hides an error),
+        // repeats are only counted, and the count surfaces as a `repeated:N` row on the
+        // next write past the window (or at report time via flushErrorAggregates).
+        const key = message.slice(0, ERROR_KEY_MAXLEN);
+        const agg = this.errAgg.get(key);
+        if (!agg) {
+            if (this.errAgg.size >= ERROR_KEYS_MAX) {
+                const oldest = this.errAgg.keys().next().value;   // evict oldest (insertion order)
+                if (oldest !== undefined) this.errAgg.delete(oldest);
+            }
+            this.errAgg.set(key, { count: 1, lastWritten: 1, firstTs: ts, lastTs: ts, lastContext: context });
+            const entry: ErrorEntry = { type: 'error', timestamp: ts, context, message, stack };   // first: full, keeps stack
+            await this.append(entry);
+            return;
+        }
+        agg.count += 1;
+        agg.lastTs = ts;
+        agg.lastContext = context;
+        // Write only at exponential milestones (count is a power of two); repeats between
+        // milestones are merely counted. The running total rides along as `repeated`, and
+        // stack is dropped (the first occurrence already carried it).
+        if ((agg.count & (agg.count - 1)) === 0) {
+            agg.lastWritten = agg.count;
+            const entry: ErrorEntry = { type: 'error', timestamp: ts, context, message, stack: null, repeated: agg.count };
+            await this.append(entry);
+        }
     }
 
     // Parse one NDJSON file into entries, attributing a fallback deviceId to any
@@ -246,6 +337,36 @@ export class SeekLogger {
         }
     }
 
+    // Tail-truncate THIS device's log if it has grown past MAX_LOG_BYTES, keeping the
+    // most recent KEEP_LOG_BYTES. Best-effort and load-only (never in the append hot
+    // path); per-device files mean each device only ever trims its own stream. stat
+    // gives a cheap size probe so an in-bounds log is never fully read just to measure;
+    // when stat is unavailable we fall back to a single startup read. The cut is
+    // advanced to the next '\n' so the retained head starts on a clean line boundary —
+    // and parseLog already skips any malformed line, so a worst-case slice is harmless.
+    async rotateIfOversize(): Promise<void> {
+        const adapter = this.app.vault.adapter;
+        const path = this.logPath();
+        try {
+            let raw: string | null = null;
+            let size: number | null = null;
+            try { size = (await adapter.stat(path))?.size ?? null; } catch { /* stat unsupported — read-measure below */ }
+            if (size === null) {
+                raw = await adapter.read(path).catch(() => null);
+                if (raw === null) return;          // file absent / unreadable
+                size = raw.length;
+            }
+            if (size <= MAX_LOG_BYTES) return;
+            if (raw === null) raw = await adapter.read(path);
+            const cut = raw.length - KEEP_LOG_BYTES;
+            const nl = raw.indexOf('\n', cut);
+            const tail = nl >= 0 ? raw.slice(nl + 1) : raw.slice(cut);
+            await adapter.write(path, tail);
+        } catch (e) {
+            console.error('[seek] log rotation failed:', e);
+        }
+    }
+
     // One-time move of the machine-written data streams from the vault root (where
     // pre-this-change builds wrote them) into the hidden LOG_DIR, so they stop
     // cluttering the file explorer. Idempotent and non-fatal: a file already in
@@ -286,511 +407,168 @@ export class SeekLogger {
                 await this.appendError('logger-migrate-root', e).catch(() => {});
             }
         }
-        console.log(`[seek] log migration: moved ${moved}/${toMove.length} files → ${LOG_DIR}`);
         return moved;
     }
 
-    async generateReport(): Promise<string> {
-        const entries = await this.readAllDevices();
-        if (entries.length === 0) {
-            return '# Seek Log Report\n\nNo data recorded yet. Run a search or reindex to populate the log.\n';
+    // Build the full diagnostic dataset: every device's stream merged + sorted by
+    // timestamp (readAllDevices), plus a small metadata header. Serialized verbatim to
+    // seek-report.json — the parse target. One flat, type-tagged `entries` array is the
+    // most parse-friendly shape (filter by `.type` in jq / pandas) and needs no per-type
+    // schema here; searches already carry the trimmed top-10 trace (see verboseTrace).
+    // Persist the exact final tally for any message whose count has advanced past its
+    // last milestone write. Called when building a report (so the artifact reflects an
+    // in-flight storm) and safe anytime. Per-device: only this device's pending counts.
+    async flushErrorAggregates(): Promise<void> {
+        for (const [key, agg] of this.errAgg) {
+            if (agg.count <= agg.lastWritten) continue;
+            agg.lastWritten = agg.count;
+            const summary: ErrorEntry = {
+                type: 'error', timestamp: agg.lastTs,
+                context: agg.lastContext, message: key,
+                stack: null, repeated: agg.count,
+            };
+            await this.append(summary);
         }
+    }
 
-        // Device-identity sections (Init / Platform / Loads) must describe the
-        // device generating THIS report, not whichever device last appended to
-        // the shared log. Scope them to the current session; the legacy at(-1)
-        // over a cross-device merge is exactly the bug this fixes.
-        const sessionEntries = entries.filter(e => e.sessionId === this.sessionId);
-        const identityScope = sessionEntries.length > 0 ? sessionEntries : entries;
-        const scopedToSession = sessionEntries.length > 0;
+    // Reclaim abandoned log files. Active devices each cap their OWN file via
+    // rotateIfOversize, but a retired device's file (and the pre-v9 legacy file) would
+    // otherwise linger and sync forever. Drop any log file OTHER than this device's whose
+    // most-recent entry is older than ORPHAN_LOG_MAX_AGE_MS. Age comes from file CONTENT
+    // (last entry's timestamp), NOT mtime — iCloud re-stamps mtime on sync, so mtime lies.
+    // Conservative: a device used within the window keeps its history, and a pruned device
+    // that returns simply recreates its file.
+    async pruneOrphanLogs(): Promise<void> {
+        const adapter = this.app.vault.adapter;
+        const mine = this.logPath();
+        const listed = await adapter.list(LOG_DIR).catch(() => null);
+        if (!listed) return;
+        const now = Date.now();
+        for (const path of listed.files ?? []) {
+            const norm = path.replace(/^\/+/, '');
+            const base = norm.split('/').pop() ?? '';
+            const isLog = base === LEGACY_LOG_BASE || (base.startsWith(LOG_PREFIX) && base.endsWith('.ndjson'));
+            // Legacy relevance-debug captures are never written or read anymore — pure
+            // dead weight; prune them on the same age rule as abandoned device logs.
+            const isCapture = base === 'seek-captures.ndjson' || (base.startsWith(CAPTURE_PREFIX) && base.endsWith('.ndjson'));
+            if ((!isLog && !isCapture) || norm === mine) continue;   // never touch this device's live log
+            try {
+                const lastTs = this.lastTimestampOf(await adapter.read(norm));
+                if (lastTs === null) continue;        // empty / unreadable — leave it
+                if (now - Date.parse(lastTs) <= ORPHAN_LOG_MAX_AGE_MS) continue;
+                await adapter.remove(norm);
+                if (base.startsWith(LOG_PREFIX)) {    // drop the paired init sidecar too
+                    const dev = base.slice(LOG_PREFIX.length, -'.ndjson'.length);
+                    await adapter.remove(`${LOG_DIR}/${INIT_PREFIX}${dev}.json`).catch(() => {});
+                }
+            } catch { /* read/remove failed — skip, retry next load */ }
+        }
+    }
 
-        const inits = filterByType<InitEntry>(identityScope, 'init');
-        const platforms = filterByType<PlatformEntry>(identityScope, 'platform');
-        const loads = filterByType<LoadEntry>(identityScope, 'load');
-        const profiles = filterByType<EmbedProfileEntry>(entries, 'embed-profile');
-        const progress = filterByType<IndexProgressEntry>(entries, 'index-progress');
-        const completes = filterByType<IndexCompleteEntry>(entries, 'index-complete');
-        const searches = filterByType<SearchEntry>(entries, 'search');
-        const resets = filterByType<ResetEntry>(entries, 'reset');
-        const errors = filterByType<ErrorEntry>(entries, 'error');
-        const longTasks = filterByType<LongTaskEntry>(entries, 'long-task');
-        const memoryPressure = filterByType<MemoryPressureEntry>(entries, 'memory-pressure');
-        const storageSnaps = filterByType<StorageSnapshotEntry>(entries, 'storage-snapshot');
-        const evictions = filterByType<EvictionSuspectedEntry>(entries, 'eviction-suspected');
-        const probes = filterByType<AppLocalFetchEntry>(entries, 'app-local-fetch');
-        const clicks = filterByType<ClickEntry>(entries, 'click');
-        const crashes = filterByType<CrashDetectedEntry & import('./types').LogMeta>(entries, 'crash-detected');
+    // Last parseable line's timestamp, scanned from the end (tolerates a torn tail).
+    private lastTimestampOf(raw: string): string | null {
+        const lines = raw.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i].trim();
+            if (!line) continue;
+            try {
+                const ts = (JSON.parse(line) as { timestamp?: string }).timestamp;
+                if (ts) return ts;
+            } catch { /* torn/garbage line — keep scanning upward */ }
+        }
+        return null;
+    }
 
-        const lines: string[] = [];
-        lines.push('# Seek Log Report');
-        lines.push(`\n_Generated: ${new Date().toISOString()}_`);
-        lines.push(`_Log entries: ${entries.length} · first: ${entries[0].timestamp} · last: ${entries[entries.length - 1].timestamp}_`);
-        lines.push(`_Report schema version: ${LOG_SCHEMA_VERSION}_`);
-
-        // ---- This Session (device attribution) ----
-        // Per-device entry counts make cross-device mixing visible at a glance —
-        // and confirm a phone's run actually synced into the vault.
+    async buildReportData(): Promise<ReportData> {
+        await this.flushErrorAggregates();   // surface any in-flight suppressed-error tails
+        const entries = await this.readAllDevices();
         const byDevice = new Map<string, number>();
         for (const e of entries) byDevice.set(e.deviceId ?? 'legacy', (byDevice.get(e.deviceId ?? 'legacy') ?? 0) + 1);
-        lines.push('\n## This Session');
-        lines.push(`- Device: \`${this.deviceId}\``);
-        lines.push(`- Session: \`${this.sessionId}\` (${sessionEntries.length} entries this session)`);
-        if (!scopedToSession) {
-            lines.push('- ⚠️ No entries for the current session in any log file — the Init / Platform / Loads sections below fall back to the most recent entry **across all devices** and may not describe this device.');
+        // Recency-cap: walk newest→oldest keeping up to REPORT_CAPS[type] of each
+        // high-volume type (uncapped types kept in full). Then restore ascending order.
+        const kept: LogEntry[] = [];
+        const perType = new Map<string, number>();
+        for (let i = entries.length - 1; i >= 0; i--) {
+            const e = entries[i];
+            const cap = REPORT_CAPS[e.type];
+            if (cap !== undefined) {
+                const n = perType.get(e.type) ?? 0;
+                if (n >= cap) continue;
+                perType.set(e.type, n + 1);
+            }
+            kept.push(e);
         }
-        lines.push('\n_Entries by device (across all log files):_');
-        lines.push('\n| Device | Entries |');
-        lines.push('|---|---:|');
-        for (const [dev, n] of [...byDevice.entries()].sort((a, b) => b[1] - a[1])) {
-            lines.push(`| \`${dev}\`${dev === this.deviceId ? ' ← this device' : ''} | ${n} |`);
-        }
+        kept.reverse();
+        // Defensively trim any historical 50-row search trace to the 10 the report uses
+        // (pre-verboseTrace entries; new ones are already ≤10) so they don't bloat it.
+        const trimmed = kept.map(e => {
+            if (e.type !== 'search') return e;
+            const s = e as SearchEntry;
+            return s.fusedTop50 && s.fusedTop50.length > 10 ? { ...s, fusedTop50: s.fusedTop50.slice(0, 10) } : e;
+        });
+        return {
+            generated: new Date().toISOString(),
+            schemaVersion: LOG_SCHEMA_VERSION,
+            thisDevice: this.deviceId,
+            thisSession: this.sessionId,
+            entryCount: entries.length,
+            includedCount: trimmed.length,
+            firstTimestamp: entries[0]?.timestamp ?? null,
+            lastTimestamp: entries.at(-1)?.timestamp ?? null,
+            devices: [...byDevice.entries()].sort((a, b) => b[1] - a[1]).map(([id, count]) => ({ id, count })),
+            caps: REPORT_CAPS,
+            entries: trimmed,
+        };
+    }
 
-        // ---- Crash Forensics ----
-        // Promoted at boot from the synchronous localStorage breadcrumb ring
-        // (forensics.ts) — the only record that survives a jetsam kill. Placed
-        // near the top: a crash is the single most important fact in a report.
+    // ~20-line human glance rendered from the already-built data (no second file read).
+    // The full detail lives in seek-report.json; this surfaces the headline facts a
+    // person needs before sharing, plus the privacy note, and points at the JSON.
+    private summarize(d: ReportData): string {
+        const lines: string[] = [];
+        lines.push('# Seek Diagnostic Report');
+        lines.push(`\n_Generated ${d.generated} · log schema v${d.schemaVersion}_`);
+        if (d.entryCount === 0) {
+            lines.push('\nNo data recorded yet. Run a search or reindex to populate the log.');
+            return lines.join('\n') + '\n';
+        }
+        const searches = filterByType<SearchEntry>(d.entries, 'search');
+        const indexes = filterByType<IndexCompleteEntry>(d.entries, 'index-complete');
+        const errors = filterByType<ErrorEntry>(d.entries, 'error');
+        const crashes = filterByType<CrashDetectedEntry & LogMeta>(d.entries, 'crash-detected');
+        const lastInit = filterByType<InitEntry>(d.entries, 'init').at(-1);
+        const lastPlatform = filterByType<PlatformEntry>(d.entries, 'platform').at(-1);
+
+        lines.push('\n> [!warning] Review before sharing — this report includes your recent search queries and matching note paths (but **not** note contents).');
+        lines.push(`\n**Full data:** \`${REPORT_JSON_PATH}\` — parse that for analysis; this \`.md\` is a human summary.`);
+        lines.push('\n## At a Glance');
+        lines.push(`- This device: \`${d.thisDevice}\` · session \`${d.thisSession}\``);
+        lines.push(`- Events: ${d.includedCount} in report${d.includedCount < d.entryCount ? ` of ${d.entryCount} total (older high-volume entries capped — see \`caps\` in the JSON)` : ''} · ${d.firstTimestamp} → ${d.lastTimestamp}`);
+        lines.push(`- Devices: ${d.devices.map(x => `\`${x.id}\` (${x.count})`).join(', ')}`);
+        if (lastInit) lines.push(`- Last init: v${lastInit.pluginVersion}, iframe ${lastInit.iframeReady ? '✅' : '❌'}${lastInit.error ? ` · ⚠️ \`${lastInit.error}\`` : ''}`);
+        if (lastPlatform) lines.push(`- Platform: ${lastPlatform.isMobile ? 'mobile' : 'desktop'} · GPU ${lastPlatform.gpuAvailable ? 'yes' : 'no'} · storage ${fmtMB(lastPlatform.storageUsedMB)} / ${fmtMB(lastPlatform.storageQuotaMB)}`);
+        lines.push(`- Searches ${searches.length} · index runs ${indexes.length} · errors ${errors.length} · crashes ${crashes.length}`);
         if (crashes.length > 0) {
-            lines.push('\n## Crash Forensics');
-            lines.push(`\n${crashes.length} unclean session end(s) detected across devices. Verdict legend: \`crash-while-indexing-foreground\` = memory-ceiling signature · \`crash-while-indexing-hidden\` = iOS background-GPU kill · \`evicted-while-hidden\` = normal suspended-app eviction.`);
-            lines.push('\n| When detected | Device | Verdict | Last beat | Gap |');
-            lines.push('|---|---|---|---|---:|');
-            for (const c of crashes.slice(-15)) {
-                const lastBeat = c.lastBeat
-                    ? `\`${c.lastBeat.type}\` (${c.lastBeat.vis})${c.lastBeat.detail ? ' ' + JSON.stringify(c.lastBeat.detail) : ''}`
-                    : '—';
-                const gap = c.gapSeconds != null ? `${Math.round(c.gapSeconds)}s` : '—';
-                lines.push(`| ${c.timestamp} | \`${c.deviceId ?? '?'}\` | **${c.verdict}** | ${lastBeat} | ${gap} |`);
-            }
-            const lastCrash = crashes.at(-1);
-            if (lastCrash && lastCrash.breadcrumbs.length > 0) {
-                lines.push('\n_Most recent crash — breadcrumb tail (oldest → newest):_');
-                lines.push('```');
-                for (const b of lastCrash.breadcrumbs) {
-                    lines.push(`${b.t} ${b.type} [${b.vis}]${b.detail ? ' ' + JSON.stringify(b.detail) : ''}`);
-                }
-                lines.push('```');
-            }
+            const c = crashes[crashes.length - 1];
+            lines.push('\n## ⚠️ Last Crash');
+            lines.push(`- ${c.timestamp} · \`${c.deviceId ?? '?'}\` · **${c.verdict}**`);
         }
-
-        // ---- Init ----
-        const lastInit = inits.at(-1);
-        if (lastInit) {
-            lines.push(`\n## Last Init${scopedToSession ? ' (this session)' : ''}`);
-            lines.push(`- Plugin version: \`${lastInit.pluginVersion}\``);
-            lines.push(`- Build timestamp: \`${lastInit.buildTimestamp}\``);
-            lines.push(`- transformers.js: \`${lastInit.transformersVersion}\``);
-            lines.push(`- CDN: \`${lastInit.cdnUrl}\``);
-            lines.push(`- Iframe ready: ${lastInit.iframeReady ? '✅' : '❌'}`);
-            // initMs is v11+ (older logs lack it). 0 = idempotent early-return
-            // (iframe already live), not a zero-cost build.
-            if (typeof lastInit.initMs === 'number') {
-                lines.push(`- Iframe build: ${lastInit.initMs === 0 ? 'cached (idempotent, 0 ms)' : `${lastInit.initMs} ms`}`);
-            }
-            if (lastInit.error) lines.push(`- Error: \`${lastInit.error}\``);
-        }
-
-        // ---- Platform ----
-        const lastPlatform = platforms.at(-1);
-        if (lastPlatform) {
-            lines.push(`\n## Platform${scopedToSession ? ' (this session)' : ''}`);
-            lines.push(`- Mobile: ${lastPlatform.isMobile}`);
-            // WKWebView FREEZES the OS version in its User-Agent (Apple caps it to
-            // avoid version-sniffing breakage), so this is NOT the real iOS version
-            // — a phone on iOS 26 reports "18.7" here. Treat it as a lower bound.
-            // A non-null GPU adapter below is a better "iOS ≥ 26" signal (the adapter
-            // was null pre-26). There's no reliable JS API for the true WebView OS version.
-            lines.push(`- iOS version (UA-reported, WKWebView-capped — real OS may be newer): ${lastPlatform.iosVersion ?? 'n/a'}`);
-            lines.push(`- GPU available: ${lastPlatform.gpuAvailable}${lastPlatform.gpuAvailable ? ' _(adapter present ⇒ iOS ≥ 26 / modern WebKit)_' : ''}`);
-            if (lastPlatform.gpuAdapterDescription) lines.push(`- GPU adapter: \`${lastPlatform.gpuAdapterDescription}\``);
-            if (lastPlatform.gpuAdapterLimits) {
-                const l = lastPlatform.gpuAdapterLimits;
-                lines.push(`- GPU limits: maxBuffer ${fmtBytes(l.maxBufferSize)}, maxStorageBufBind ${fmtBytes(l.maxStorageBufferBindingSize)}, workgroupX ${l.maxComputeWorkgroupSizeX ?? '—'}, invocations/wg ${l.maxComputeInvocationsPerWorkgroup ?? '—'}`);
-            }
-            lines.push(`- Storage quota: ${fmtMB(lastPlatform.storageQuotaMB)} · used: ${fmtMB(lastPlatform.storageUsedMB)}`);
-            lines.push(`- Persistent storage granted: ${lastPlatform.persistGranted ?? 'unknown'}`);
-            lines.push(`- Heap API available: ${lastPlatform.heapAvailable ?? 'unknown (pre-v2 log)'} _(false → expect null heapMB everywhere; iOS WebKit doesn't expose performance.memory)_`);
-            lines.push(`- measureUserAgentSpecificMemory available: ${lastPlatform.measureMemoryAvailable ?? 'unknown'} (crossOriginIsolated: ${lastPlatform.crossOriginIsolated ?? 'unknown'})`);
-            lines.push(`\n<details><summary>User-Agent</summary>\n\n\`${lastPlatform.userAgent}\`\n\n</details>`);
-        }
-
-        // ---- Loads ----
-        if (loads.length > 0) {
-            lines.push('\n## Model Loads');
-            lines.push('\n| Time | Requested | Actual | Dtype | Dim | Cold-start (ms) | Heap Δ (MB) | Storage Δ (MB) | Pass |');
-            lines.push('|---|---|---|---|---:|---:|---:|---:|:---:|');
-            for (const l of loads) {
-                // embeddingDim added in LOG_SCHEMA_VERSION 4. Older entries
-                // pre-date the field; render as "—" for back-compat.
-                const dim = (l as unknown as { embeddingDim?: number }).embeddingDim;
-                lines.push(
-                    `| ${fmtTs(l.timestamp)} | ${l.requestedDevice} | ${l.actualDevice} | ${l.dtype}` +
-                    ` | ${dim ?? '—'}` +
-                    ` | ${l.coldStartMs.toFixed(0)} | ${l.heapDeltaMB?.toFixed(1) ?? '—'}` +
-                    ` | ${l.storageDeltaMB?.toFixed(1) ?? '—'} | ${l.pass ? '✅' : '❌'} |`,
-                );
-            }
-            lines.push('\n### Load Checks');
-            for (const l of loads) {
-                lines.push(`\n**${fmtTs(l.timestamp)} (${l.actualDevice}/${l.dtype})**`);
-                for (const c of l.checks) lines.push(`- ${c}`);
-            }
-        }
-
-        // ---- Runtime profile (wall-time decomposition) ----
-        const lastProfile = profiles.at(-1);
-        if (lastProfile) {
-            lines.push('\n## Runtime Profile (wall-time decomposition)');
-            lines.push(
-                `\n_${fmtTs(lastProfile.timestamp)} · ${lastProfile.device}/${lastProfile.dtype}` +
-                ` · transformers.js ${lastProfile.transformersVersion}` +
-                ` · run ${(lastProfile.elapsedMs / 1000).toFixed(1)} s` +
-                ` · heap Δ ${lastProfile.heapDeltaMB?.toFixed(1) ?? '—'} MB (non-disposing)_`,
-            );
-            lines.push(`\n_${lastProfile.notes}_`);
-            lines.push('\n| bs × seq | tokenize p50 | forward p50 | post(readback) p50 | pipeline p50 | fwd % | tok % | /text fwd |');
-            lines.push('|---|---:|---:|---:|---:|---:|---:|---:|');
-            const ms = (d: DistributionStats | null) => d ? d.p50.toFixed(1) : '—';
-            for (const c of lastProfile.cells) {
-                lines.push(
-                    `| ${c.batchSize} × ${c.seqBucket}` +
-                    ` | ${ms(c.tokenizeMs)} | ${ms(c.forwardMs)} | ${ms(c.postMs)} | ${ms(c.pipelineTotalMs)}` +
-                    ` | ${c.forwardSharePct ?? '—'} | ${c.tokenizeSharePct ?? '—'}` +
-                    ` | ${c.perTextForwardMs ?? '—'} |`,
-                );
-            }
-            // The decision read, spelled out so the report is self-interpreting.
-            const probe = lastProfile.cells.find(c => c.batchSize === 8 && c.seqBucket === 128)
-                ?? lastProfile.cells[0];
-            if (probe) {
-                lines.push(
-                    `\n**Read (bs8×128):** forward ${probe.forwardSharePct ?? '—'}% of wall` +
-                    ` · tokenize ${probe.tokenizeSharePct ?? '—'}%.` +
-                    ` High forward% ⇒ GPU-forward-bound: I/O binding / worker low ROI (v4 kernel fix already captured it).` +
-                    ` High tokenize% ⇒ WASM tokenizer worth it. Climbing heap Δ ⇒ the undisposed-tensor leak is real.`,
-                );
-            }
-        }
-
-        // ---- Index ops ----
-        if (completes.length > 0 || resets.length > 0) {
-            lines.push('\n## Index Operations');
-            if (resets.length > 0) {
-                lines.push('\n### Resets (Full Reindex)');
-                lines.push('\n| Time | Chunks dropped | Vectors dropped | Duration (ms) | Pass |');
-                lines.push('|---|---:|---:|---:|:---:|');
-                for (const r of resets) {
-                    lines.push(`| ${fmtTs(r.timestamp)} | ${r.chunksDeleted} | ${r.vectorsDeleted} | ${r.durationMs.toFixed(0)} | ${r.pass ? '✅' : '❌'} |`);
-                }
-            }
-            if (completes.length > 0) {
-                lines.push('\n### Index Builds');
-                lines.push('\n| Time | Mode | Dtype/Dim | Files | Skipped | Chunks | Embed (ms) | Chunk (ms) | BM25 (ms) | Commit (ms) | Total (ms) | Chunks/s | Files/s | Heap Δ | Storage Δ | Pass |');
-                lines.push('|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|');
-                for (const c of completes) {
-                    // dtype + embeddingDim added in LOG_SCHEMA_VERSION 4.
-                    // Older entries render the cell as "—" for back-compat.
-                    const dtype = (c as unknown as { dtype?: string }).dtype;
-                    const dim = (c as unknown as { embeddingDim?: number }).embeddingDim;
-                    const dtypeDim = dtype && dim ? `${dtype}/${dim}` : '—';
-                    lines.push(
-                        `| ${fmtTs(c.timestamp)} | ${c.mode} | ${dtypeDim} | ${c.filesIndexed} | ${c.filesSkippedError ?? 0} | ${c.chunksIndexed}` +
-                        ` | ${c.embedDurationMs.toFixed(0)} | ${c.chunkDurationMs.toFixed(0)}` +
-                        ` | ${c.bm25DurationMs.toFixed(0)} | ${c.commitDurationMs.toFixed(0)}` +
-                        ` | ${c.totalDurationMs.toFixed(0)} | ${(c.chunksPerSec ?? 0).toFixed(1)} | ${(c.filesPerSec ?? 0).toFixed(1)}` +
-                        ` | ${c.heapDeltaMB?.toFixed(1) ?? '—'} | ${c.storageDeltaMB?.toFixed(1) ?? '—'}` +
-                        ` | ${c.pass ? '✅' : '❌'} |`,
-                    );
-                }
-
-                // Distribution summary for the most recent build only —
-                // the prior table's rows already capture history at the
-                // aggregate level; deep stats below are most useful for
-                // diagnosing the latest run.
-                const last = completes.at(-1)!;
-                if (last.perFileWallMs || last.chunksPerFile || last.embedBatchLatencyMs) {
-                    lines.push('\n### Last Build — Distributions');
-                    lines.push('\n| Metric | n | min | p50 | mean | p95 | max |');
-                    lines.push('|---|---:|---:|---:|---:|---:|---:|');
-                    if (last.perFileWallMs) lines.push(`| Per-file wall (ms) | ${distRow(last.perFileWallMs)} |`);
-                    if (last.chunksPerFile) lines.push(`| Chunks per file | ${distRow(last.chunksPerFile)} |`);
-                    if (last.embedBatchLatencyMs) lines.push(`| Embed batch latency (ms) | ${distRow(last.embedBatchLatencyMs)} |`);
-                }
-
-                lines.push('\n### Index Checks');
-                for (const c of completes) {
-                    lines.push(`\n**${fmtTs(c.timestamp)} — ${c.mode}**`);
-                    for (const ck of c.checks) lines.push(`- ${ck}`);
-                }
-            }
-        }
-
-        // ---- Index Progress (last N) ----
-        if (progress.length > 0) {
-            const lastN = progress.slice(-50);
-            lines.push('\n## Most Recent Index Progress (last 50 entries)');
-            lines.push('\n| Time | Phase | Files seen / total | Chunks emitted | Elapsed (ms) | Heap (MB) | Storage (MB) |');
-            lines.push('|---|---|---:|---:|---:|---:|---:|');
-            for (const p of lastN) {
-                lines.push(
-                    `| ${fmtTs(p.timestamp)} | ${p.phase} | ${p.filesSeen} / ${p.filesTotal}` +
-                    ` | ${p.chunksEmitted} | ${p.elapsedMs.toFixed(0)}` +
-                    ` | ${p.heapMB?.toFixed(1) ?? '—'} | ${p.storageMB?.toFixed(1) ?? '—'} |`,
-                );
-            }
-        }
-
-        // ---- Search history ----
-        if (searches.length > 0) {
-            lines.push('\n## Search History');
-            lines.push(`\n_Total queries: ${searches.length}_`);
-            lines.push('\n| Time | Query | TopK | IDB | Align | Embed | Iframe | Cosine | BM25 | Cache | Fusion | Snippet | Total | Chunks |');
-            lines.push('|---|---|---:|---:|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|');
-            for (const s of searches) {
-                const q = s.query.replace(/\|/g, '\\|').slice(0, 40);
-                lines.push(
-                    `| ${fmtTs(s.timestamp)} | \`${q}\` | ${s.topK}` +
-                    ` | ${(s.idbReadMs ?? 0).toFixed(0)} | ${(s.alignMs ?? 0).toFixed(0)}` +
-                    ` | ${s.queryEmbedMs.toFixed(0)} | ${(s.iframeEmbedMs ?? 0).toFixed(0)}` +
-                    ` | ${(s.cosineMs ?? 0).toFixed(0)} | ${s.bm25Ms.toFixed(0)}` +
-                    ` | ${s.bm25CacheHit ? '✅' : '❌'} | ${s.fusionMs.toFixed(0)}` +
-                    ` | ${(s.snippetMs ?? 0).toFixed(0)} | ${s.totalMs.toFixed(0)}` +
-                    ` | ${s.totalChunks} |`,
-                );
-            }
-
-            // Latency stats over recent N
-            const recent = searches.slice(-50);
-            const totals = recent.map(s => s.totalMs).sort((a, b) => a - b);
-            const p = (q: number) => totals[Math.floor((q / 100) * (totals.length - 1))]?.toFixed(0) ?? '—';
-            lines.push('\n### Recent Latency (last 50 searches)');
-            lines.push(`- Total p50 / p90 / p99: **${p(50)} / ${p(90)} / ${p(99)} ms**`);
-            // Per-stage rollups make it obvious which stage is the bottleneck.
-            const stageStats = (pick: (s: SearchEntry) => number) => {
-                const sorted = recent.map(pick).sort((a, b) => a - b);
-                const sp = (q: number) => sorted[Math.floor((q / 100) * (sorted.length - 1))]?.toFixed(0) ?? '—';
-                return `p50 ${sp(50)} / p95 ${sp(95)}`;
-            };
-            lines.push(`- IDB read: ${stageStats(s => s.idbReadMs ?? 0)} ms`);
-            lines.push(`- Align: ${stageStats(s => s.alignMs ?? 0)} ms`);
-            lines.push(`- Embed (parent): ${stageStats(s => s.queryEmbedMs)} ms — iframe-side: ${stageStats(s => s.iframeEmbedMs ?? 0)} ms`);
-            lines.push(`- Cosine: ${stageStats(s => s.cosineMs ?? 0)} ms`);
-            lines.push(`- BM25: ${stageStats(s => s.bm25Ms)} ms (cache hit rate: ${pctCacheHit(recent)}%)`);
-            lines.push(`- Fusion: ${stageStats(s => s.fusionMs)} ms`);
-            lines.push(`- Snippet: ${stageStats(s => s.snippetMs ?? 0)} ms`);
-
-            // Last few full breakdowns for diagnostic depth. fusedTop50 in
-            // NDJSON; we render only top-10 here to keep the report readable.
-            // Spreadsheet / offline analysis can read the full top-50 from
-            // seek-log.ndjson directly.
-            const last = searches.slice(-5);
-            lines.push('\n### Last 5 Searches — Top-10 Fused Results (full top-50 in NDJSON)');
-            for (const s of last) {
-                // Backward compatibility: pre-schema-v3 entries had `fusedTop10`
-                // and lacked `note_path` / `rank` / `searchId`. Read from the
-                // new field first, fall back to the old shape, normalize so
-                // the row renderer below sees a consistent structure.
-                interface RowLike {
-                    rank: number;
-                    note_path: string;
-                    title: string;
-                    score: number;
-                    dense: number;
-                    bm25: number;
-                    recency: number;
-                    title_boost: number;
-                }
-                interface OldRow {
-                    chunk_id: string;
-                    title: string;
-                    score: number;
-                    dense: number;
-                    bm25: number;
-                    recency: number;
-                    title_boost: number;
-                }
-                const legacy = s as unknown as { fusedTop10?: OldRow[] };
-                const fromNew = s.fusedTop50 ?? [];
-                const fromOld: RowLike[] = (legacy.fusedTop10 ?? []).map((r, i) => ({
-                    rank: i + 1,
-                    note_path: r.chunk_id,           // closest we have on old entries
-                    title: r.title,
-                    score: r.score,
-                    dense: r.dense,
-                    bm25: r.bm25,
-                    recency: r.recency,
-                    title_boost: r.title_boost,
-                }));
-                const rows: RowLike[] = fromNew.length > 0 ? fromNew : fromOld;
-                if (rows.length === 0) continue;
-
-                const sid = s.searchId ?? '(legacy)';
-                // Inline-filter annotation (v8+). Absent on older logs → blank.
-                const fp: string[] = [];
-                if (s.filters?.tags) fp.push(`tags:${s.filters.tags.join(',')}`);
-                if (s.filters?.includePaths) fp.push(`path:${s.filters.includePaths.join(',')}`);
-                if (s.filters?.frontmatter) fp.push(Object.entries(s.filters.frontmatter).map(([k, v]) => `${k}=${v}`).join(','));
-                if (s.filters?.createdAfter) fp.push(`created>${s.filters.createdAfter}`);
-                if (s.filters?.createdBefore) fp.push(`created<${s.filters.createdBefore}`);
-                if (s.filters?.modifiedAfter) fp.push(`modified>${s.filters.modifiedAfter}`);
-                if (s.filters?.modifiedBefore) fp.push(`modified<${s.filters.modifiedBefore}`);
-                const filterStr = fp.length ? ` · filters: ${fp.join(' ')}` : '';
-                const cleanedStr = (s.cleanedQuery && s.cleanedQuery !== s.query) ? ` · cleaned=\`${s.cleanedQuery}\`` : '';
-                const blendStr = s.blendMode === 'rrf' ? `, blend=rrf k=${s.rrfK}` : '';
-                lines.push(`\n**\`${s.query}\`** _(α=${s.alpha}, recencyW=${s.recencyWeight}${blendStr}${cleanedStr}${filterStr}, searchId=\`${sid}\`)_`);
-                lines.push('| Rank | Note path | Title | Final | Dense | BM25 | Recency | Title boost |');
-                lines.push('|---:|---|---|---:|---:|---:|---:|---:|');
-                rows.slice(0, 10).forEach(r => {
-                    const title = r.title.replace(/\|/g, '\\|').slice(0, 60);
-                    const path = r.note_path.replace(/\|/g, '\\|').slice(0, 50);
-                    lines.push(`| ${r.rank} | \`${path}\` | ${title} | ${r.score.toFixed(3)}` +
-                        ` | ${r.dense.toFixed(3)} | ${r.bm25.toFixed(3)} | ${r.recency.toFixed(3)} | ${r.title_boost.toFixed(3)} |`);
-                });
-            }
-        }
-
-        // ---- Click events / relevance ----
-        if (clicks.length > 0) {
-            lines.push('\n## Click Events / Relevance');
-            lines.push(`\n_Total clicks: ${clicks.length}. CTR-style breakdown by rank-of-click:_\n`);
-
-            // Group clicks by rank bucket. Industry convention: click-at-1
-            // is the cleanest "good ranking" signal; clicks at 2–3 mean the
-            // top-1 was wrong-ish but in the right neighborhood; clicks at
-            // 4+ mean the ranking is meaningfully off.
-            let r1 = 0, r23 = 0, r4to10 = 0, beyond10 = 0;
-            for (const c of clicks) {
-                if (c.rank === 1) r1++;
-                else if (c.rank <= 3) r23++;
-                else if (c.rank <= 10) r4to10++;
-                else beyond10++;
-            }
-            const pct = (n: number) => clicks.length === 0 ? '—' : `${((n / clicks.length) * 100).toFixed(0)}%`;
-            lines.push('| Rank bucket | Count | % of clicks |');
-            lines.push('|---|---:|---:|');
-            lines.push(`| Rank 1 (top hit clicked) | ${r1} | ${pct(r1)} |`);
-            lines.push(`| Rank 2–3 | ${r23} | ${pct(r23)} |`);
-            lines.push(`| Rank 4–10 | ${r4to10} | ${pct(r4to10)} |`);
-            lines.push(`| Rank 11+ (off-screen) | ${beyond10} | ${pct(beyond10)} |`);
-
-            // Per-click recent table (last 30) for narrative debugging.
-            const recent = clicks.slice(-30);
-            lines.push('\n### Recent Click Events (last 30)');
-            lines.push('| Time | Query | Rank | Clicked path | Score | Dwell (ms) |');
-            lines.push('|---|---|---:|---|---:|---:|');
-            for (const c of recent) {
-                const q = c.query.replace(/\|/g, '\\|').slice(0, 30);
-                const path = c.note_path.replace(/\|/g, '\\|').slice(0, 50);
-                lines.push(`| ${fmtTs(c.timestamp)} | \`${q}\` | ${c.rank} | \`${path}\` | ${c.score.toFixed(3)} | ${c.dwellMs.toFixed(0)} |`);
-            }
-
-            // Dwell time distribution — short dwell suggests "accepted top
-            // result", long dwell suggests "deliberated then picked".
-            const dwells = clicks.map(c => c.dwellMs).sort((a, b) => a - b);
-            const pq = (q: number) => dwells[Math.floor((q / 100) * (dwells.length - 1))]?.toFixed(0) ?? '—';
-            lines.push(`\n_Dwell p50 / p90: **${pq(50)} ms / ${pq(90)} ms**_`);
-        }
-
-        // ---- Long tasks ----
-        if (longTasks.length > 0) {
-            // Group by context for a quick "where's the jank?" view.
-            const byContext = new Map<string, LongTaskEntry[]>();
-            for (const t of longTasks) {
-                const arr = byContext.get(t.context) ?? [];
-                arr.push(t);
-                byContext.set(t.context, arr);
-            }
-            lines.push('\n## Long Tasks (≥250 ms main-thread blocks)');
-            lines.push(`\n_Total: ${longTasks.length}. Per-context breakdown:_\n`);
-            lines.push('| Context | Count | Sum (ms) | Max (ms) |');
-            lines.push('|---|---:|---:|---:|');
-            for (const [ctx, arr] of byContext) {
-                const sum = arr.reduce((s, t) => s + t.durationMs, 0);
-                const max = arr.reduce((m, t) => Math.max(m, t.durationMs), 0);
-                lines.push(`| ${ctx} | ${arr.length} | ${sum.toFixed(0)} | ${max.toFixed(0)} |`);
-            }
-            // Show the worst 20 so the user can spot specific bad actors.
-            const worst = [...longTasks].sort((a, b) => b.durationMs - a.durationMs).slice(0, 20);
-            lines.push('\n### Worst 20');
-            lines.push('| Time | Context | Duration (ms) | Attribution |');
-            lines.push('|---|---|---:|---|');
-            for (const t of worst) {
-                lines.push(`| ${fmtTs(t.timestamp)} | ${t.context} | ${t.durationMs.toFixed(0)} | ${t.attribution ?? '—'} |`);
-            }
-        }
-
-        // ---- Memory pressure events ----
-        if (memoryPressure.length > 0) {
-            // Limit to the last 30 — page lifecycle events fire often.
-            const lastN = memoryPressure.slice(-30);
-            lines.push('\n## Memory Pressure Events');
-            lines.push('\n_Captured at visibility/pagehide. Useful for correlating iOS jetsam with last-known state._\n');
-            lines.push('| Time | Event | Heap (MB) | Storage (MB) | Persisted |');
-            lines.push('|---|---|---:|---:|:---:|');
-            for (const m of lastN) {
-                lines.push(`| ${fmtTs(m.timestamp)} | ${m.event} | ${m.heapMB?.toFixed(1) ?? '—'} | ${m.storageMB?.toFixed(1) ?? '—'} | ${m.persisted ? '✅' : '❌'} |`);
-            }
-        }
-
-        // ---- Storage snapshots ----
-        if (storageSnaps.length > 0) {
-            lines.push('\n## Storage Snapshots');
-            lines.push('\n| Time | Context | Used (MB) | Quota (MB) | Heap (MB) |');
-            lines.push('|---|---|---:|---:|---:|');
-            for (const s of storageSnaps) {
-                lines.push(`| ${fmtTs(s.timestamp)} | ${s.context} | ${s.storageUsedMB?.toFixed(1) ?? '—'} | ${s.storageQuotaMB?.toFixed(0) ?? '—'} | ${s.heapMB?.toFixed(1) ?? '—'} |`);
-            }
-        }
-
-        // ---- Phase 1 telemetry: eviction-suspected + app-local probe ----
-        // These two sections answer the rearchitecture plan's Phase 1 exit
-        // criteria: is the model cache being evicted (count + storage drop
-        // at the same timestamp), and does `app://local/...` work inside
-        // the iframe (gates the Phase 3 shard streaming pattern).
-        if (evictions.length > 0) {
-            lines.push('\n## Eviction Suspected (cold-start ≥ 5 s)');
-            lines.push(`\n_Count: ${evictions.length}. Plan exit criterion is ≥3 outliers on iOS._\n`);
-            lines.push('| Time | Cold-start (ms) | Device | Dtype | Storage used (MB) | Quota (MB) | Persisted |');
-            lines.push('|---|---:|---|---|---:|---:|:---:|');
-            for (const e of evictions.slice(-30)) {
-                lines.push(
-                    `| ${fmtTs(e.timestamp)} | ${e.coldStartMs.toFixed(0)} | ${e.actualDevice} | ${e.dtype}` +
-                    ` | ${e.storageUsedMB?.toFixed(1) ?? '—'} | ${e.storageQuotaMB?.toFixed(0) ?? '—'}` +
-                    ` | ${e.persisted == null ? '—' : (e.persisted ? '✅' : '❌')} |`,
-                );
-            }
-        }
-        if (probes.length > 0) {
-            const last = probes.at(-1)!;
-            const okCount = probes.filter(p => p.result === 'ok').length;
-            lines.push('\n## App-Local Fetch Probe');
-            lines.push(`\n_Last result: **${last.result}** (${okCount}/${probes.length} sessions ok). Gates Phase 3 shard pattern._\n`);
-            lines.push(`- URL: \`${last.url || '(no resourcePath)'}\``);
-            lines.push(`- HTTP status: ${last.httpStatus ?? '—'}`);
-            lines.push(`- Body matched probe content: ${last.bodyMatched == null ? '—' : (last.bodyMatched ? '✅' : '❌')}`);
-            if (last.error) lines.push(`- Error: \`${last.error}\``);
-        }
-
-        // ---- Errors ----
         if (errors.length > 0) {
-            lines.push('\n## Errors');
-            for (const err of errors.slice(-30)) {
-                lines.push(`\n**${fmtTs(err.timestamp)} — ${err.context}**`);
-                lines.push('```');
-                lines.push(err.message);
-                lines.push('```');
-                if (err.stack) {
-                    lines.push(`<details><summary>Stack trace</summary>\n\n\`\`\`\n${err.stack}\n\`\`\`\n\n</details>`);
-                }
-            }
+            lines.push('\n## Recent Errors');
+            for (const e of errors.slice(-5)) lines.push(`- \`${e.context}\` — ${e.message}`);
         }
-
         return lines.join('\n') + '\n';
     }
 
+    // Write both report artifacts to the vault root from a single data build: the full
+    // structured seek-report.json (the parse target) and a short seek-report.md human
+    // summary. Returns the .md path — that's what opens in Obsidian, and it points the
+    // reader at the .json.
     async writeReport(): Promise<string> {
-        const content = await this.generateReport();
         const adapter = this.app.vault.adapter;
-        await adapter.write(REPORT_PATH, content);
+        const data = await this.buildReportData();
+        await adapter.write(REPORT_JSON_PATH, JSON.stringify(data, null, 2));
+        await adapter.write(REPORT_PATH, this.summarize(data));
         return REPORT_PATH;
     }
 }

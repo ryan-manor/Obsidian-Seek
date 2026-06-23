@@ -360,6 +360,12 @@ export interface SeekSettings {
     // applies to the next time the search modal opens.
     showScores: boolean;
 
+    // Diagnostic-only knob (no settings UI; set via data.json or an `obsidian eval`
+    // settings inject). When false — the default — each search row persists only the
+    // top-10 ranking trace the report actually renders; when true it keeps the full
+    // 50-deep tail for offline pandas/eval. Bounds the size of the append-only log.
+    verboseTrace: boolean;
+
     // Search-modal footer affordance. ON (default) shows the keyboard-hint bar
     // along the bottom of the modal (↑↓ navigate · ↵ open · ⌘↵ new tab · tab
     // fill autosuggest · esc close). OFF removes the whole footer for a minimal
@@ -454,6 +460,7 @@ export const DEFAULT_SETTINGS: SeekSettings = {
     honorIgnoredFolders: true, // Archive et al. are soft-deletes by default
     indexBases: true,          // ON: index .base files (Obsidian Bases) as synthetic docs; preserves the feature's unconditional pre-toggle behavior
     showScores: true,          // ON: per-result score line (Matching % · recency · title); auto-disabled until the corpus is calibrated (≥200 notes + full pass)
+    verboseTrace: false,       // OFF: persist only the top-10 ranking trace per search (what the report shows); ON = full 50-deep tail for offline eval. Diagnostic-only, no UI
     showHotkeyHints: true,     // ON: show the modal footer keyboard-hint bar + result counter; OFF = full-results-only modal
     sidecarEnabled: true,      // ON (hidden) per the 2026-06-19 ratification; vault-file index persistence for iOS-eviction survival + cross-device sync; only Index location stays user-facing; seeds on next reindex — see field comment
     sidecarIndexLocation: 'config', // hidden literal '.obsidian/plugins/seek/index'; 'visible' = vault-root 'Seek Index/' for split-config Obsidian Sync; see field comment
@@ -814,9 +821,10 @@ export interface SearchEntry {
     binaryCacheHit: boolean;
     rawDenseTop5: Array<{ chunk_id: string; score: number }>;
     rawBm25Top5: Array<{ chunk_id: string; score: number }>;
-    // Full ranking trace for offline analysis. The report renderer truncates
-    // to top-10 by default; this field exists in NDJSON for spreadsheet /
-    // pandas eval where you want to see the full long tail. NOTE: from v7
+    // Ranking trace for offline analysis. Persisted depth is gated by the
+    // verboseTrace setting: top-10 by default (exactly what the report renders,
+    // keeping the append-only log small), or the full 50-deep tail when verboseTrace
+    // is on — for spreadsheet / pandas eval over the long tail. NOTE: from v7
     // this trace is over the CANDIDATE UNION (~250), not all chunks — the
     // "rank" field is the candidate-set rank, not a global rank.
     fusedTop50: Array<{
@@ -905,6 +913,12 @@ export interface ErrorEntry {
     context: string;
     message: string;
     stack: string | null;
+    // Running occurrence count carried on a milestone/flush row when errors are deduped
+    // by message: how many times this message has fired this session as of this row.
+    // Errors are written at exponential milestones (2,4,8,…), not one row each, so a
+    // chronic fault like "iframe not initialized" costs ~log2(N) rows instead of N.
+    // Absent ⇒ a first/only occurrence.
+    repeated?: number;
 }
 
 export interface ResetEntry {

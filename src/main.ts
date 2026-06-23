@@ -25,7 +25,6 @@ import { sweepOrphanTmpFiles } from './sidecar';
 import type { SeekSettings, SidecarIndexLocation, IndexCompleteEntry, ModelDeliveryEntry } from './types';
 import { DEFAULT_SETTINGS, migrateSettings } from './types';
 import { IndexStore } from './index-store';
-import { formatIndexSizeReport, type IndexSizeReport } from './index-size';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
 import { SearchOrchestrator, driftRecoveryDecision } from './search';
@@ -35,9 +34,7 @@ import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBacke
 import { CompositorPacer } from './pacer';
 import { shouldUnloadEmbedder, type UnloadGateState } from './embedder-lifecycle';
 import { drainCatchUp, CATCHUP_MAX_FILES_PER_BURST, CATCHUP_BURST_BUDGET_MS } from './catchup';
-import type { LongTaskEntry, MemoryPressureEntry, StorageSnapshotEntry, EvictionSuspectedEntry, AppLocalFetchEntry, EmbedProfileEntry, ProfileCell } from './types';
-import { distributionStats, snapshotMemory, memoryDelta, LOG_SCHEMA_VERSION } from './types';
-import type { RawProfileCell } from './iframe-runner';
+import type { LongTaskEntry, MemoryPressureEntry, StorageSnapshotEntry, EvictionSuspectedEntry, AppLocalFetchEntry } from './types';
 import { TRANSFORMERS_VERSION } from './iframe-runner';
 
 // Long-task threshold. PerformanceObserver fires for any task ≥50 ms by spec,
@@ -55,41 +52,6 @@ function isIndexableFile(f: TFile, indexBases: boolean): boolean {
     return indexBases && f.extension === 'base';
 }
 
-// Runtime-profile matrix. Batch axis is the decisive one: the v4 ORT-Web
-// fix was specifically the MatMulNBits M>1 (prefill) kernel, and M scales
-// with batch — so 1 (iOS-ish single) vs 8 (mobile ceiling) vs 32 (desktop
-// ceiling) is exactly the axis that tells us whether v4 actually closed the
-// gap at the batch sizes the indexer uses. Buckets mirror SEQ_BUCKETS.
-// 3×5 cells × 5 reps ≈ 75 forward passes + 75 production-path passes ≈ a
-// few seconds; acceptable for an explicit diagnostic command.
-const PROFILE_BATCH_SIZES = [1, 8, 32];
-const PROFILE_SEQ_BUCKETS = [32, 64, 128, 256, 512];
-const PROFILE_REPS = 5;
-
-// Collapse one cell's raw timing arrays into the logged ProfileCell. Shares
-// are p50-derived (robust to the occasional GC/scheduler outlier in a
-// 5-sample cell). forwardSharePct vs tokenizeSharePct are THE decision reads
-// — see EmbedProfileEntry in types.ts for how each maps to an idea-list
-// question.
-function buildProfileCell(raw: RawProfileCell): ProfileCell {
-    const tk = distributionStats(raw.tokenize);
-    const fw = distributionStats(raw.forward);
-    const po = distributionStats(raw.post);
-    const pi = distributionStats(raw.pipe);
-    const denom = (tk?.p50 ?? 0) + (fw?.p50 ?? 0) + (po?.p50 ?? 0);
-    return {
-        batchSize: raw.batchSize,
-        seqBucket: raw.seqBucket,
-        reps: raw.reps,
-        tokenizeMs: tk,
-        forwardMs: fw,
-        postMs: po,
-        pipelineTotalMs: pi,
-        forwardSharePct: denom > 0 && fw ? Number((100 * fw.p50 / denom).toFixed(1)) : null,
-        tokenizeSharePct: denom > 0 && tk ? Number((100 * tk.p50 / denom).toFixed(1)) : null,
-        perTextForwardMs: fw && raw.batchSize > 0 ? Number((fw.p50 / raw.batchSize).toFixed(2)) : null,
-    };
-}
 
 // Incremental-indexing debounces. Edits wait out a 5-min idle window after the
 // user leaves a note (so flipping back to keep writing never triggers a flush
@@ -257,11 +219,17 @@ export default class SeekPlugin extends Plugin {
     async onload() {
         this.logger = new SeekLogger(this.app);
         // Sweep any pre-existing root-level seek-log/init/captures files into the
-        // hidden LOG_DIR next to the index. Fire-and-forget: new writes already
-        // target LOG_DIR, and the report listing reads both locations during the
-        // window, so this only declutters the file explorer — it blocks nothing.
-        void this.logger.migrateRootFiles().catch(e =>
-            this.logger.appendError('logger-migrate-root-onload', e).catch(() => {}));
+        // hidden LOG_DIR next to the index, THEN tail-truncate this device's log if it
+        // has outgrown MAX_LOG_BYTES (append-only logs have no natural ceiling), THEN
+        // prune any abandoned other-device / legacy logs (pruneOrphanLogs). All three are
+        // fire-and-forget: new writes already target LOG_DIR, the report reads both
+        // locations during the migration window, and rotation/pruning only shrink the tail
+        // or drop dead files — so this blocks nothing on the load path. The steps chain in
+        // order so each operates on the files at their final LOG_DIR location.
+        void this.logger.migrateRootFiles()
+            .then(() => this.logger.rotateIfOversize())
+            .then(() => this.logger.pruneOrphanLogs())
+            .catch(e => this.logger.appendError('logger-onload-maintenance', e).catch(() => {}));
         // Load persisted settings (merge over defaults so new keys appear).
         // Mutate the existing object in place — the orchestrator holds this
         // same reference.
@@ -353,7 +321,6 @@ export default class SeekPlugin extends Plugin {
         // is ~5 ms for an empty store and ~100 ms for a 5k-chunk vault.
         try {
             const packed = await this.store.backfillBinaryIfMissing();
-            if (packed > 0) console.log(`[seek] backfilled binary index for ${packed} existing chunks`);
         } catch (e) {
             // Backfill failure isn't fatal: the user can rebuild via "Full
             // reindex". Log it and continue plugin init.
@@ -493,7 +460,7 @@ export default class SeekPlugin extends Plugin {
                 // no search will work, which is worth one toast.
                 if (!initEntry.iframeReady || initEntry.error) {
                     new Notice(
-                        `Seek: search engine failed to start${initEntry.error ? ` — ${initEntry.error.slice(0, 80)}` : ''}. See seek-log.ndjson.`,
+                        `Seek: search engine failed to start${initEntry.error ? ` — ${initEntry.error.slice(0, 80)}` : ''}. See Settings → Seek → Generate logging report.`,
                         8000,
                     );
                 }
@@ -539,194 +506,15 @@ export default class SeekPlugin extends Plugin {
             else this.openSearchModal(query);
         });
 
-        this.addCommand({
-            id: 'seek-full-reindex',
-            name: 'Full reindex (nuke and rebuild)',
-            // Shared with the settings "Full reindex" button — see runFullReindex.
-            callback: () => this.runFullReindex(),
-        });
 
-        // NOTE: the manual "Reconcile index from other devices (sidecar)" and
-        // "Rebuild from sidecar (no re-embed)" commands were removed (Phase 4) — the
-        // shipped plugin self-heals with no user commands. Their orchestrator methods
-        // (hydrateSidecar / rebuildFromSidecar) live on, driven internally by the boot
-        // identity cascade (enforceIndexIdentity) and the 5-min poll (periodicReconcile).
-        // "Full reindex (nuke and rebuild)" above is kept as the one human recovery affordance.
-
-        // ── Phase-5: trimmed-model smoke test (load + embed 10) ──────────
-        // Crash-survivable: every stage is appended (disk-flushed) to
-        // seek-log.ndjson BEFORE the next heavy step, so an iOS WKWebView
-        // memory-ceiling crash still shows how far it got. This answers the
-        // core vocab-trim question: does the ~102 MB trimmed q4 LOAD on iOS
-        // where the ~195 MB stock model does not?
-        this.addCommand({
-            id: 'seek-phase5-smoke',
-            name: 'Phase-5 trimmed-model smoke test (load + embed 10)',
-            callback: async () => {
-                const slog = async (stage: string, extra: Record<string, string | number | boolean> = {}) => {
-                    try {
-                        await this.logger.append({
-                            type: 'phase5-smoke',
-                            timestamp: new Date().toISOString(),
-                            stage,
-                            ...extra,
-                        });
-                    } catch (_) { /* logging must never throw */ }
-                };
-                const notice = new Notice('Seek Phase-5 smoke: starting…', 0);
-                try {
-                    await slog('start', {
-                        enabled: LOCAL_MODEL.enabled,
-                        dtype: LOCAL_MODEL.dtype,
-                        vaultRelPath: LOCAL_MODEL.vaultRelPath,
-                    });
-                    const t0 = performance.now();
-                    await this.ensureModelLoaded();
-                    await slog('model-loaded', {
-                        device: this.embedder.device,
-                        dtype: this.embedder.dtype,
-                        loadMs: +(performance.now() - t0).toFixed(1),
-                    });
-                    notice.setMessage('Seek Phase-5 smoke: model loaded, embedding 10…');
-                    const docs = [
-                        'task: search result | query: lightroom masking',
-                        'title: none | text: Alex owns query understanding.',
-                        'title: none | text: Vector DB tradeoffs: HNSW recall vs memory.',
-                        'title: none | text: EmbeddingGemma vocab trim to 64k.',
-                        'title: none | text: Obsidian dataview inline queries.',
-                        'title: none | text: Weekly review and 1x1 notes.',
-                        'title: none | text: ONNX MatMulNBits q4 on WebGPU.',
-                        'title: none | text: Sidecar JSONL per-device sync.',
-                        'title: none | text: Generative ideation design assets.',
-                        'title: none | text: Photo styles in Lightroom desktop GA.',
-                    ];
-                    for (let i = 0; i < docs.length; i++) {
-                        const te = performance.now();
-                        const r = await this.embedder.embed(docs[i]);
-                        let nrm = 0;
-                        for (let k = 0; k < r.vector.length; k++) nrm += r.vector[k] * r.vector[k];
-                        await slog('embed', {
-                            i: i + 1,
-                            n: docs.length,
-                            ms: +(performance.now() - te).toFixed(1),
-                            dim: r.vector.length,
-                            norm: +Math.sqrt(nrm).toFixed(4),
-                        });
-                    }
-                    await slog('done', {});
-                    notice.hide();
-                    new Notice('Seek Phase-5 smoke: loaded + embedded 10. See seek-log.ndjson.', 10000);
-                } catch (e) {
-                    await slog('error', { error: String((e && e.stack) || e) });
-                    await this.logger.appendError('seek-phase5-smoke', e);
-                    notice.hide();
-                    new Notice('Seek Phase-5 smoke: FAILED — ' + e, 0);
-                }
-            },
-        });
-
-        this.addCommand({
-            id: 'seek-unload-model',
-            name: 'Unload model (simulate cold start)',
-            callback: async () => {
-                // Disposes pipeline + iframe DOM; the Cache API entries for
-                // the model bytes (~250 MB) survive, so the next load is a
-                // realistic "user returning to Obsidian" cold start, NOT a
-                // true first-install scenario (which would re-download the
-                // model from CDN). To clear the model cache entirely, the
-                // user would need to clear browser storage manually.
-                const notice = new Notice('Seek: unloading model…', 0);
-                try {
-                    this.embedder.teardown();
-                    await this.embedder.init();
-                    this.modelLoadPromise = null;
-                    notice.hide();
-                } catch (e) {
-                    notice.hide();
-                    await this.logger.appendError('seek-unload-model', e);
-                    new Notice(`❌ Unload failed: ${e}`, 0);
-                }
-            },
-        });
-
-        this.addCommand({
-            id: 'seek-profile-runtime',
-            name: 'Profile runtime (wall-time decomposition)',
-            callback: async () => {
-                const notice = new Notice('Seek: profiling runtime (a few seconds)…', 0);
-                this.currentTaskContext = 'indexing';
-                try {
-                    await this.ensureModelLoaded();
-                    const memBefore = await snapshotMemory();
-                    const start = performance.now();
-                    const raw = await this.embedder.profile(
-                        PROFILE_BATCH_SIZES, PROFILE_SEQ_BUCKETS, PROFILE_REPS);
-                    const elapsedMs = performance.now() - start;
-                    const memAfter = await snapshotMemory();
-
-                    const cells = raw.cells.map(buildProfileCell);
-                    const entry: EmbedProfileEntry = {
-                        type: 'embed-profile',
-                        timestamp: new Date().toISOString(),
-                        schemaVersion: LOG_SCHEMA_VERSION,
-                        device: this.embedder.device,
-                        dtype: this.embedder.dtype,
-                        transformersVersion: TRANSFORMERS_VERSION,
-                        cells,
-                        heapDeltaMB: memoryDelta(memBefore, memAfter).heapDeltaMB,
-                        elapsedMs: Number(elapsedMs.toFixed(0)),
-                        notes: 'postMs = GPU→CPU readback boundary (not full pool/normalize); '
-                            + 'non-disposing path — heapDeltaMB is a leak-hypothesis read.',
-                    };
-                    await this.logger.append(entry);
-
-                    // One-line verdict on the cell the indexer actually hits
-                    // most (mobile ceiling 8 × the p50 bucket 128). fwd-share
-                    // high ⇒ forward-bound (I/O binding low ROI); tok-share
-                    // high ⇒ WASM tokenizer worth it.
-                    const probe = cells.find(c => c.batchSize === 8 && c.seqBucket === 128)
-                        ?? cells[0];
-                    notice.hide();
-                    new Notice(
-                        `Seek profile · ${this.embedder.device}/${this.embedder.dtype} · `
-                        + `bs8×128: forward ${probe?.forwardSharePct ?? '—'}% · `
-                        + `tokenize ${probe?.tokenizeSharePct ?? '—'}% · `
-                        + `heapΔ ${entry.heapDeltaMB?.toFixed(1) ?? '—'} MB · see seek-log.ndjson`,
-                        10000,
-                    );
-                } catch (e) {
-                    notice.hide();
-                    await this.logger.appendError('seek-profile-runtime', e);
-                    new Notice(`❌ Runtime profile failed: ${e}`, 0);
-                } finally {
-                    this.currentTaskContext = 'idle';
-                }
-            },
-        });
-
-        this.addCommand({
-            id: 'seek-generate-log',
-            name: 'Generate logging report',
-            callback: async () => {
-                const notice = new Notice('Seek: generating report…', 0);
-                try {
-                    const path = await this.logger.writeReport();
-                    notice.hide();
-                    const file = this.app.vault.getAbstractFileByPath(path);
-                    if (file instanceof TFile) {
-                        await this.app.workspace.getLeaf(false).openFile(file);
-                    }
-                    new Notice(`Seek: report written to ${path}`, 6000);
-                } catch (e) {
-                    notice.hide();
-                    await this.logger.appendError('seek-generate-log', e);
-                    new Notice(`❌ Report generation failed: ${e}`, 0);
-                }
-            },
-        });
+        // Reindex and diagnostics are intentionally NOT palette commands: a full
+        // reindex nukes and re-embeds the whole vault (too destructive for a fuzzy
+        // palette match), so it lives in Settings → Seek → Index behind a confirm;
+        // the logging report is a Settings button (openLoggingReport). Sidecar
+        // reconcile/rebuild are automatic. Search is the only command Seek adds.
 
         // ---- Headless CLI query handler --------------------------------
-        // `obsidian seek:search query="..." [limit=N] [verbose]`.
+        // `obsidian seek:search query="..." [limit=N]`.
         //
         // registerCliHandler is provided by the obsidian-cli companion, not the
         // core Obsidian API typings — hence the cast and the runtime guard. On
@@ -737,8 +525,8 @@ export default class SeekPlugin extends Plugin {
         // void (their job is to open the modal), so they can never feed the CLI —
         // that is why `seek:seek-search` was unreachable. Output defaults to a
         // readable text list (rank/score/path/excerpt); `format=json` emits the
-        // machine shape (path/title/score/excerpt, +chunk_id/signals under
-        // `verbose`), matching the predecessor plugin so the same parsing works.
+        // machine shape (path/title/score/excerpt), matching the predecessor
+        // plugin so the same parsing works.
         const registerCliHandler = (this as unknown as {
             registerCliHandler?: (
                 id: string,
@@ -757,7 +545,6 @@ export default class SeekPlugin extends Plugin {
                     query: { value: '<text>', description: 'Search query (supports inline filters: #tag, tag:, path:, [k:v], dates)', required: true },
                     limit: { value: '<n>', description: 'Max results (default: 10)', required: false },
                     format: { value: 'text|json', description: 'Output format (default: text — readable list; json for programmatic use)', required: false },
-                    verbose: { description: 'Add heading breadcrumb + ranking signals (applies to both formats)', required: false },
                     recencyWeight: { value: '<ε>', description: 'Override recency weight ε for THIS query only (additive; default 0.02). Not persisted — for scrobbling recency configs.', required: false },
                     recencyHalflife: { value: '<days>', description: 'Override recency half-life in days for THIS query only (default 180). Not persisted.', required: false },
                 },
@@ -766,7 +553,6 @@ export default class SeekPlugin extends Plugin {
                 // compare against both.
                 async (args: Record<string, string | boolean | undefined>): Promise<string> => {
                     const query = typeof args.query === 'string' ? args.query : '';
-                    const verbose = args.verbose === true || args.verbose === 'true';
                     const asJson = args.format === 'json';
                     // Error sink that honors the active format: JSON callers get a
                     // parseable {error}, humans get a one-liner.
@@ -811,26 +597,16 @@ export default class SeekPlugin extends Plugin {
                                     score: r.score,
                                     excerpt: r.snippet ?? '',
                                 };
-                                if (verbose) {
-                                    base.chunk_id = r.chunk_id;
-                                    base.heading_path = r.heading_path;
-                                    base.signals = r.ranking_signals;
-                                }
                                 return base;
                             });
-                            return JSON.stringify(
-                                { results: mapped, query, count: mapped.length },
-                                null,
-                                verbose ? 2 : undefined,
-                            );
+                            return JSON.stringify({ results: mapped, query, count: mapped.length });
                         }
 
                         // ---- default: human-readable text ----------------------
                         // Minified single-line JSON wraps into an unreadable wall
                         // in a terminal. The readable form emits real newlines —
                         // one record per block: "rank  score  path", with the
-                        // excerpt (and, under `verbose`, the heading breadcrumb +
-                        // ranking signals) indented to align beneath the path.
+                        // excerpt indented to align beneath the path.
                         if (results.length === 0) return `Seek · "${query}" · no results`;
 
                         const INDENT = ' '.repeat(11); // width of "NN  0.000  "
@@ -840,11 +616,6 @@ export default class SeekPlugin extends Plugin {
                         ];
                         results.forEach((r, i) => {
                             lines.push(`${String(i + 1).padStart(2, ' ')}  ${r.score.toFixed(3)}  ${r.note_path}`);
-                            if (verbose) {
-                                if (r.title) lines.push(`${INDENT}${r.title}`);
-                                const s = r.ranking_signals;
-                                lines.push(`${INDENT}dense ${s.dense.toFixed(2)} (raw ${s.denseRaw.toFixed(3)}) · bm25 ${s.bm25.toFixed(2)} · recency ${s.recency.toFixed(2)} · title ${s.title_boost.toFixed(2)}`);
-                            }
                             const excerpt = (r.snippet ?? '').replace(/\s+/g, ' ').trim();
                             if (excerpt) lines.push(`${INDENT}${excerpt.length > 160 ? excerpt.slice(0, 159) + '…' : excerpt}`);
                             lines.push('');
@@ -860,76 +631,6 @@ export default class SeekPlugin extends Plugin {
                     }
                 },
             );
-
-            // `obsidian seek:reindex` — headless full reindex. The palette
-            // command gates on window.confirm (right for a GUI nuke-and-rebuild,
-            // but it hangs a headless bridge call); typing the CLI command IS
-            // the explicit intent, so no confirm here. Added 2026-06-10 so
-            // deploy verification can run through the CLI.
-            registerCliHandler.call(
-                this,
-                'seek:reindex',
-                'Seek full reindex (nuke and rebuild)',
-                {},
-                async (): Promise<string> => {
-                    if (!this.orchestrator) return 'Seek error: not initialized — plugin still loading';
-                    this.currentTaskContext = 'indexing';
-                    try {
-                        await this.ensureModelLoaded();
-                        this.orchestrator.invalidateBm25Cache();
-                        const result = await this.orchestrator.reindexAll(() => { /* no progress sink headless */ });
-                        await this.emitStorageSnapshot('post-reindex');
-                        // A full reindex re-couples the index from scratch — clear any
-                        // degraded drift state so a stale banner can't outlive a CLI
-                        // reindex (mirrors runFullReindex; every reindex path must clear it).
-                        this.indexHealth = 'healthy';
-                        return [
-                            result.pass ? 'PASS' : 'FAIL',
-                            `${result.filesIndexed} files`,
-                            `${result.chunksIndexed} chunks`,
-                            `${(result.totalDurationMs / 1000).toFixed(1)} s`,
-                            `${result.chunksPerSec.toFixed(1)} ch/s`,
-                            `model ${this.embedder.modelId} · ${this.embedder.device} · ${this.embedder.dtype}`,
-                        ].join(' · ');
-                    } catch (err) {
-                        return `Seek error: ${err instanceof Error ? err.message : String(err)}`;
-                    } finally {
-                        this.currentTaskContext = 'idle';
-                    }
-                },
-            );
-
-            // `obsidian seek:indexsize [format=json]` — diagnostic. Walks each
-            // store, sums logical bytes, and prints the physical/slack split from
-            // navigator.storage.estimate(). Read-only, no schema touch. Desktop-only
-            // (the bridge is absent on iOS — the settings "Storage breakdown" button
-            // covers the phone). NOTE: desktop slack is harmless (40 GB quota) and
-            // not web-reclaimable, so this is a trend/telemetry surface, not a
-            // call-to-action — there is intentionally no companion `seek:compact`.
-            registerCliHandler.call(
-                this,
-                'seek:indexsize',
-                'Seek index size breakdown (per-store logical bytes + physical/slack)',
-                {
-                    format: { value: 'text|json', description: 'Output format (default: text — readable table; json for the raw report)', required: false },
-                },
-                async (args: Record<string, string | boolean | undefined>): Promise<string> => {
-                    if (!this.store) return 'Seek error: not initialized — plugin still loading';
-                    try {
-                        const report = await this.measureIndexSize();
-                        return args.format === 'json'
-                            ? JSON.stringify(report, null, 2)
-                            : formatIndexSizeReport(report);
-                    } catch (err) {
-                        return `Seek error: ${err instanceof Error ? err.message : String(err)}`;
-                    }
-                },
-            );
-            // NOTE: no `seek:compact` handler by design — embed-free compaction does
-            // not reclaim physical disk on desktop (LevelDB won't compact dead SSTs
-            // from web code; a live run GREW the store 60 → 72 MB). See
-            // settings-tab.ts renderSizeRow + IndexStore.compact for the retained,
-            // unwired mechanism kept only for a possible future iOS-gated path.
         }
     }
 
@@ -997,7 +698,6 @@ export default class SeekPlugin extends Plugin {
                 await this.logger.appendError('sidecar-migrate-file', e).catch(() => {});
             }
         }
-        console.log(`[seek] sidecar migration: moved ${moved}/${ls.files.length} files ${from} → ${to}`);
     }
 
     // Steer the lone unreachable case to the visible folder: Obsidian Sync + a
@@ -1201,7 +901,7 @@ export default class SeekPlugin extends Plugin {
                 // every cold open. Warnings still get a toast: a degraded load
                 // is worth interrupting for, and the glyph can't convey "why".
                 if (!entry.pass) {
-                    new Notice(`Seek model loaded with warnings on ${entry.actualDevice}. See seek-log.ndjson.`, 8000);
+                    console.warn(`[seek] model loaded with warnings on ${entry.actualDevice} — see the logging report (Settings → Seek).`);
                 }
             } catch (e) {
                 this.modelLoadPromise = null; // allow retry
@@ -1283,8 +983,7 @@ export default class SeekPlugin extends Plugin {
             //    exists; otherwise it returns acceptedProducers:0 without touching the index.
             const rebuilt = await this.orchestrator.rebuildFromSidecar();
             if (rebuilt && rebuilt.acceptedProducers > 0) {
-                this.identityHealNotified = false; // healed
-                new Notice('Seek: index updated to the new version from a synced device.', 6000);
+                this.identityHealNotified = false; // healed (silent — background sync)
                 return true;
             }
 
@@ -1321,7 +1020,7 @@ export default class SeekPlugin extends Plugin {
                 return true;
             }
             // Desktop is the source of truth: auto full reindex, no prompt (decision #1).
-            new Notice('Seek: index is from an older version — rebuilding…', 6000);
+            // Silent — the reindex itself shows the start + recap toast.
             // Only clear the "needs heal" report latch if the reindex actually ran (and
             // thus stamped the current identity). It can be refused if a flush grabbed
             // the write mutex during the rebuildFromSidecar await above — leave the latch
@@ -1366,7 +1065,6 @@ export default class SeekPlugin extends Plugin {
                 try {
                     const { removed, completed } = await this.orchestrator.sweepOrphanChunks({ shouldContinue: () => !document.hidden });
                     if (completed) this.orphanSweepDone = true;
-                    if (removed > 0) console.log(`[seek] orphan sweep: removed ${removed} unreferenced chunk(s)${completed ? '' : ' (aborted — resumes next poll)'}`);
                 } finally {
                     this.orphanSweepRunning = false;
                 }
@@ -1380,15 +1078,12 @@ export default class SeekPlugin extends Plugin {
                 try {
                     const r = await this.orchestrator.compactOwnSidecar();
                     if (r?.compacted) {
-                        const mb = (n: number): string => (n / (1024 * 1024)).toFixed(1);
-                        console.log(`[seek] sidecar compaction: ${r.recordsBefore}→${r.recordsAfter} records, ${mb(r.bytesBefore)}→${mb(r.bytesAfter)} MB`);
                         // A shed = this device's OWN shard was unreadable/corrupt for a
                         // still-live record → that note needs a model re-embed to be
                         // searchable again. Expected zero; surface any non-zero as a
                         // corruption breadcrumb (invisible on mobile without it).
                         if (r.shed > 0) await this.logger.appendError('sidecar-compaction-shed', new Error(`shed ${r.shed} corrupt/unreadable record(s)`)).catch(() => {});
                     } else if (r && r.reason === 'incomplete-rechunk') {
-                        console.log('[seek] sidecar compaction skipped: live-id snapshot incomplete (unreadable note?) — retries next poll');
                     }
                     // Latch on any definitive verdict; an incomplete re-chunk is transient,
                     // so leave it open to retry. null = sidecar off → don't latch (it may
@@ -1409,6 +1104,22 @@ export default class SeekPlugin extends Plugin {
         }
     }
 
+    // Generate the diagnostic report (full seek-report.json + a short seek-report.md
+    // summary) and open the .md. The user-facing debug affordance, surfaced as a
+    // Settings button now that the command-palette entry is gone. Errors tee to
+    // console + NDJSON as usual.
+    async openLoggingReport(): Promise<void> {
+        try {
+            const path = await this.logger.writeReport();
+            const file = this.app.vault.getAbstractFileByPath(path);
+            if (file instanceof TFile) await this.app.workspace.getLeaf(false).openFile(file);
+            new Notice(`Seek: report written — ${path} (summary) + seek-report.json (full data)`, 6000);
+        } catch (e) {
+            await this.logger.appendError('generate-log', e);
+            new Notice('Seek: could not write the logging report — see the developer console.', 6000);
+        }
+    }
+
     private async warnOnModelIndexDrift(): Promise<void> {
         if (this.modelDriftWarned) return;
         try {
@@ -1419,7 +1130,7 @@ export default class SeekPlugin extends Plugin {
                 this.modelDriftWarned = true;
                 new Notice(
                     'Seek: the index was built with a different embedding model. ' +
-                    'Run "Seek: Full reindex (nuke and rebuild)" — until then, incremental ' +
+                    'Open Settings → Seek → Index and choose Reindex — until then, incremental ' +
                     'indexing is paused and semantic ranking is unreliable.',
                     15000,
                 );
@@ -1709,7 +1420,7 @@ export default class SeekPlugin extends Plugin {
             // Synchronous failure path (rare — only if the Modal ctor or
             // ensureModelLoaded throws before returning a promise).
             this.logger.appendError('seek-search:open', e).catch(() => {});
-            new Notice(`❌ Search failed to start: ${e}`, 0);
+            new Notice('Seek: search failed to open — see the developer console.');
         } finally {
             // Modal lifecycle isn't observable from here; reset to idle after open().
             this.currentTaskContext = 'idle';
@@ -1741,7 +1452,7 @@ export default class SeekPlugin extends Plugin {
         } catch (e) {
             notice.hide();
             this.logger.appendError('seek:protocol-open', e).catch(() => {});
-            new Notice(`❌ Seek open failed: ${e}`, 0);
+            new Notice('Seek: could not open the result — see the developer console.');
         } finally {
             this.currentTaskContext = 'idle';
         }
@@ -1843,11 +1554,9 @@ export default class SeekPlugin extends Plugin {
                     // the outcome. Leave health 'recovering' (invisible in settings) and
                     // the escalation suppression key untouched, so the new generation
                     // re-arms recovery on the next drift trip.
-                    console.log('[seek] drift auto-recovery: index changed mid-verify (a concurrent reindex/delta raced) — deferring to that mutation');
                 } else {
                     this.commitDriftHealth(ok ? 'healthy' : 'degraded', verifiedGen);
                     if (ok) {
-                        console.log('[seek] drift auto-recovery succeeded — frame/BM25 row space re-coupled (embed-free)');
                     } else {
                         console.error('[seek] drift auto-recovery exhausted (embed-free warm + sidecar reconcile did not re-couple the frame/BM25 row space) — indexHealth=degraded; a full reindex recovers it');
                     }
@@ -1870,7 +1579,6 @@ export default class SeekPlugin extends Plugin {
                     // The generation advanced: a concurrent reindex/delta closed the store
                     // mid-verify and owns the outcome. Expected under the race — defer, and
                     // don't log it as an error (it isn't one).
-                    console.log('[seek] drift auto-recovery: store closed mid-verify by a concurrent reindex/delta — deferring to that mutation');
                 }
             } finally {
                 this.driftRecoveryPending = false;
@@ -1948,7 +1656,8 @@ export default class SeekPlugin extends Plugin {
         } catch (e) {
             notice.hide();
             await this.logger.appendError('seek-full-reindex', e);
-            new Notice(`❌ Reindex failed: ${e}`, 0);
+            // One end-toast whether it passed or failed (the recap). Detail → console + log.
+            new Notice('Seek reindex: ❌ failed — see the logging report (Settings → Seek).', 10000);
             return false;
         } finally {
             this.currentTaskContext = 'idle';
@@ -2008,33 +1717,6 @@ export default class SeekPlugin extends Plugin {
             calibrated = meta.bgMean != null && meta.bgStd != null && meta.bgStd > 0;
         } catch { /* meta unreadable */ }
         return { files, chunks, storageMB, indexMB, modelMB, lastFullAt, lastFullDurationMs, lastUpdatedAt, calibrated };
-    }
-
-    // Phase-0 index-size breakdown — the read-only orchestration shared by the
-    // `seek:indexsize` CLI handler (desktop) and the settings "Storage breakdown"
-    // button (the only surface that works on the phone, which has no CLI bridge).
-    // Combines the per-store logical walk with the physical/quota numbers so the
-    // caller can render `physical − logical = LevelDB slack`. Never throws on the
-    // estimate (older WebViews lack usageDetails → those fields stay null).
-    async measureIndexSize(): Promise<IndexSizeReport> {
-        const { stores, logicalBytes } = await this.store.measureSizes();
-        let indexedDbBytes: number | null = null;
-        let cachesBytes: number | null = null;
-        let originUsageBytes: number | null = null;
-        let quotaBytes: number | null = null;
-        if (navigator.storage?.estimate) {
-            try {
-                const est = await navigator.storage.estimate();
-                originUsageBytes = est.usage ?? null;
-                quotaBytes = est.quota ?? null;
-                const details = (est as { usageDetails?: Record<string, number> }).usageDetails;
-                if (details) {
-                    if (typeof details.indexedDB === 'number') indexedDbBytes = details.indexedDB;
-                    if (typeof details.caches === 'number') cachesBytes = details.caches;
-                }
-            } catch { /* unsupported — logical-only report */ }
-        }
-        return { stores, logicalBytes, indexedDbBytes, cachesBytes, originUsageBytes, quotaBytes };
     }
 
     // Embedding-model DOWNLOAD status for the settings Model section — distinct from

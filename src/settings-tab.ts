@@ -658,8 +658,19 @@ export class SeekSettingTab extends PluginSettingTab {
         });
     }
 
-    // ---- Reset ---------------------------------------------------------------------
+    // ---- Diagnostics + Reset --------------------------------------------------------
     private renderReset(containerEl: HTMLElement): void {
+        // Diagnostics first, under its own heading, and rendered BEFORE the
+        // reset-confirm early-return below so the report button is always visible
+        // (it replaces the removed "Generate logging report" command). openLoggingReport
+        // renders the per-device NDJSON logs into seek-report.md and opens it.
+        new Setting(containerEl).setName('Diagnostics').setHeading();
+        new Setting(containerEl)
+            .setName('Logging report')
+            .setDesc('Write a diagnostic report (seek-report.md) of indexing, searches, model loads, and any errors — generate and share it when reporting an issue. Review before sharing: it includes your recent queries and matching note paths (but not note contents).')
+            .addButton(b => b.setButtonText('Generate logging report').onClick(() => void this.plugin.openLoggingReport()));
+
+        new Setting(containerEl).setName('Reset').setHeading();
         if (this.resetConfirm) {
             new Setting(containerEl)
                 .setName('Reset to defaults')

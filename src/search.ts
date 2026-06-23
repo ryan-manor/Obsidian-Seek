@@ -112,6 +112,7 @@ const PROGRESS_MAX_SILENCE_MS = 2500;
 // "where did my note go" complaint should be added here.
 const EXCLUDED_PATHS = new Set([
     'seek-report.md',
+    'seek-report.json',
     'spike-report.md',
 ]);
 const EXCLUDED_PREFIXES = [
@@ -267,7 +268,6 @@ export class SearchOrchestrator {
             return include;
         });
         if (skipped.length > 0) {
-            console.log(`[seek] excluding ${skipped.length} file(s) from index (machine-generated or user-excluded):`, skipped);
         }
         // Progressive ordering: index most-recently-modified files first. Since
         // search rebuilds BM25 in-memory and dense reads commit per file, the
@@ -390,7 +390,6 @@ export class SearchOrchestrator {
             // Best-effort: never fail the reindex on a reap error.
             try {
                 const reaped = await this.reapDeadIdentitySidecars();
-                if (reaped > 0) console.log(`[seek] reaped ${reaped} dead-identity sidecar device(s)`);
             } catch (e) {
                 await this.logger.appendError('sidecar-reap', e);
             }
@@ -1437,7 +1436,6 @@ export class SearchOrchestrator {
         // signal stays visible in the very telemetry used to diagnose this bug class.
         const filtered = adds.length - fresh.length;
         if (filtered > 0) console.warn(`[seek] applyDelta absorbed ${filtered} already-live/in-batch duplicate add(s) — hydrate/cache divergence`);
-        console.log(`[seek] applyDelta: +${fresh.length}/-${removedIds.length} incremental, no rebuild (${bm.liveCount}/${bm.size} live rows, gen ${this.coord.generation})`);
         return true;
     }
 
@@ -1445,7 +1443,6 @@ export class SearchOrchestrator {
     // Makes the live smoke observable: every delta logs either an "applyDelta:
     // +x/-y incremental" success or an "applyDelta fallback: <reason>" line.
     private deltaFallback(reason: string): false {
-        console.log(`[seek] applyDelta fallback: ${reason} → full rebuild`);
         return false;
     }
 
@@ -1485,7 +1482,6 @@ export class SearchOrchestrator {
         }
         this.lastCoherenceWarmAt = now;
         console.error(`[seek] frame/BM25 row-space drift detected at ${where} — dropping caches for a full rebuild (trip #${this.coherenceDriftCount})`);
-        new Notice('Seek: index coherence drift detected — rebuilding.');
         void this.warmCaches('coherence-drift');
     }
 
@@ -1956,7 +1952,6 @@ export class SearchOrchestrator {
             putFileRecord: rec => this.store.putFileRecord(rec),
             onRefusedProducer: (dev, meta, expect) => this.warnRefusedProducer(dev, meta, expect),
             log: (msg, detail) => {
-                console.log(`[seek] ${msg}`, detail);
                 // Persist to the NDJSON log too — console.log is invisible on
                 // mobile (no devtools), which is why hydrate outcomes never
                 // surfaced in iPhone reports. Flatten arrays → counts to fit the
@@ -2012,7 +2007,6 @@ export class SearchOrchestrator {
         // (when the delta path supplies it) surfaces the hydrated chunks into the
         // change-set so applyDelta can apply them incrementally.
         const res = await hydrateFromSidecar(this.hydrateDeps(async () => notes, addsSink));
-        if (res.hydrated > 0) console.log('[seek] delta dedup hydrated', { files: res.hydratedNotePaths.length, chunks: res.hydrated });
         const done = new Set(res.hydratedNotePaths);
         return files.filter(f => !done.has(f.path));
     }
@@ -2083,7 +2077,6 @@ export class SearchOrchestrator {
             done.add(f.path);
             reusedChunks += chunks.length;
         }
-        if (reusedChunks > 0) console.log('[seek] delta carry-over reused', { files: done.size, chunks: reusedChunks });
         return files.filter(f => !done.has(f.path));
     }
 
@@ -2094,6 +2087,11 @@ export class SearchOrchestrator {
         chunksEmitted: number,
         elapsedMs: number,
     ): Promise<void> {
+        // index-progress is a high-volume per-batch firehose that's ALSO mirrored into
+        // the crash-forensics breadcrumb ring (the copy that survives a jetsam kill — the
+        // one that matters for crash classification). Persist it to the NDJSON only under
+        // verboseTrace; index-complete still records the per-run summary unconditionally.
+        if (!this.settings.verboseTrace) return;
         // Storage probe runs alongside heap so iOS gets a non-null signal too.
         const mem = await snapshotMemory();
         const entry: IndexProgressEntry = {
@@ -2520,7 +2518,13 @@ export class SearchOrchestrator {
         // candidate set, what did exact rerank rank highest pre-fusion."
         const rawDenseTop5 = topKByScore(denseScoresCand, candidateChunks, 5);
         const rawBm25Top5 = topKByScore(new Float64Array(candidateBm25), candidateChunks, 5);
-        const fusedTop50 = rankedPool.slice(0, 50).map((r, i) => ({
+        // Persisted ranking-trace depth. The report only ever renders the top 10
+        // (generateReport → rows.slice(0, 10)), so normal runs persist 10 — a ~5×
+        // smaller search row that keeps the append-only NDJSON from ballooning.
+        // verboseTrace keeps the full 50-deep tail for offline pandas/eval. The field
+        // name stays `fusedTop50` for log-schema stability; it now holds ≤50 rows.
+        const traceDepth = this.settings.verboseTrace ? 50 : 10;
+        const fusedTop50 = rankedPool.slice(0, traceDepth).map((r, i) => ({
             chunk_id: r.chunk_id,
             note_path: r.note_path,
             rank: i + 1,
@@ -2761,7 +2765,6 @@ export class SearchOrchestrator {
             for (let i = 0; i < embIds.length; i++) embById.set(embIds[i], embVecs[i]);
             resident = buildResidentRerankBlock(orderedIds, embById);
         } else {
-            console.debug(`[seek] resident int8 block disabled (mobile/size, ${orderedIds.length} rows) — stage-2 uses per-id IDB fetch`);
         }
 
         // The index advanced while we were assembling (a full reindex completed):
@@ -2844,9 +2847,6 @@ export class SearchOrchestrator {
             // what the guards dropped — silent drops are this feature's main
             // scaling hazard (adversarial review), so they must be visible.
             this.synonymCache = buildSynonymMap(orderedChunks, t => this.bm25Cache!.termDocFraction(t));
-            const st = this.synonymCache.stats;
-            console.log(`[seek] synonym dict: ${st.classes} classes → ${st.triggers} triggers `
-                + `(${st.droppedAmbiguous} ambiguous dropped, ${st.droppedDf} over df ceiling)`);
         }
         return hit;
     }
@@ -2875,8 +2875,6 @@ export class SearchOrchestrator {
                 headingsField: this.settings.headingsField || this.settings.boostedBm25,
             });
             this.stampBm25Cache(orderedChunks.length);
-            console.log(`[seek] BM25 loaded from persisted index (gen ${this.coord.generation}, `
-                + `${orderedChunks.length} chunks) — skipped fit()`);
         } catch (e) {
             // Corrupt blob / loadJSON throw → leave cache cold, ensureBm25 refits.
             console.warn('[seek] persisted BM25 load failed (refitting)', e);
@@ -2934,8 +2932,6 @@ export class SearchOrchestrator {
                 this.stampBm25Cache(orderedChunks.length);
                 // Adopt locally (no-op on a hydrate-only device; see method comment).
                 void this.persistBm25(orderedChunks);
-                console.log(`[seek] BM25 loaded from cross-device sidecar (${dev}, gen ${this.coord.generation}, `
-                    + `${orderedChunks.length} chunks) — skipped refit`);
                 return;
             } catch (e) {
                 // Corrupt gz / parse error on THIS producer → try the next-freshest.
@@ -2987,8 +2983,6 @@ export class SearchOrchestrator {
             // would ENOENT on the `.tmp` write and silently skip the cross-device blob.
             await ensureDir(this.app.vault.adapter, dir);
             await writeBytesAtomic(this.app.vault.adapter, bm25PathFor(dir, this.logger.deviceId), gz);
-            console.log(`[seek] cross-device BM25 artifact written (${(gz.byteLength / 1e6).toFixed(2)} MB gz, `
-                + `${orderedChunks.length} chunks)`);
         } catch (e) {
             await this.logger.appendError('emitCrossDeviceBm25', e).catch(() => {});
         }
@@ -3079,8 +3073,6 @@ export class SearchOrchestrator {
                 if (!frame) break;
                 await this.ensureBm25(frame.orderedChunks);
                 warmedChunks = frame.orderedChunks;
-                console.log(`[seek] cache re-warm (${trigger}): gen ${this.coord.generation}, `
-                    + `${frame.orderedChunks.length} chunks, ${(performance.now() - t0).toFixed(0)}ms`);
             } while (this.bm25CacheGeneration !== this.coord.generation);
             // Persist the converged, warmed BM25 index so the next cold start can
             // skip fit() (fire-and-forget — the serialize + write ride this quiet

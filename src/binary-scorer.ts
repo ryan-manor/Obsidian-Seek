@@ -44,7 +44,6 @@ export class BinaryScorerWorker {
             : null;
         if (disabled) {
             this.dead = true;
-            console.log(`[seek] binary scorer: synchronous (worker disabled — ${disabled})`);
             return;
         }
         try {
@@ -54,11 +53,9 @@ export class BinaryScorerWorker {
             this.worker.onmessage = (e: MessageEvent) => this.onMessage(e.data);
             this.worker.onerror = () => this.kill();
             this.worker.onmessageerror = () => this.kill();
-            console.log('[seek] binary scorer: worker ACTIVE (stage-1 scan off the main thread)');
         } catch (e) {
             // e.g. renderer CSP blocking blob: workers → synchronous fallback.
             this.kill();
-            console.log('[seek] binary scorer: synchronous (worker creation failed — likely CSP)', e);
         }
     }
 
