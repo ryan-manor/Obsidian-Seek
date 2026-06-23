@@ -4,8 +4,12 @@
 //   1. BUDGET: every emitted chunk's composed embed input counts ≤ budget
 //      (exception: the unsplittable oversize-title pathology, which must be
 //      counted in overBudget — never silent).
-//   2. NO CONTENT LOSS: the unit sequence (paragraph blocks) of the original
-//      content survives re-packing exactly; hard-split loses only whitespace.
+//   2. NO CONTENT LOSS: every original unit (paragraph block) survives
+//      re-packing, in order; hard-split loses only whitespace. Within-section
+//      overlap may REPEAT a seam paragraph as the head of the next part, so the
+//      invariant is "original units are an ordered subsequence of the emitted
+//      stream, and the emitted stream introduces no foreign units" — not exact
+//      stream equality.
 //   3. IDENTITY: untouched chunks pass through object-identical; split parts
 //      get distinct path-salted chunk_ids, the same embedded `title`, and
 //      display-only part numbering.
@@ -20,9 +24,18 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import type { Chunk, ChunkMetadata } from './types';
-import { enforceTokenBudget, embedInput, type CountTokens } from './token-budget';
+import { enforceTokenBudget, embedInput, overlapSeed, type CountTokens } from './token-budget';
 import { chunkIdFor } from './chunker';
-import { parseAtoms } from './atoms';
+import { parseAtoms, type Atom } from './atoms';
+
+// Original units must appear, in order, somewhere in the emitted stream —
+// overlap may interleave duplicate seam paragraphs, so this is a subsequence
+// check, not equality.
+const isSubsequence = (sub: string[], sup: string[]) => {
+    let i = 0;
+    for (const x of sup) if (i < sub.length && x === sub[i]) i++;
+    return i === sub.length;
+};
 
 const META: ChunkMetadata = {
     tags: [], aliases: [], pageType: '', created: null, modified: null, properties: {},
@@ -83,8 +96,11 @@ describe('enforceTokenBudget', () => {
             expect(c).toBeLessThanOrEqual(512);
             expect(r.counts[i]).toBe(c); // routing counts are the real composed counts
         }
-        // No content loss, no reordering: concatenated unit streams identical.
-        expect(r.chunks.flatMap(c => paras(c.content))).toEqual(paras(body));
+        // No content loss, no reordering, no foreign units (overlap may repeat
+        // a seam paragraph, so subsequence + same-set, not exact equality).
+        const flat = r.chunks.flatMap(c => paras(c.content));
+        expect(isSubsequence(paras(body), flat)).toBe(true);
+        expect(new Set(flat)).toEqual(new Set(paras(body)));
     });
 
     it('split parts: same embedded title, distinct chunk_ids, display-only numbering', async () => {
@@ -142,13 +158,68 @@ describe('enforceTokenBudget', () => {
         for (let i = 0; i < r.chunks.length; i++) {
             expect(advCount(embedInput(r.chunks[i]))).toBeLessThanOrEqual(512);
         }
-        expect(r.chunks.flatMap(c => paras(c.content))).toEqual(paras(body));
+        const flat = r.chunks.flatMap(c => paras(c.content));
+        expect(isSubsequence(paras(body), flat)).toBe(true);
+        expect(new Set(flat)).toEqual(new Set(paras(body)));
         expect(r.overBudget).toBe(0);
     });
 
     it('handles the empty chunk list without a counter call', async () => {
         const r = await enforceTokenBudget([], async () => { throw new Error('must not be called'); }, 512);
         expect(r).toEqual({ chunks: [], counts: [], splits: 0, overBudget: 0 });
+    });
+});
+
+describe('within-section overlap', () => {
+    it('seeds each later part with the trailing paragraph of the previous part', async () => {
+        // 30-word paragraphs (~60 tok each) — one fits the ~76-tok overlap cap,
+        // two do not, so exactly one paragraph carries across every seam.
+        const body = Array.from({ length: 12 }, (_, i) => makeParagraph(30, `p${i}`)).join('\n\n');
+        const chunk = mkChunk({ content: body });
+        const r = await enforceTokenBudget([chunk], counter, 512);
+
+        expect(r.chunks.length).toBeGreaterThan(1);
+        for (let k = 1; k < r.chunks.length; k++) {
+            const prev = paras(r.chunks[k - 1].content);
+            const here = paras(r.chunks[k].content);
+            expect(here[0]).toBe(prev[prev.length - 1]); // seam paragraph repeated
+        }
+        // Every part still fits WITH its seed.
+        for (const c of r.chunks) expect(fakeCount(embedInput(c))).toBeLessThanOrEqual(512);
+        // Overlap makes parts share content, but ids stay distinct (fresh atoms differ).
+        expect(new Set(r.chunks.map(c => c.chunk_id)).size).toBe(r.chunks.length);
+    });
+
+    it('overlapSeed: paragraph-only, newest-first, bounded by the limit', () => {
+        const A: Atom = { type: 'paragraph', text: 'aaa' };
+        const B: Atom = { type: 'paragraph', text: 'bbb' };
+        const tbl: Atom = { type: 'table', text: '|h|\n|-|\n|r|' };
+
+        // Both paragraphs fit → both, restored to document order.
+        expect(overlapSeed([A, B], [1, 1], 2).atoms).toEqual([A, B]);
+        // Limit fits one → newest only.
+        expect(overlapSeed([A, B], [1, 1], 1).atoms).toEqual([B]);
+        // No room (≤ 0) → nothing seeds.
+        expect(overlapSeed([A, B], [1, 1], 0).atoms).toEqual([]);
+        expect(overlapSeed([A, B], [1, 1], -5).atoms).toEqual([]);
+        // A trailing non-paragraph atom is never duplicated (no table-header re-emit).
+        expect(overlapSeed([A, tbl], [1, 1], 9).atoms).toEqual([]);
+        // …and it halts the walk even when earlier atoms are paragraphs.
+        expect(overlapSeed([A, tbl, B], [1, 1, 1], 9).atoms).toEqual([B]);
+    });
+
+    it('does not duplicate a table atom across the seam it falls on', async () => {
+        // A table sized to land at a part boundary; its rows must appear once.
+        const rows = Array.from({ length: 8 }, (_, i) => `| r${i}a | r${i}b |`).join('\n');
+        const table = `| h1 | h2 |\n| --- | --- |\n${rows}`;
+        const body = [makeParagraph(60, 'lead'), table, makeParagraph(60, 'tail0'),
+            makeParagraph(60, 'tail1'), makeParagraph(60, 'tail2')].join('\n\n');
+        const chunk = mkChunk({ content: body });
+        const r = await enforceTokenBudget([chunk], counter, 200);
+
+        expect(r.chunks.length).toBeGreaterThan(1);
+        const tableParts = r.chunks.filter(c => c.content.includes('| h1 | h2 |'));
+        expect(tableParts.length).toBe(1); // the table atom is not seeded forward
     });
 });
 

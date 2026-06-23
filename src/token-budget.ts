@@ -27,6 +27,12 @@
 // re-chunking is pre-validated relevance-safe; the gate is the invariant
 // itself — dense-invisible share → 0 — checked in the eval-pack harness.
 //
+// Within-section overlap (2026-06-23): seam insurance for the long-section
+// tail — when a super-section splits, each later part carries the prior part's
+// trailing paragraph(s) so a straddling query meets a chunk with both sides.
+// See OVERLAP_FRACTION / overlapSeed. Targeted, paragraph-only, capped; the
+// straddle-query eval probe (gold chunk in a non-first part) is the gate.
+//
 // WS3 (2026-06-10): the unit boundary is the ATOM (atoms.ts) — paragraphs at
 // blank lines, fences/tables/callouts whole. This module is also now the ONLY
 // splitter in the pipeline (the chunker's char-based splitOversized is gone),
@@ -51,6 +57,28 @@ export const TOKEN_BUDGET = 512;
 // Below this content budget (title nearly fills the window) packing would
 // emit hundred-sliver chunks; treat the title as pathological instead.
 const MIN_CONTENT_BUDGET = 32;
+
+// Within-section overlap (2026-06-23). When a single heading section is too big
+// for the window and splits into multiple parts, each later part is seeded with
+// up to this fraction of the content budget worth of the PREVIOUS part's
+// trailing paragraphs — boundary insurance so a query whose answer straddles
+// the cut still meets one chunk holding both sides. This is the ONLY overlap in
+// the pipeline and it lives entirely inside splitChunk, so it is structurally
+// confined to over-budget sections: under-budget sections pass through
+// enforceTokenBudget untouched and never overlap with their neighbours across a
+// heading boundary. The deleted WS3 char-splitter overlap (chunker.ts header)
+// ran in series and duplicated across arbitrary cuts — this one is
+// paragraph-only and capped (overlapSeed), so the old footgun can't recur. 0
+// disables it.
+const OVERLAP_FRACTION = 0.15;
+// Token headroom kept between the seed + first fresh atom and the budget. Under
+// realistic (near-additive) BPE join costs this keeps the exact recount from
+// tipping a seeded head over budget, so the verify loop won't demote it. A
+// pathological tokenizer with a huge per-`\n\n` premium (≫ the granite BPE's
+// 1-2 tokens) could still force a demote that emits a seed-only part — harmless
+// index redundancy, never a budget breach or content loss (the budget invariant
+// is enforced unconditionally by the verify loop downstream).
+const OVERLAP_JOIN_SLACK = 4;
 
 // THE embed-input composition. search.ts routing and the doc side of the
 // query path both assume this exact `title\n\ncontent` shape — compose it in
@@ -157,16 +185,32 @@ async function splitChunk(
     // count and the pack is conservative by construction; the verify loop
     // almost never demotes.
     const unitCounts = await countTokens(units.map(u => u.text));
+    const overlapCap = Math.round(contentBudget * OVERLAP_FRACTION);
     const groups: Atom[][] = [];
     let cur: Atom[] = [];
+    let curCounts: number[] = [];
     let curSum = 0;
     for (let i = 0; i < units.length; i++) {
         if (cur.length && overhead + curSum + unitCounts[i] > budget) {
             groups.push(cur);
-            cur = [];
-            curSum = 0;
+            // Within-section overlap: seed the next group with the trailing
+            // paragraph atoms of the one just closed. Bounded by overlapCap AND
+            // by the room left beside the atom that triggered the break (minus a
+            // join-slack margin), so under realistic BPE join costs seed + first
+            // fresh atom stays under budget and the verify loop won't demote it.
+            // A negative room (the triggering atom already (nearly) fills the
+            // window) makes the limit ≤ 0 → overlapSeed returns empty → no
+            // overlap. The seed atoms are duplicated (still owned by the closed
+            // group); every original atom keeps exactly one "home" group and `i`
+            // advances each iteration, so coverage and termination are unchanged.
+            const room = budget - overhead - unitCounts[i] - OVERLAP_JOIN_SLACK;
+            const seed = overlapSeed(cur, curCounts, Math.min(overlapCap, room));
+            cur = seed.atoms;
+            curCounts = seed.counts;
+            curSum = seed.sum;
         }
         cur.push(units[i]);
+        curCounts.push(unitCounts[i]);
         curSum += unitCounts[i];
     }
     if (cur.length) groups.push(cur);
@@ -226,6 +270,31 @@ async function splitChunk(
 
 function joinAtoms(atoms: Atom[]): string {
     return atoms.map(a => a.text).join('\n\n');
+}
+
+// Trailing PARAGRAPH atoms of a just-closed group, newest-first up to `limit`
+// tokens, returned in document order so the seeded group reads forward. Stops
+// at the first non-paragraph atom — a table header, reopened fence or callout
+// marker must never be duplicated into the next part — and at the first atom
+// that would breach `limit`. `limit` ≤ 0 → empty (no room beside the breaking
+// atom). A hard-split blob piece is type 'paragraph' but ~budget-sized, so the
+// limit, not the type guard, keeps it out. Exported for direct guard tests.
+export function overlapSeed(
+    group: Atom[],
+    counts: number[],
+    limit: number,
+): { atoms: Atom[]; counts: number[]; sum: number } {
+    const atoms: Atom[] = [];
+    const outCounts: number[] = [];
+    let sum = 0;
+    for (let k = group.length - 1; k >= 0; k--) {
+        if (group[k].type !== 'paragraph') break;
+        if (sum + counts[k] > limit) break;
+        atoms.unshift(group[k]);
+        outCounts.unshift(counts[k]);
+        sum += counts[k];
+    }
+    return { atoms, counts: outCounts, sum };
 }
 
 // Structure-aware oversize split — the WS3 invariant's enforcement point.
