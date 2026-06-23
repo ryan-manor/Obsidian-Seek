@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { MarkdownChunker } from './chunker';
+import { MarkdownChunker, chunkIdFor } from './chunker';
+import { extractBaseDocs } from './base-extractor';
 
 const chunker = new MarkdownChunker();
 
@@ -383,5 +384,64 @@ describe('MarkdownChunker — dense frontmatter suffix (2026-06-18 frontmatter-i
         const [chunk] = chunker.chunkContent(big, 'Notes/Big.md');
         expect(chunk.denseSuffix).toBeDefined();
         expect(chunk.denseSuffix!.split(/\s+/)).toHaveLength(48);
+    });
+});
+
+describe('MarkdownChunker — chunkBase (.base per-view chunks)', () => {
+    const CLIPPINGS = `filters:
+  and:
+    - file.inFolder("Clippings")
+views:
+  - type: cards
+    name: All Clippings
+  - type: cards
+    name: Products
+    filters:
+      and:
+        - category == "product"
+  - type: cards
+    name: Clothing
+    filters:
+      and:
+        - subcategory.contains("Clothing")
+`;
+    const PATH = 'Bases/Clippings.base';
+    const docsFor = () => chunker.chunkBase(extractBaseDocs(CLIPPINGS, PATH), PATH, '2026-06-23T00:00:00.000Z');
+
+    it('titles the base-level chunk bare and view chunks hierarchically', () => {
+        const chunks = docsFor();
+        const baseChunk = chunks.find(c => c.heading_path.length === 0)!;
+        expect(baseChunk.title).toBe('Clippings');
+        const clothing = chunks.find(c => c.heading_path[0] === 'Clothing')!;
+        expect(clothing.title).toBe('Clippings > Clothing');
+        expect(clothing.heading_path).toEqual(['Clothing']);
+    });
+
+    it('reuses chunkIdFor with no denseSuffix, so ids are reproducible everywhere', () => {
+        // The unification guarantee: a base chunk re-derived at any production site
+        // (reChunkLive / collectLiveIds / dedup / carryOver, all via chunksFor) yields
+        // the same id, because it is a pure function of (path, title, content).
+        for (const c of docsFor()) {
+            expect(c.chunk_id).toBe(chunkIdFor(PATH, c.title, c.content));
+            expect(c.denseSuffix).toBeUndefined();
+        }
+    });
+
+    it('produces deterministic, unique ids across views', () => {
+        const a = docsFor();
+        const b = docsFor();
+        expect(a.map(c => c.chunk_id)).toEqual(b.map(c => c.chunk_id));   // deterministic
+        expect(new Set(a.map(c => c.chunk_id)).size).toBe(a.length);      // unique
+    });
+
+    it('carries empty note metadata, modified set, one-line span, and no lexicalOnly', () => {
+        for (const c of docsFor()) {
+            expect(c.metadata).toEqual({ tags: [], aliases: [], pageType: '', created: null, modified: '2026-06-23T00:00:00.000Z', properties: {} });
+            expect(c.start_line).toBe(1);
+            expect(c.end_line).toBe(1);
+            expect(c.note_path).toBe(PATH);
+            expect(c.lexicalOnly).toBeUndefined();   // a named view is not a content-free stub
+            expect(c.content.length).toBeGreaterThan(0);
+        }
     });
 });

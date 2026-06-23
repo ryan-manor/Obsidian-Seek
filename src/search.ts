@@ -11,7 +11,7 @@ import { TFile, Notice } from 'obsidian'; // value imports: reindexDelta uses `i
 import type { Chunk, ChunkMeta, ScoredChunk, SearchEntry, IndexCompleteEntry, IndexProgressEntry, ResetEntry, QueryFilters, SeekSettings, MemorySnapshot } from './types';
 import { snapshotMemory, memoryDelta, distributionStats } from './types';
 import { MarkdownChunker, cyrb53Hex } from './chunker';
-import { extractBaseDoc } from './base-extractor';
+import { extractBaseDocs } from './base-extractor';
 import { MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, ANALYZER_VERSION } from './bm25';
 import { buildSynonymMap, SYNONYM_WEIGHT, type SynonymMap } from './synonyms';
 import { rank, cosineScores, DEFAULT_RANKING_CONFIG } from './ranker';
@@ -944,10 +944,12 @@ export class SearchOrchestrator {
         return true;
     }
 
-    // The candidate set for every collection site (reindexAll, computeDelta).
+    // The candidate set for every collection site (reindexAll, computeDelta, and
+    // the sidecar liveness oracles reChunkLive / collectLiveIds — all of which must
+    // agree on the file set or base chunk_ids drift between writer and re-deriver).
     // getMarkdownFiles() is .md-only; we additionally index .base files (Obsidian
-    // Bases — saved query/view definitions) via a synthetic document. The watcher
-    // in main.ts gates create/rename/delete on the same two extensions.
+    // Bases — saved query/view definitions) via per-view synthetic documents. The
+    // watcher in main.ts gates create/rename/delete on the same two extensions.
     private indexableFiles(): TFile[] {
         const md = this.app.vault.getMarkdownFiles();
         if (!this.settings.indexBases) return md;
@@ -956,15 +958,17 @@ export class SearchOrchestrator {
     }
 
     // Content → chunks for one file, branching by extension. A .base file isn't
-    // markdown — it's a YAML view definition — so it goes through extractBaseDoc
-    // (title + filter literals) before the chunker, which then treats the synthetic
-    // text exactly like a body-bearing note (one chunk, title-boosted, dense + BM25).
-    // Every chunk-production site routes through here so the .md/.base split lives
-    // in one place. `modifiedIso` matches the chunker's `modified` param contract.
+    // markdown — it's a YAML view definition — so it goes through extractBaseDocs
+    // (one synthetic doc per view) + chunkBase, which builds a base-level chunk
+    // plus one per non-generic view (each title-boosted, dense + BM25, the view
+    // name in the 3.0x headings field). Every chunk-PRODUCTION site routes through
+    // here so the .md/.base split lives in one place — reChunkLive, collectLiveIds,
+    // dedupViaSidecar and carryOverHydrate all call this, not chunkContent, so a
+    // base chunk's id is identical wherever it is re-derived. `modifiedIso` matches
+    // the chunker's `modified` param contract.
     private chunksFor(content: string, path: string, modifiedIso: string | null): Chunk[] {
         if (path.endsWith('.base')) {
-            const { title, text } = extractBaseDoc(content, path);
-            return this.chunker.chunkContent(text, path, title, modifiedIso);
+            return this.chunker.chunkBase(extractBaseDocs(content, path), path, modifiedIso);
         }
         return this.chunker.chunkContent(content, path, undefined, modifiedIso);
     }
@@ -1731,10 +1735,13 @@ export class SearchOrchestrator {
         return result;
     }
 
-    // Re-chunk every live, indexable note — the liveness oracle for a full
-    // hydrate. Mirrors computeDelta's file filter AND embedAndCommitFiles' full
-    // chunk pipeline: chunkContent THEN enforceTokenBudget, so chunk_ids match
-    // exactly what indexing produced. The token-budget re-split is load-bearing,
+    // Re-chunk every live, indexable note AND .base — the liveness oracle for a
+    // full hydrate. Mirrors computeDelta's file filter (indexableFiles, so bases
+    // are included) AND embedAndCommitFiles' full chunk pipeline: chunksFor THEN
+    // enforceTokenBudget, so chunk_ids match exactly what indexing produced —
+    // including base chunks (chunksFor → chunkBase), which is what lets the phone
+    // rehydrate base vectors embed-free instead of dropping them. The token-budget
+    // re-split is load-bearing,
     // NOT optional: chunk_id = chunkIdFor(path, title, content), and on long
     // notes indexing splits oversize chunks into new contents → new ids. Without
     // reproducing that split here, the sidecar lookup missed every split note
@@ -1744,14 +1751,14 @@ export class SearchOrchestrator {
     private async reChunkLive(): Promise<ReChunkedNote[]> {
         await this.embedder.ensureTokenizer();
         const out: ReChunkedNote[] = [];
-        for (const f of this.app.vault.getMarkdownFiles().filter(f => this.shouldIndex(f.path))) {
+        for (const f of this.indexableFiles().filter(f => this.shouldIndex(f.path))) {
             let content: string;
             try {
                 content = await this.app.vault.cachedRead(f);
             } catch {
                 continue;
             }
-            let chunks = this.chunker.chunkContent(content, f.path, undefined, new Date(f.stat.mtime).toISOString());
+            let chunks = this.chunksFor(content, f.path, new Date(f.stat.mtime).toISOString());
             if (chunks.length === 0) continue;
             try {
                 chunks = (await enforceTokenBudget(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
@@ -1767,8 +1774,10 @@ export class SearchOrchestrator {
     }
 
     // The live-vault chunk_id set + whether it is COMPLETE — the liveness oracle for
-    // sidecar compaction. Mirrors reChunkLive's id pipeline (chunkContent THEN
-    // enforceTokenBudget, so ids match what indexing wrote) but returns only ids and,
+    // sidecar compaction. Mirrors reChunkLive's id pipeline (chunksFor THEN
+    // enforceTokenBudget over indexableFiles, so ids match what indexing wrote for
+    // both notes and bases — without the base coverage compaction would count every
+    // base chunk dead and GC it). Returns only ids and,
     // critically, a completeness flag: reChunkLive SWALLOWS per-note read/tokenizer
     // errors (hydrate only skips, which is non-destructive), but compaction DELETES on
     // this oracle, so a single skipped note would wrongly drop that note's live records.
@@ -1788,7 +1797,7 @@ export class SearchOrchestrator {
             return { ids, complete: false };
         }
         let complete = true;
-        for (const f of this.app.vault.getMarkdownFiles().filter(f => this.shouldIndex(f.path))) {
+        for (const f of this.indexableFiles().filter(f => this.shouldIndex(f.path))) {
             let content: string;
             try {
                 content = await this.app.vault.cachedRead(f);
@@ -1800,7 +1809,7 @@ export class SearchOrchestrator {
                 await this.logger.appendError(`collectLiveIds-read:${f.path}`, e);
                 continue;
             }
-            let chunks = this.chunker.chunkContent(content, f.path, undefined, new Date(f.stat.mtime).toISOString());
+            let chunks = this.chunksFor(content, f.path, new Date(f.stat.mtime).toISOString());
             if (chunks.length === 0) continue; // genuinely empty note — no ids, not a skip
             try {
                 chunks = (await enforceTokenBudget(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
@@ -1991,7 +2000,7 @@ export class SearchOrchestrator {
             } catch {
                 continue;
             }
-            let chunks = this.chunker.chunkContent(content, f.path, undefined, new Date(f.stat.mtime).toISOString());
+            let chunks = this.chunksFor(content, f.path, new Date(f.stat.mtime).toISOString());
             if (chunks.length === 0) continue;
             try {
                 chunks = (await enforceTokenBudget(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
@@ -2061,7 +2070,7 @@ export class SearchOrchestrator {
         for (const f of files) {
             let content: string;
             try { content = await this.app.vault.cachedRead(f); } catch { continue; }
-            let chunks = this.chunker.chunkContent(content, f.path, undefined, new Date(f.stat.mtime).toISOString());
+            let chunks = this.chunksFor(content, f.path, new Date(f.stat.mtime).toISOString());
             if (chunks.length === 0) continue;
             try {
                 chunks = (await enforceTokenBudget(chunks, ts => this.embedder.tokenCounts(ts))).chunks;

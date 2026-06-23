@@ -962,6 +962,29 @@ export class SeekSearchModal extends Modal {
         const file = this.app.vault.getAbstractFileByPath(r.note_path);
         if (!(file instanceof TFile)) return;
 
+        // A .base is a saved query/view, not editable text. Skip the markdown
+        // highlight + scroll path (buildMatchHighlight/scrollLeafToChunk assume a
+        // text editor) and drive the Bases view directly: the matched view name
+        // rides in heading_path (chunkBase puts it there), so we land on that exact
+        // view. A base-level chunk (empty heading_path) has no viewName, so the
+        // Bases view opens its default/last-used view. Mirrors the markdown path's
+        // modal semantics: a background new tab keeps the modal open + focused; a
+        // plain open takes the active tab and dismisses.
+        if (file.extension === 'base') {
+            const viewName = r.heading_path?.[r.heading_path.length - 1];
+            const state: Record<string, unknown> = viewName ? { file: file.path, viewName } : { file: file.path };
+            if (newTab) {
+                const leaf = this.app.workspace.getLeaf('tab');
+                await leaf.setViewState({ type: 'bases', active: false, state });
+                this.field?.focus();
+                return;
+            }
+            const leaf = this.app.workspace.getLeaf(false);
+            await leaf.setViewState({ type: 'bases', active: true, state });
+            this.close();
+            return;
+        }
+
         // Native search-style highlight of the matched terms (same transient
         // flash core Search uses), passed via ephemeral state on the open call.
         const eState = await this.buildMatchHighlight(file, r);

@@ -127,6 +127,22 @@ export interface Chunk {
     denseSuffix?: string;
 }
 
+// One synthetic search document extracted from a `.base` file (Obsidian Bases).
+// A base is modelled as a document whose VIEWS are its sections: `extractBaseDocs`
+// returns one BaseView per indexable view plus a base-level entry, and the chunker
+// (`chunkBase`) turns each into a Chunk that reuses the whole note pipeline (title,
+// heading_path, chunk_id, dense + BM25, dedup, nav). See base-extractor.ts.
+export interface BaseView {
+    // The view's display name, or null for the base-level entry. Drives the chunk
+    // title (`"<base> > <viewName>"` vs bare `"<base>"`) and heading_path, so the
+    // view name earns the 3.0x BM25 headings field and the dense channel.
+    viewName: string | null;
+    // Synthetic searchable text: base name + inherited top-level filter literals +
+    // this view's own filter literals + the view name, deduped. Never empty (the
+    // base name is always present), so no chunk needs the lexicalOnly stub flag.
+    content: string;
+}
+
 // A chunk's metadata — everything except the body text. This is what the v8
 // `chunk_meta` IDB store holds and what the resident search frame keeps in RAM;
 // the body lives in `chunk_body` keyed by chunk_id and is fetched lazily for
@@ -343,8 +359,9 @@ export interface SeekSettings {
 
     // Whether `.base` files (Obsidian Bases — saved query/view definitions) are
     // indexed alongside markdown notes. ON (default) collects every `.base` file
-    // and feeds it through extractBaseDoc → a synthetic title+filter document so
-    // a Base surfaces in search like any note. OFF restricts the index to `.md`
+    // and feeds it through extractBaseDocs → chunkBase → a base-level chunk plus
+    // one per non-generic view, so a Base (and the right VIEW) surfaces in search
+    // like any note section. OFF restricts the index to `.md`
     // only. Applied at index time: collection (search.ts indexableFiles) and the
     // create/rename/delete watcher (main.ts isIndexableFile) both gate on it, so
     // a change takes effect on the next reindex/delta — toggling OFF drops

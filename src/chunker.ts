@@ -22,7 +22,7 @@
 // forward-progress guarantee (JWT-blob class) lives on in token-budget.ts's
 // hardSplitByTokens, which has the same strictly-shrinking guard.
 
-import type { Chunk, ChunkMeta, ChunkMetadata } from './types';
+import type { Chunk, ChunkMeta, ChunkMetadata, BaseView } from './types';
 import { scanHeadings } from './atoms';
 import { toDisplayForm } from './prop-normalize';
 export type { Chunk, ChunkMeta, ChunkMetadata };
@@ -96,8 +96,12 @@ export function chunkIdFor(notePath: string, title: string, content: string, den
 // the embedded bytes (and thus the ids) changed, so a pre-4 sidecar's vectors
 // are unreproducible here and must be rejected. 5 = lightweight cleanliness
 // gates on that suffix (shape/dedup/cap, 2026-06-18) — the suffix bytes shrink,
-// so the ids shift again and a pre-5 sidecar is likewise rejected.
-export const CHUNKER_VERSION = 5;
+// so the ids shift again and a pre-5 sidecar is likewise rejected. 6 = .base
+// files chunk per-VIEW via chunkBase (base-as-document model, 2026-06-23) — one
+// base now yields a base-level chunk + one per non-generic view instead of a
+// single mashed doc, so every base chunk's title/content (and id) changed and a
+// pre-6 sidecar's base vectors are unreproducible.
+export const CHUNKER_VERSION = 6;
 
 export interface ChunkerOptions {
     minChunkChars?: number;
@@ -344,6 +348,44 @@ export class MarkdownChunker {
             }
         }
         return chunks;
+    }
+
+    // Chunk an Obsidian `.base` file. A base is a document whose VIEWS are its
+    // sections (base-extractor.ts extractBaseDocs): each BaseView becomes one chunk
+    // titled "<base> > <viewName>" with heading_path ["<viewName>"], so the view
+    // name earns the 3.0x BM25 headings field and routes a semantic query to the
+    // right view. The base-level entry (viewName null) is the bare "<base>" title
+    // with an empty heading_path and wins bare-name queries via title-boost —
+    // mirroring how a note carries a whole-note identity alongside its sections.
+    // Reuses the module-level chunkIdFor (no denseSuffix: bases have no frontmatter
+    // values), so a base chunk's id matches across every production site that
+    // routes through chunksFor. Bases carry no note metadata and span one logical
+    // line, so start/end_line = 1. Content is never empty (the base name is always
+    // present), so no chunk needs the lexical-only fallback the markdown path uses.
+    chunkBase(views: BaseView[], notePath: string, modified?: string | null): Chunk[] {
+        const base = notePath.split('/').pop()!.replace(/\.base$/, '');
+        const metadata: ChunkMetadata = {
+            tags: [],
+            aliases: [],
+            pageType: '',
+            created: null,
+            modified: modified ?? null,
+            properties: {},
+        };
+        return views.map(v => {
+            const title = v.viewName ? `${base} > ${v.viewName}` : base;
+            const headingPath = v.viewName ? [v.viewName] : [];
+            return {
+                chunk_id: chunkIdFor(notePath, title, v.content),
+                title,
+                content: v.content,
+                note_path: notePath,
+                heading_path: headingPath,
+                metadata,
+                start_line: 1,
+                end_line: 1,
+            };
+        });
     }
 
 }

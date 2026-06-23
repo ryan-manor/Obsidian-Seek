@@ -1,7 +1,44 @@
 import { describe, it, expect } from 'vitest';
-import { extractBaseDoc } from './base-extractor';
+import { extractBaseDocs } from './base-extractor';
+import type { BaseView } from './types';
 
 // Real-shape fixtures lifted from the vault's .base files.
+
+// The worked example from the plan: top-level folder filter inherited by every
+// view, five non-generic views, the default "All Clippings" view carrying no own
+// filter. "fashion clips" should route to Clothing — impossible with one mashed doc.
+const CLIPPINGS = `filters:
+  and:
+    - file.inFolder("Clippings")
+views:
+  - type: cards
+    name: All Clippings
+    order:
+      - file.name
+  - type: cards
+    name: Products
+    filters:
+      and:
+        - category == "product"
+  - type: list
+    name: Posts
+    filters:
+      and:
+        - category == "writing"
+  - type: cards
+    name: Clothing
+    filters:
+      and:
+        - category == "product"
+        - subcategory.contains("Clothing")
+        - read != true
+  - type: list
+    name: Wikis
+    filters:
+      and:
+        - pageSource == "Team Wiki"
+`;
+
 const READING_LIST = `filters:
   or:
     - category == "writing"
@@ -40,7 +77,7 @@ views:
     name: View
 `;
 
-// The pathological case: ~30 formula bodies full of literals like "Overdue",
+// The pathological case: formula bodies full of literals like "Overdue",
 // "Quick (<30m)", "No due date" that must NOT leak into the index.
 const AGENDA = `filters:
   and:
@@ -54,58 +91,107 @@ views:
     name: Agenda
 `;
 
-describe('extractBaseDoc', () => {
-    it('titles the doc by basename, minus the .base extension', () => {
-        expect(extractBaseDoc(READING_LIST, 'Bases/Reading list.base').title).toBe('Reading list');
-        expect(extractBaseDoc(PLACES, 'a/b/Places.base').title).toBe('Places');
+const base = (docs: BaseView[]): BaseView => docs.find(d => d.viewName === null)!;
+const view = (docs: BaseView[], name: string): BaseView | undefined => docs.find(d => d.viewName === name);
+
+describe('extractBaseDocs', () => {
+    it('emits a base-level entry plus one per non-generic view', () => {
+        const docs = extractBaseDocs(CLIPPINGS, 'Bases/Clippings.base');
+        expect(docs.map(d => d.viewName)).toEqual([null, 'All Clippings', 'Products', 'Posts', 'Clothing', 'Wikis']);
     });
 
-    it('pulls filter string literals, drops operators and property paths', () => {
-        const { text } = extractBaseDoc(READING_LIST, 'Reading list.base');
-        expect(text).toContain('writing');
-        expect(text).toContain('books');
-        expect(text).not.toContain('category');     // property path, not content
-        expect(text).not.toContain('file.tags');
-        expect(text).not.toContain('346');          // layout config
+    it('routes a view by its own filter literal AND its name (the Clothing case)', () => {
+        const docs = extractBaseDocs(CLIPPINGS, 'Bases/Clippings.base');
+        const clothing = view(docs, 'Clothing')!;
+        expect(clothing.content).toContain('Clothing');   // view name
+        expect(clothing.content).toContain('product');    // own filter literal
+        expect(clothing.content).not.toContain('writing'); // a SIBLING view's literal must not bleed in
     });
 
-    it('keeps multi-word and slashed literals intact', () => {
-        const { text } = extractBaseDoc(ALEX_1X1S, 'Alex 1x1s.base');
-        expect(text).toContain('meetings/1x1s');
-        expect(text).toContain('Alex');
+    it('inherits top-level filter literals into every view and the base entry', () => {
+        const docs = extractBaseDocs(CLIPPINGS, 'Bases/Clippings.base');
+        for (const d of docs) expect(d.content).toContain('Clippings'); // file.inFolder("Clippings")
     });
 
-    it('skips summaries blocks (no "null" leak)', () => {
-        const { text } = extractBaseDoc(ALEX_1X1S, 'Alex 1x1s.base');
-        expect(text).not.toContain('null');
+    it('keeps each view content distinct (Posts→writing, Wikis→Team Wiki)', () => {
+        const docs = extractBaseDocs(CLIPPINGS, 'Bases/Clippings.base');
+        expect(view(docs, 'Posts')!.content).toContain('writing');
+        expect(view(docs, 'Wikis')!.content).toContain('Team Wiki');
+        expect(view(docs, 'Products')!.content).toContain('product');
     });
 
-    it('keeps meaningful view names but drops generic ones', () => {
-        const { text } = extractBaseDoc(PLACES, 'Places.base');
-        expect(text).toContain('places');
-        expect(text).toContain('Map');              // meaningful view name
-        expect(text).not.toContain('View');         // generic
-        expect(text).not.toContain('Table');        // generic
+    it('pulls filter string literals, drops operators / property paths / layout', () => {
+        const docs = extractBaseDocs(READING_LIST, 'Reading list.base');
+        const c = base(docs).content;       // generic-only base → literals fold to base level
+        expect(c).toContain('writing');
+        expect(c).toContain('books');
+        expect(c).not.toContain('category');
+        expect(c).not.toContain('file.tags');
+        expect(c).not.toContain('346');
     });
 
-    it('rejects expression literals like !coordinates.isEmpty()', () => {
-        const { text } = extractBaseDoc(PLACES, 'Places.base');
-        expect(text).not.toContain('coordinates');
-        expect(text).not.toContain('isEmpty');
+    it('folds a generic view\'s own literals into the base-level entry', () => {
+        // ALEX's only view is a generic "Table" — its filter literals still describe
+        // the base, so they land on the base-level entry, not a dropped view.
+        const docs = extractBaseDocs(ALEX_1X1S, 'Alex 1x1s.base');
+        expect(docs.map(d => d.viewName)).toEqual([null]);
+        const c = base(docs).content;
+        expect(c).toContain('meetings/1x1s');
+        expect(c).toContain('Alex');
+        expect(c).not.toContain('null');   // summaries never read
+    });
+
+    it('keeps meaningful view names, drops generic ones, rejects expression literals', () => {
+        const docs = extractBaseDocs(PLACES, 'Places.base');
+        expect(docs.map(d => d.viewName)).toEqual([null, 'Map']); // "View" (generic) dropped
+        expect(base(docs).content).toContain('places');
+        const map = view(docs, 'Map')!.content;
+        expect(map).toContain('Map');
+        expect(map).toContain('places');       // inherited
+        expect(map).not.toContain('coordinates'); // "!coordinates.isEmpty()" rejected
+        expect(map).not.toContain('isEmpty');
     });
 
     it('does not leak formula-body literals (the agenda swamp)', () => {
-        const { text } = extractBaseDoc(AGENDA, 'agenda.base');
+        const docs = extractBaseDocs(AGENDA, 'agenda.base');
+        const all = docs.map(d => d.content).join(' ');
         for (const noise of ['none', 'high', 'No due date', 'Overdue', 'This week', 'Quick', 'priorityWeight']) {
-            expect(text).not.toContain(noise);
+            expect(all).not.toContain(noise);
         }
-        expect(text).toContain('task');             // the one real filter literal
-        expect(text).toContain('Agenda');           // view name, declared AFTER formulas
+        expect(view(docs, 'Agenda')!.content).toContain('task');   // the one real filter literal, inherited
+        expect(view(docs, 'Agenda')!.content).toContain('Agenda'); // view name, declared AFTER formulas
     });
 
-    it('returns empty text when a base has only generic views and no literals', () => {
-        const { title, text } = extractBaseDoc('views:\n  - type: table\n    name: Table\n', 'Empty.base');
-        expect(title).toBe('Empty');
-        expect(text).toBe('');
+    it('always returns a non-empty base-level entry, even for an empty/generic-only base', () => {
+        const docs = extractBaseDocs('views:\n  - type: table\n    name: Table\n', 'Empty.base');
+        expect(docs).toHaveLength(1);
+        expect(docs[0].viewName).toBeNull();
+        expect(docs[0].content).toBe('Empty');   // just the base name — never empty
+    });
+
+    it('degrades to a base-level entry on malformed YAML', () => {
+        const docs = extractBaseDocs(':\n  bad: : :\n\t- nope', 'Broke.base');
+        expect(docs).toHaveLength(1);
+        expect(docs[0].viewName).toBeNull();
+        expect(docs[0].content).toBe('Broke');
+    });
+
+    it('degrades (never throws) on structurally-odd shapes — non-array views / branches', () => {
+        // Parseable YAML whose shapes violate the Bases schema (only reachable via a
+        // hand-edited / corrupt .base): a non-array `views`, a null view element, and
+        // a non-array and/or/not branch must all fold to a lone base-level entry, not
+        // throw and lose the file.
+        for (const raw of [
+            'views: 5',                 // views is a scalar
+            'views:\n  bad: map',       // views is a mapping
+            'views:\n  - null',         // null view element
+            'filters:\n  and: 7',       // branch is a scalar
+            'filters: 3',               // filters is a scalar leaf
+        ]) {
+            const docs = extractBaseDocs(raw, 'Weird.base');
+            expect(docs).toHaveLength(1);
+            expect(docs[0].viewName).toBeNull();
+            expect(docs[0].content).toBe('Weird');
+        }
     });
 });
