@@ -597,7 +597,7 @@ export interface MemorySnapshot {
 export async function snapshotMemory(): Promise<MemorySnapshot> {
     const heap = snapshotHeap();
     let storageMB: number | null = null;
-    if (navigator.storage?.estimate) {
+    if (typeof navigator !== 'undefined' && navigator.storage?.estimate) {
         try {
             const est = await navigator.storage.estimate();
             storageMB = est.usage != null ? est.usage / 1e6 : null;

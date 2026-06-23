@@ -8,6 +8,9 @@ import type { PlatformEntry, AdapterLimits } from './types';
 // probe and by the indexer's device-adaptive embed batch ceiling, so the two
 // can never disagree about what "mobile" means.
 export function isMobilePlatform(): boolean {
+    // `navigator` is absent under Node < 21 (e.g. the CI test runner); the real
+    // plugin runtime always has it. Default to not-mobile when it's missing.
+    if (typeof navigator === 'undefined') return false;
     return /Mobile|Android|iPhone|iPad/.test(navigator.userAgent);
 }
 
