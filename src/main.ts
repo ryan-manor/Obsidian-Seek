@@ -24,7 +24,7 @@ import { pluginIdentity, identityMatches, identityFromMeta } from './identity';
 import { sweepOrphanTmpFiles } from './sidecar';
 import type { SeekSettings, SidecarIndexLocation, IndexCompleteEntry, ModelDeliveryEntry } from './types';
 import { DEFAULT_SETTINGS, migrateSettings } from './types';
-import { IndexStore } from './index-store';
+import { IndexStore, indexDbPrefix } from './index-store';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
 import { SearchOrchestrator, driftRecoveryDecision } from './search';
@@ -217,7 +217,7 @@ export default class SeekPlugin extends Plugin {
     }
 
     async onload() {
-        this.logger = new SeekLogger(this.app);
+        this.logger = new SeekLogger(this.app, this.manifest.id);
         // Sweep any pre-existing root-level seek-log/init/captures files into the
         // hidden LOG_DIR next to the index, THEN tail-truncate this device's log if it
         // has outgrown MAX_LOG_BYTES (append-only logs have no natural ceiling), THEN
@@ -254,14 +254,20 @@ export default class SeekPlugin extends Plugin {
         // the cast. Vault name fallback keeps a (rename-fragile) scope if a
         // future Obsidian drops appId.
         const appId = (this.app as unknown as { appId?: string }).appId;
-        await this.store.open(appId ?? this.app.vault.getName());
+        const vaultScope = appId ?? this.app.vault.getName();
+        // Scope the DB by PLUGIN id too (indexDbPrefix), not just the vault, so a
+        // second Seek build in this vault (e.g. an id 'seek-prototype' dev build)
+        // owns a separate database. id 'seek' → 'seek-index:<appId>', unchanged.
+        await this.store.open(vaultScope, indexDbPrefix(this.manifest.id));
 
         // Crash forensics: synchronous localStorage breadcrumbs (vault-scoped
         // like the IDB name — localStorage is origin-shared across vaults on
         // mobile). bootInspect classifies an unclean previous session and we
         // promote it into the log; this is the ONLY way a jetsam kill becomes
-        // visible, since async NDJSON appends die with the process.
-        this.forensics = new Forensics(appId ?? this.app.vault.getName(), this.logger.deviceId, this.logger.sessionId);
+        // visible, since async NDJSON appends die with the process. Scoped by
+        // plugin id as well, so a co-installed build's breadcrumbs can't be
+        // misread as this build's crash.
+        this.forensics = new Forensics(`${this.manifest.id}:${vaultScope}`, this.logger.deviceId, this.logger.sessionId);
         const crash = this.forensics.bootInspect();
         if (crash) {
             // Forensics: always persist the classified crash to the per-device
@@ -665,15 +671,22 @@ export default class SeekPlugin extends Plugin {
     // vault.configDir (the per-device active override) so every device resolves
     // the SAME sidecar path — the fix for the config-folder CRITICAL.
     private static readonly DEFAULT_CONFIG_DIR = '.obsidian';
-    private static readonly SIDECAR_CONFIG_DIR = '.obsidian/plugins/seek/index';
-    private static readonly SIDECAR_VISIBLE_DIR = 'Seek Index';
+    // Per-INSTANCE so a co-installed build (different manifest.id) gets its own
+    // sidecar location and can't write into the public build's plugin folder. The
+    // hidden default is `.obsidian/plugins/<id>/index` (id 'seek' → the historical
+    // path, no migration); the visible opt-in folder is `<name> Index` (name
+    // 'Seek' → 'Seek Index', unchanged). Still a LITERAL `.obsidian` (not
+    // vault.configDir) so every device resolves the same synced path — the
+    // config-folder CRITICAL fix.
+    private get sidecarConfigDir(): string { return `.obsidian/plugins/${this.manifest.id}/index`; }
+    private get sidecarVisibleDir(): string { return `${this.manifest.name} Index`; }
 
     // Hidden literal path by default; the vault-root visible folder only when a
     // split-config Obsidian Sync user opts in (see maybeSteerSidecarLocation).
     private resolveSidecarIndexDir(): string {
         return this.settings.sidecarIndexLocation === 'visible'
-            ? SeekPlugin.SIDECAR_VISIBLE_DIR
-            : SeekPlugin.SIDECAR_CONFIG_DIR;
+            ? this.sidecarVisibleDir
+            : this.sidecarConfigDir;
     }
 
     // One-time rev-3→4 move of an index written under the old active-override
@@ -715,7 +728,7 @@ export default class SeekPlugin extends Plugin {
         // presence is the in-use signal. iCloud/Syncthing have no such file.
         const onObsidianSync = await this.app.vault.adapter.exists(`${configDir}/sync.json`).catch(() => false);
         if (!onObsidianSync) return;
-        const flagKey = 'seek-sidecar-steer-shown';
+        const flagKey = `${this.manifest.id}-sidecar-steer-shown`;
         if (window.localStorage.getItem(flagKey)) return;
         window.localStorage.setItem(flagKey, '1');
         new Notice(

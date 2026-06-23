@@ -46,7 +46,10 @@ import { isMobilePlatform } from './platform';
 // SAME directory, so iCloud syncs all devices' per-device logs into one folder
 // the report can list in a single pass. Invisible in the file explorer because
 // it lives under the config folder.
-const LOG_DIR = '.obsidian/plugins/seek/logs';
+// Per-INSTANCE (plugin-id-scoped) so a co-installed build writes its logs into
+// its OWN plugin folder, never a sibling's. id 'seek' → the historical
+// '.obsidian/plugins/seek/logs', so a shipped build's log location is unchanged.
+function logDirFor(pluginId: string): string { return `.obsidian/plugins/${pluginId}/logs`; }
 // The report is the only shared (single-writer-at-a-time, full-overwrite) file,
 // and the only one kept at the vault ROOT — it must stay a real vault file so the
 // "Generate logging report" command can open it (getAbstractFileByPath only
@@ -83,7 +86,6 @@ const REPORT_CAPS: Record<string, number> = {
 // isn't lost; never written to again. The basename is matched both at the vault
 // root (pre-move) and inside LOG_DIR (post-move).
 const LEGACY_LOG_BASE = 'seek-log.ndjson';
-const LEGACY_LOG_PATH = `${LOG_DIR}/${LEGACY_LOG_BASE}`;
 const LOG_PREFIX = 'seek-log-';     // per-device: seek-log-<deviceId>.ndjson
 const INIT_PREFIX = 'seek-init-';   // per-device: seek-init-<deviceId>.json
 const CAPTURE_PREFIX = 'seek-captures-';
@@ -165,22 +167,26 @@ export class SeekLogger {
     // distinct message is always persisted, so a crash never hides an error; subsequent
     // identical messages are counted and only milestone-sampled to disk. See appendError.
     private errAgg = new Map<string, { count: number; lastWritten: number; firstTs: string; lastTs: string; lastContext: string }>();
-    constructor(app: App) {
+    // Plugin-scoped per-device log directory (logDirFor) — a co-installed build
+    // writes into its own folder, not a sibling's. 'seek' → the historical path.
+    private readonly logDir: string;
+    constructor(app: App, pluginId: string) {
         this.app = app;
+        this.logDir = logDirFor(pluginId);
         this.deviceId = resolveDeviceId();
         this.sessionId = randId();
     }
 
-    private logPath(): string { return `${LOG_DIR}/${LOG_PREFIX}${this.deviceId}.ndjson`; }
-    private initPath(): string { return `${LOG_DIR}/${INIT_PREFIX}${this.deviceId}.json`; }
+    private logPath(): string { return `${this.logDir}/${LOG_PREFIX}${this.deviceId}.ndjson`; }
+    private initPath(): string { return `${this.logDir}/${INIT_PREFIX}${this.deviceId}.json`; }
 
     // mkdir LOG_DIR if absent. Idempotent and best-effort: the parent
     // .obsidian/plugins/seek folder always exists (the plugin loads from it), so
     // this only ever creates the leaf 'logs'. Called before every first write.
     private async ensureDir(): Promise<void> {
         const adapter = this.app.vault.adapter;
-        if (await adapter.exists(LOG_DIR).catch(() => false)) return;
-        await adapter.mkdir(LOG_DIR).catch(() => { /* concurrent create / race — write will surface any real failure */ });
+        if (await adapter.exists(this.logDir).catch(() => false)) return;
+        await adapter.mkdir(this.logDir).catch(() => { /* concurrent create / race — write will surface any real failure */ });
     }
 
     // Stamp device + session onto every outgoing entry. Centralized here so no
@@ -306,8 +312,8 @@ export class SeekLogger {
         // LOG_DIR (the new home) AND the vault root: during the upgrade window a
         // not-yet-migrated device may still be writing per-device logs at root,
         // and iCloud may have synced them here before this device migrated.
-        const candidates = new Set<string>([this.logPath(), LEGACY_LOG_PATH]);
-        for (const dir of [LOG_DIR, '']) {
+        const candidates = new Set<string>([this.logPath(), `${this.logDir}/${LEGACY_LOG_BASE}`]);
+        for (const dir of [this.logDir, '']) {
             try {
                 const listed = await adapter.list(dir);
                 for (const f of listed.files ?? []) {
@@ -393,7 +399,7 @@ export class SeekLogger {
         await this.ensureDir();
         let moved = 0;
         for (const src of toMove) {
-            const dest = `${LOG_DIR}/${src}`;
+            const dest = `${this.logDir}/${src}`;
             if (await adapter.exists(dest).catch(() => false)) {
                 // Already present in LOG_DIR (a prior partial migration, or another
                 // device synced its copy here first). Drop the stale root duplicate.
@@ -441,7 +447,7 @@ export class SeekLogger {
     async pruneOrphanLogs(): Promise<void> {
         const adapter = this.app.vault.adapter;
         const mine = this.logPath();
-        const listed = await adapter.list(LOG_DIR).catch(() => null);
+        const listed = await adapter.list(this.logDir).catch(() => null);
         if (!listed) return;
         const now = Date.now();
         for (const path of listed.files ?? []) {
@@ -459,7 +465,7 @@ export class SeekLogger {
                 await adapter.remove(norm);
                 if (base.startsWith(LOG_PREFIX)) {    // drop the paired init sidecar too
                     const dev = base.slice(LOG_PREFIX.length, -'.ndjson'.length);
-                    await adapter.remove(`${LOG_DIR}/${INIT_PREFIX}${dev}.json`).catch(() => {});
+                    await adapter.remove(`${this.logDir}/${INIT_PREFIX}${dev}.json`).catch(() => {});
                 }
             } catch { /* read/remove failed — skip, retry next load */ }
         }

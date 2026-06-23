@@ -245,13 +245,13 @@ export class SearchOrchestrator {
         const resetEntry: ResetEntry = {
             type: 'reset',
             timestamp: new Date().toISOString(),
-            droppedDatabase: 'seek-index',
+            droppedDatabase: this.store.dbName,
             chunksDeleted: pre.chunks,
             vectorsDeleted: pre.embeddings,
             durationMs: parseFloat((performance.now() - resetStart).toFixed(2)),
             pass: true,
             checks: [
-                `✅ dropped database "seek-index"`,
+                `✅ dropped database "${this.store.dbName}"`,
                 `ℹ️ removed ${pre.chunks} chunks, ${pre.embeddings} vectors, ${pre.files} file records`,
             ],
         };

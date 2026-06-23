@@ -9,11 +9,24 @@
 // and assert byte-equality against a reference per-get implementation.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { IndexStore, classifyFileDelta, planRestoreOps, findOrphanChunkIds, isStoreClosedError, STORE_NOT_OPENED, type StoreSnapshot } from './index-store';
+import { IndexStore, classifyFileDelta, planRestoreOps, findOrphanChunkIds, isStoreClosedError, STORE_NOT_OPENED, indexDbPrefix, type StoreSnapshot } from './index-store';
 import { quantizeInt8, dequantizeInt8, type QuantVec } from './quant';
 
 // The closed-store discriminator behind the reindex storm bound: the indexer rethrows
 // (aborting the whole pass) ONLY for this error, and skips just the one file otherwise.
+describe('indexDbPrefix (per-plugin DB scoping for co-installed builds)', () => {
+    it('the shipped id resolves to the legacy name — released build never migrates', () => {
+        // open() appends `:<appId>`, so this must equal the historical
+        // LEGACY_DB_NAME ('seek-index') or every public install would re-key + reindex.
+        expect(indexDbPrefix('seek')).toBe('seek-index');
+    });
+    it('a differently-id\'d build gets a SEPARATE database prefix', () => {
+        expect(indexDbPrefix('seek-prototype')).toBe('seek-prototype-index');
+        // distinct from the shipped prefix → no shared DB, no cross-nuke
+        expect(indexDbPrefix('seek-prototype')).not.toBe(indexDbPrefix('seek'));
+    });
+});
+
 describe('isStoreClosedError (reindex-storm bound)', () => {
     it('is true for the requireDb closed-store error', () => {
         expect(isStoreClosedError(new Error(STORE_NOT_OPENED))).toBe(true);

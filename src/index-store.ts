@@ -39,7 +39,21 @@ import { sizeOfRow, type SizingRule, type StoreSizeRow } from './index-size';
 // Obsidian's stable per-vault id — the same key it uses to vault-scope its own
 // localStorage). The legacy unscoped DB is deleted fire-and-forget on first
 // scoped open.
+//
+// The prefix is ALSO scoped by PLUGIN id (indexDbPrefix), so a second Seek build
+// installed in the same vault — e.g. a prototype with id 'seek-prototype' — gets
+// its OWN database and can't nuke/reindex the public build's index. main.ts
+// passes the prefix at onload; the shipped id 'seek' resolves to 'seek-index',
+// byte-identical to this legacy constant, so a released build never migrates.
 const LEGACY_DB_NAME = 'seek-index';
+
+// The per-PLUGIN IndexedDB name prefix. `seek` → `seek-index` (== LEGACY_DB_NAME,
+// so the shipped build is unchanged); a differently-id'd build (`seek-prototype`)
+// → a separate `seek-prototype-index` database. The vault scope (`:<appId>`) is
+// appended by open(); two builds in one vault thus differ only by this prefix.
+export function indexDbPrefix(pluginId: string): string {
+    return `${pluginId}-index`;
+}
 // DB_VERSION 2 (2026-05-14): switched embedding dim 768 -> 512 (MRL slice)
 // and model dtype q8 -> q4. The on-disk vectors are now shape-incompatible
 // with the previous schema, so the upgrade path drops chunks/embeddings/files
@@ -485,8 +499,8 @@ export class IndexStore {
 
     get dbName(): string { return this._dbName; }
 
-    async open(scope?: string): Promise<void> {
-        if (scope) this._dbName = `${LEGACY_DB_NAME}:${scope}`;
+    async open(scope?: string, dbPrefix: string = LEGACY_DB_NAME): Promise<void> {
+        if (scope) this._dbName = `${dbPrefix}:${scope}`;
         this.db = await openDb(this._dbName);
         // GAP-3: openDb's onversionchange closes the connection on a cross-window
         // schema upgrade but leaves this.db pointing at the now-closed handle, so
@@ -500,12 +514,15 @@ export class IndexStore {
             opened.close();
             if (this.db === opened) this.db = null;
         };
-        // One-time legacy cleanup: the pre-scoping shared DB. Fire-and-forget —
-        // if another window (old build) still holds it, the delete stays
-        // pending until that window closes; nothing here waits on it.
-        if (!this.legacyCleanupDone && this._dbName !== LEGACY_DB_NAME) {
+        // One-time legacy cleanup: THIS build's pre-scoping shared DB (the bare,
+        // appId-less prefix). Targets dbPrefix — not a hardcoded literal — so a
+        // differently-id'd build only ever deletes its OWN bare legacy, never
+        // another build's scoped DB. Fire-and-forget — if another window (old
+        // build) still holds it, the delete stays pending until that window
+        // closes; nothing here waits on it.
+        if (!this.legacyCleanupDone && this._dbName !== dbPrefix) {
             this.legacyCleanupDone = true;
-            try { indexedDB.deleteDatabase(LEGACY_DB_NAME); } catch { /* best-effort */ }
+            try { indexedDB.deleteDatabase(dbPrefix); } catch { /* best-effort */ }
         }
     }
 
