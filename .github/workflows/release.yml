@@ -1,0 +1,42 @@
+name: Release
+
+# Obsidian's installer (and BRAT) install a plugin by pulling the GitHub Release
+# whose tag EXACTLY matches manifest.json "version" (no leading "v"), with
+# main.js / manifest.json / styles.css attached as individual assets.
+#
+# Cut a release from this repo with:
+#   npm version patch        # bumps manifest + versions.json, commits, tags
+#   git push --follow-tags   # pushes the tag -> fires this workflow
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: npm
+      - name: Build plugin
+        run: |
+          npm ci
+          npm run build
+      - name: Create draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # Drop --draft below to publish automatically instead of reviewing first.
+          gh release create "$tag" \
+            --title "$tag" \
+            --draft \
+            --generate-notes \
+            main.js manifest.json styles.css
