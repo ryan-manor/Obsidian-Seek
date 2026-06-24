@@ -161,6 +161,14 @@ interface SeekResultRow {
     lastSnippet: string;
 }
 
+// The version-stale banner the modal renders between the query field and the results.
+// The plugin supplies only the message (index-notice.ts policy); the modal owns the
+// fixed "Open settings" action (where the reindex affordance lives), so this is a pure
+// signpost — no async, no button-state to manage.
+export interface IndexBanner {
+    message: string;
+}
+
 export class SeekSearchModal extends Modal {
     private orchestrator: SearchOrchestrator;
     private logger: SeekLogger;
@@ -172,6 +180,10 @@ export class SeekSearchModal extends Modal {
     // back the field's value suggestions.
     private suggester: SuggestEngine | null = null;
     private resultsEl: HTMLElement | null = null;
+    // Fixed-position container for the version-stale banner, between the field and the
+    // results. Rendered into (empty + refill) so re-renders keep their place; collapses
+    // to nothing via `.seek-banner-slot:empty { display: none }` when there's no banner.
+    private bannerSlot: HTMLElement | null = null;
     // Reusable result rows, reconciled in place across searches so only the
     // text that actually changed repaints — no full teardown means no flicker
     // and no scroll-reset. Indexed positionally: rows[0] is always rank 1.
@@ -248,6 +260,10 @@ export class SeekSearchModal extends Modal {
         private settings: SeekSettings,
         onSearchActivity?: (active: boolean) => void,
         onQueryInFlight?: (inFlight: boolean) => void,
+        // Live thunk for the version-stale banner — null when the index is current.
+        // Re-evaluated on open and after the Reindex action, so a heal that landed
+        // between opens clears the banner. Optional (absent in tests / headless).
+        private getIndexNotice?: () => IndexBanner | null,
         // Optional seed from a deep link (obsidian://seek?query=…). Empty for the
         // palette command. Applied in onOpen once the field exists.
         private initialQuery = '',
@@ -312,6 +328,11 @@ export class SeekSearchModal extends Modal {
         // path a keystroke takes, so cold-start gating and inline filters behave
         // identically to typing it by hand.
         if (this.initialQuery.trim()) this.field.setQuery(this.initialQuery);
+
+        // Version-stale banner slot, fixed between the field and the results. Empty (and
+        // CSS-collapsed) unless the index was built under an older Seek version.
+        this.bannerSlot = contentEl.createDiv({ cls: 'seek-banner-slot' });
+        this.renderIndexBanner();
 
         this.resultsEl = contentEl.createDiv({ cls: 'seek-results' });
         this.renderEmpty();
@@ -396,6 +417,10 @@ export class SeekSearchModal extends Modal {
         this.sentinelEl = null;
         this.shownCount = 0;
         this.rows = [];
+        // Drop the banner slot ref before empty() detaches it — defensive hygiene so any
+        // stray renderIndexBanner call can never touch an orphaned node. (The banner is a
+        // pure signpost now; it's only painted in onOpen, so this is belt-and-suspenders.)
+        this.bannerSlot = null;
         this.contentEl.empty();
     }
 
@@ -634,6 +659,22 @@ export class SeekSearchModal extends Modal {
         }).setting;
         setting?.open();
         setting?.openTabById('seek');
+    }
+
+    // Paint (or clear) the version-stale banner from the live thunk. Empties the slot
+    // first so it's idempotent: re-evaluated on each open, it shows while the index is
+    // version-stale and is gone once a reindex (from Settings) heals it. CSS hides an
+    // empty slot, so the common (current-index) case adds no visible chrome. The button
+    // opens Seek settings (which closes this modal) — the reindex itself lives there.
+    private renderIndexBanner(): void {
+        if (!this.bannerSlot) return;
+        this.bannerSlot.empty();
+        const notice = this.getIndexNotice?.();
+        if (!notice) return;
+        const banner = this.bannerSlot.createDiv({ cls: 'seek-index-banner' });
+        banner.createSpan({ cls: 'seek-index-banner-msg', text: notice.message });
+        banner.createEl('button', { cls: 'seek-index-banner-btn mod-cta', text: 'Open settings' })
+            .addEventListener('click', () => this.openSeekSettings());
     }
 
     // Loading feedback that does NOT destroy what's on screen: dim the existing

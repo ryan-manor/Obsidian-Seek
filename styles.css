@@ -597,6 +597,42 @@
     cursor: pointer;
 }
 
+/* Version-stale banner: the local index was built under an older Seek version. A
+   WARNING (amber), not an error — the older index still returns correct, if
+   older-boundaried, results until the user reindexes. The slot collapses to nothing
+   when empty, so a current index adds no chrome. */
+.seek-banner-slot:empty { display: none; }
+.seek-index-banner {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 8px 0 4px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text-normal);
+    border: 1px solid var(--text-warning);
+    background: rgba(224, 160, 48, 0.12);                        /* fallback for older WebKit */
+    background: color-mix(in srgb, var(--text-warning) 12%, transparent);
+}
+.seek-index-banner-msg { flex: 1 1 auto; overflow-wrap: anywhere; }
+.seek-index-banner-btn {
+    flex: 0 0 auto;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+/* Mobile: stack message over a full-width button (a comfortable tap target) instead of
+   a cramped side-by-side row on a narrow screen. `.seek-mobile` is on the modal shell. */
+.seek-mobile .seek-index-banner {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+}
+.seek-mobile .seek-index-banner-btn { width: 100%; }
+
 /* ---- Component 3: footer hotkey bar ---- */
 
 .seek-foot {

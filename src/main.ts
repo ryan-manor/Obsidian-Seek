@@ -28,7 +28,8 @@ import { IndexStore, indexDbPrefix } from './index-store';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
 import { SearchOrchestrator, driftRecoveryDecision } from './search';
-import { SeekSearchModal } from './search-modal';
+import { SeekSearchModal, type IndexBanner } from './search-modal';
+import { indexBannerSpec, INDEX_STALE_MSG, type DegradedReason } from './index-notice';
 import { SeekSettingTab } from './settings-tab';
 import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash, getBackendOverride, setBackendOverride, isWebgpuDemoted, clearWebgpuDemoted, type BackendChoice } from './platform';
 import { CompositorPacer } from './pacer';
@@ -165,6 +166,12 @@ export default class SeekPlugin extends Plugin {
     private lastDriftRecoveryGen = -1;           // coord generation we last escalated for; -1 = never
     private indexHealth: 'healthy' | 'recovering' | 'degraded' = 'healthy';
     get indexHealthState(): 'healthy' | 'recovering' | 'degraded' { return this.indexHealth; }
+    // WHY the index is degraded, so the search-modal banner says the true thing per
+    // cause (a 'drift' degradation must not claim "this update changed indexing"). Only
+    // ever meaningful alongside indexHealth==='degraded'; cleared on every return to
+    // 'healthy'. 'version' = a CHUNKER_VERSION/model bump the user hasn't reindexed for;
+    // 'drift' = drift-recovery exhausted. See indexBannerSpec (index-notice.ts).
+    private degradedReason: DegradedReason = null;
     // Fires the version-identity mismatch log + the mobile "reindex on desktop" notice
     // once per stale spell (the gate re-checks every 5 min); cleared when identity heals
     // so a future version ship reports again. See enforceIndexIdentity.
@@ -400,9 +407,17 @@ export default class SeekPlugin extends Plugin {
             // Seek wasn't watching (external sync, edits with the plugin disabled,
             // in-session deletes lost on a crash). On desktop it loads the model +
             // re-embeds; on cold mobile it applies deletes/moves now and defers
-            // edits to the first search. Skipped when the identity gate took over:
-            // a rebuild already hydrated, a reindex is terminal, and a mobile wait
-            // must not re-chunk a stale index.
+            // edits to the first search. Skipped when the identity gate took over
+            // (identityHandled), which now means one of:
+            //   • a peer-sidecar rebuild or in-place stamp already healed the index, or
+            //   • the index is version-stale and BOTH platforms are WAITING for an
+            //     explicit reindex (consent-gated, 2026-06-23 — no more desktop
+            //     auto-reindex). We must not re-chunk onto a stale-id index here, so
+            //     while-off external edits to notes the user never opens stay deferred
+            //     until they hit “Reindex now” (a full rebuild catches everything up).
+            //     In-session edits still index live via the flushDirty event path, so
+            //     the gap is only un-touched, externally-changed notes — an accepted
+            //     freshness trade for not auto-nuking, and the banner says so.
             if (!identityHandled) await this.reconcileOnLoad();
             // The clean-launch BM25/frame warm that used to fire here ('startup') has
             // moved into ensureModelLoaded ('model-load') so it overlaps the model
@@ -976,6 +991,10 @@ export default class SeekPlugin extends Plugin {
 
         if (identityMatches(identityFromMeta(meta), pluginIdentity())) {
             this.identityHealNotified = false; // healthy — re-arm reporting for a future ship
+            // A peer sidecar (or a completed reindex) healed a version-stale index out
+            // from under us: clear the banner/health. Scoped to 'version' so a concurrent
+            // DRIFT degradation (separate axis) isn't stomped healthy here.
+            if (this.degradedReason === 'version') { this.indexHealth = 'healthy'; this.degradedReason = null; }
             return false;
         }
 
@@ -997,6 +1016,10 @@ export default class SeekPlugin extends Plugin {
             const rebuilt = await this.orchestrator.rebuildFromSidecar();
             if (rebuilt && rebuilt.acceptedProducers > 0) {
                 this.identityHealNotified = false; // healed (silent — background sync)
+                // A current-version peer existed: the fleet self-heals embed-free even
+                // with desktop auto-reindex gone. Clear any version banner this device
+                // was showing while it waited.
+                if (this.degradedReason === 'version') { this.indexHealth = 'healthy'; this.degradedReason = null; }
                 return true;
             }
 
@@ -1011,6 +1034,7 @@ export default class SeekPlugin extends Plugin {
             if (healed === 'stamped') {
                 this.identityHealNotified = false;
                 this.indexHealth = 'healthy';
+                this.degradedReason = null;
                 return true;
             }
             if (healed === 'drained') {
@@ -1018,27 +1042,41 @@ export default class SeekPlugin extends Plugin {
                 // (mobile / model not yet loaded): the index isn't fully current, so leave
                 // it degraded — the catch-up drain + a later poll finish and stamp it.
                 this.indexHealth = 'degraded';
+                // NOT a 'version' degradation: a drained index is an unstamped-but-
+                // current-model index mid-catch-up (the cold-build path), not an
+                // old-format one, so it must NOT raise the version-stale banner.
+                // degradedReason is left untouched on purpose: a genuine concurrent 'drift'
+                // reason (orthogonal axis) should persist. 'version' is effectively
+                // unreachable here (a genuinely old index returns 'stale', not 'drained');
+                // were a stale 'version' to somehow survive from a prior poll, the next
+                // poll re-stamps and clears it, so the worst case is bounded, not stuck.
                 return true;
             }
 
-            // 2. No matching peer and a genuinely old index.
-            if (isMobilePlatform()) {
-                // Mobile NEVER bulk-embeds (jetsam). Wait: the stale chunks are invisible
-                // (content-addressed ids don't reproduce → idx===undefined skip = empty/
-                // partial results, never wrong). The 5-min poll heals this the moment a
-                // desktop publishes a current sidecar.
-                this.indexHealth = 'degraded';
-                if (firstReport) new Notice(
-                    'Seek: this version needs a fresh index — reindex on a desktop and this device will sync it automatically.', 8000);
-                return true;
-            }
-            // Desktop is the source of truth: auto full reindex, no prompt (decision #1).
-            // Silent — the reindex itself shows the start + recap toast.
-            // Only clear the "needs heal" report latch if the reindex actually ran (and
-            // thus stamped the current identity). It can be refused if a flush grabbed
-            // the write mutex during the rebuildFromSidecar await above — leave the latch
-            // set so the next poll re-detects the still-stale index and re-heals.
-            if (await this.runFullReindex({ skipConfirm: true })) this.identityHealNotified = false;
+            // 2. No matching peer and a genuinely old index. CONSENT-GATED (2026-06-23):
+            //    NEITHER platform auto-reindexes here anymore. We only mark the index
+            //    version-stale, fire a one-time warning toast, and let the search-modal
+            //    banner carry the action. Rationale:
+            //      • Desktop auto-nuke silently degraded the user's search mid-rebuild
+            //        (recency-first partial results with no explanation) — a surprise
+            //        the user never opted into. The banner makes the state honest and
+            //        hands them the trigger (decision: reverse the old auto-reindex).
+            //      • Mobile already waited; now it gets the SAME banner, not just a toast.
+            //    The embed-free heals above (peer sidecar / in-place stamp) still run
+            //    automatically every poll, so a fleet where ANY device reindexes still
+            //    converges for free — only the expensive re-embed needs consent.
+            //    A still-valid older index stays fully queryable in the meantime; its
+            //    stale chunks are invisible-not-wrong (content-addressed ids).
+            //    KNOWN trade: a vault used ONLY from mobile (no desktop ever clicks
+            //    Reindex, and a phone never bulk-embeds — the jetsam rule) stays degraded
+            //    indefinitely. Intentional: an honest banner beats a surprise auto-nuke,
+            //    and the embed-free heal still converges it the moment any desktop reindexes.
+            this.indexHealth = 'degraded';
+            this.degradedReason = 'version';
+            // Sticky (duration 0 = stays until the user clicks it away): this is rare
+            // enough that the intrusion is worth not having it auto-vanish unseen. Same
+            // copy as the modal banner (INDEX_STALE_MSG), once per stale spell.
+            if (firstReport) new Notice(INDEX_STALE_MSG, 0);
             return true;
         } finally {
             this.identityHealInFlight = false;
@@ -1413,6 +1451,15 @@ export default class SeekPlugin extends Plugin {
     // awaits it inside `runSearch`, not `onOpen`. The .catch is the unhandled-
     // rejection guard for when nothing in the modal ever awaits it (e.g. the user
     // closes the modal before typing); errors are already logged in ensureModelLoaded.
+    // The version-stale banner spec for the search modal, or null when the index
+    // identity matches this build (the common case). Platform-independent: the banner is
+    // a signpost whose button opens Settings (the modal owns that), so the only policy
+    // here is "is the index version-stale?". Re-evaluated by the modal on each open, so a
+    // reindex done from Settings clears it the next time the modal opens.
+    private indexNotice(): IndexBanner | null {
+        return indexBannerSpec(this.indexHealth, this.degradedReason);
+    }
+
     private openSearchModal(initialQuery = ''): void {
         this.currentTaskContext = 'search';
         try {
@@ -1427,6 +1474,7 @@ export default class SeekPlugin extends Plugin {
                 this.settings,
                 (active) => this.onSearchActivity(active),
                 (inFlight) => this.onQueryInFlight(inFlight),
+                () => this.indexNotice(),
                 initialQuery,
             ).open();
         } catch (e) {
@@ -1607,6 +1655,13 @@ export default class SeekPlugin extends Plugin {
     // that raced verify), hiding the degraded affordance for a state we never checked.
     private commitDriftHealth(health: 'healthy' | 'degraded', gen: number): void {
         this.indexHealth = health;
+        // Tag the cause so the modal banner stays truthful: a drift degradation must not
+        // wear the version-stale copy (INDEX_STALE_MSG). 'healthy' clears it. NOTE: if the
+        // index was version-stale when drift recovery ran, this overwrites/clears the
+        // 'version' reason — but that's self-correcting: the next periodicReconcile re-runs
+        // enforceIndexIdentity, re-detects the still-mismatched identity, and re-sets
+        // degradedReason='version' (no duplicate toast — identityHealNotified stays latched).
+        this.degradedReason = health === 'degraded' ? 'drift' : null;
         this.lastDriftRecoveryGen = gen;
     }
 
@@ -1662,9 +1717,14 @@ export default class SeekPlugin extends Plugin {
             // actually consume?" without waiting for the next platform probe (reload).
             await this.emitStorageSnapshot('post-reindex');
             // A full reindex re-couples the index from scratch (it is the terminal
-            // recovery): clear any lingering degraded health so the settings affordance
-            // and the suppression baseline both reset.
+            // recovery): clear any lingering degraded health so the settings affordance,
+            // the version banner, and the suppression baseline all reset.
             this.indexHealth = 'healthy';
+            this.degradedReason = null;
+            // Re-arm version reporting: this build just stamped its identity, so a FUTURE
+            // ship should toast/banner again. (Without this, identityHealNotified could
+            // stay latched until the next poll's identityMatches clears it.)
+            this.identityHealNotified = false;
             return true;
         } catch (e) {
             notice.hide();
