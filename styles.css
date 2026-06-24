@@ -1022,6 +1022,10 @@
     font-size: 11px;
     color: var(--text-faint);
 }
+.seek-settings .seek-about-by {
+    font-size: 11px;
+    color: var(--text-faint);
+}
 .seek-settings .seek-about-links {
     display: flex;
     gap: 8px;

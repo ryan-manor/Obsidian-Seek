@@ -440,12 +440,12 @@ export class SeekSettingTab extends PluginSettingTab {
         const box = (text: string, cls = '') => pipe.createDiv({ cls: `seek-pipe-box ${cls}`.trim(), text });
         const arrow = () => pipe.createSpan({ cls: 'seek-pipe-arrow', text: '→' });
 
-        box('Notes');
+        box('Query terms');
         arrow();
         // In Balanced both branches are neutral; only Keyword-focused elevates Keyword.
         const branch = pipe.createDiv({ cls: 'seek-pipe-branch' });
         branch.createDiv({ cls: 'seek-pipe-box seek-pipe-dense', text: 'Conceptual meaning' });
-        branch.createDiv({ cls: `seek-pipe-box seek-pipe-kw${strategy === 'keyword' ? ' is-elevated' : ''}`, text: 'Keyword' });
+        branch.createDiv({ cls: `seek-pipe-box seek-pipe-kw${strategy === 'keyword' ? ' is-elevated' : ''}`, text: 'Keywords' });
         arrow();
         box('Fusion', 'seek-pipe-fuse');
         arrow();
@@ -700,14 +700,22 @@ export class SeekSettingTab extends PluginSettingTab {
         const left = about.createDiv({ cls: 'seek-about-left' });
         left.createSpan({ cls: 'seek-about-name', text: 'Seek' });
         left.createSpan({ cls: 'seek-about-ver', text: `v${this.plugin.manifest.version}` });
+        left.createSpan({ cls: 'seek-about-by', text: '© 2026 Ryan Manor' });
 
         const links = about.createDiv({ cls: 'seek-about-links' });
-        const link = (href: string, icon: string, label: string) => {
-            const a = links.createEl('a', { cls: 'seek-about-ic', href, attr: { 'aria-label': label, title: label } });
-            setIcon(a, icon);
-        };
-        link(GITHUB_URL, 'github', 'Repository on GitHub');
-        link(X_URL, 'twitter', 'On X');
+        const ghLink = links.createEl('a', { cls: 'seek-about-ic', href: GITHUB_URL, attr: { 'aria-label': 'Repository on GitHub', title: 'Repository on GitHub' } });
+        setIcon(ghLink, 'github');
+
+        // X (formerly Twitter): Obsidian's bundled Lucide dropped the `twitter`
+        // brand glyph, so setIcon() would leave an empty box. Inline the official
+        // X logo as SVG instead — fill:currentColor inherits the same muted→accent
+        // color treatment as the Lucide github icon beside it.
+        const xLink = links.createEl('a', { cls: 'seek-about-ic', href: X_URL, attr: { 'aria-label': 'On X', title: 'On X' } });
+        const xSvg = xLink.createSvg('svg', { attr: { viewBox: '0 0 24 24', 'aria-hidden': 'true' } });
+        xSvg.createSvg('path', { attr: {
+            fill: 'currentColor',
+            d: 'M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z',
+        } });
     }
 
     // ---- shared: segmented (pill) control ------------------------------------------
