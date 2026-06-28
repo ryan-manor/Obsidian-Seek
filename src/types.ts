@@ -467,10 +467,10 @@ export const DEFAULT_SETTINGS: SeekSettings = {
     createdProp: 'created',    // frontmatter property holding the creation date (vault convention; falls back to filename date, then mtime)
     recencyEpsilon: 0,         // ships Off (Recency segmented Off=ε0 / Default=ε0.04·180d / High=ε0.1·270d); was a 0.02 tiebreaker pre-2026-06-19 ratification — additive ε in final = hybrid + ε·recency + titleBoost (see field comment)
     recencyHalfLifeDays: 180,  // recency decay HALF-LIFE in days (0.5^(daysOld/HL)); 180 = 06-04 operating point, shorten (7–30) to concentrate on the last days
-    fuzzyEnabled: true,        // typo tolerance ON by default (edit dist scales by term length, ≤2 exact; see bm25.ts FUZZY_BY_LENGTH); +3–4/40 gold@1 on typo'd entity queries, ns cost on clean
+    fuzzyEnabled: true,        // typo tolerance ON by default (edit dist scales by term length, ≤3 exact; see bm25.ts FUZZY_BY_LENGTH); +3–4/40 gold@1 on typo'd entity queries, ns cost on clean
     prefixLastToken: true,     // last-token prefix expansion ON by default; +0.0064 personal nDCG, stress sets clean; see field comment
     synonymExpansion: true,    // ON (hidden) per the 2026-06-19 ratification; alias-dictionary query expansion (Lr↔Lightroom); BM25-dict refit, no reindex — see field comment
-    searchableProperties: false, // frontmatter values as a BM25 field; OFF pending live smoke test (harness gate passed 2026-06-11); see field comment
+    searchableProperties: true, // frontmatter values as a BM25 field; ON as of 2026-06-25 — channel eval measured +0.05 nDCG@10 (place-note recall: austin 22→3, zurich 33→7; combo_eval). Migrated on via rev 7; see field comment
     headingsField: true,       // ON (hidden) per the 2026-06-19 ratification; heading path as a BM25 field; BM25 refit, no reindex — see field comment
     boostedBm25: false,        // "Boosted BM25" preset (aliases 9 / tags 2 / headings 4); OFF — opt-in field-weight lever, implies heading indexing; see field comment
     bm25Coverage: true,        // soft-AND: scale BM25 by matched-query-term fraction (multi-term only); see field comment
@@ -481,7 +481,7 @@ export const DEFAULT_SETTINGS: SeekSettings = {
     showHotkeyHints: true,     // ON: show the modal footer keyboard-hint bar + result counter; OFF = full-results-only modal
     sidecarEnabled: true,      // ON (hidden) per the 2026-06-19 ratification; vault-file index persistence for iOS-eviction survival + cross-device sync; only Index location stays user-facing; seeds on next reindex — see field comment
     sidecarIndexLocation: 'config', // hidden literal '.obsidian/plugins/seek/index'; 'visible' = vault-root 'Seek Index/' for split-config Obsidian Sync; see field comment
-    settingsRev: 6,            // current schema rev; bump alongside a migration in main.ts onload (rev 6 = 2026-06-21 debugMode→showScores rename)
+    settingsRev: 7,            // current schema rev; bump alongside a migration in main.ts onload (rev 7 = 2026-06-25 searchableProperties default ON)
 };
 
 // One-time settings migrations, keyed on the persisted settingsRev. Applied to the
@@ -527,7 +527,19 @@ export function migrateSettings(raw: Partial<SeekSettings>): Partial<SeekSetting
         if (raw.showScores === undefined && legacy.debugMode !== undefined) raw.showScores = legacy.debugMode;
         delete legacy.debugMode;
     }
-    raw.settingsRev = 6;
+    // Rev 7 (2026-06-25 searchableProperties default ON): the BM25 frontmatter-values
+    // field flips OFF→ON after the channel eval measured +0.05 nDCG@10 (place-note
+    // recall). Installs created under the old default persisted `false`, so a bare
+    // DEFAULT_SETTINGS flip would be a silent no-op on them — migrate them. The toggle
+    // still exists, so move only an install still on the old default; a deliberate post-
+    // rev-7 `false` is indistinguishable from the default here (true was never persistable
+    // before), which is acceptable — the new baseline is ON for everyone pre-rev-7. Refit-
+    // only (search.ts bm25CacheProps mismatch → BM25 cache rebuild on next search), NO
+    // embedding reindex: chunks already store metadata.properties.
+    if (fromRev < 7 && (raw.searchableProperties === undefined || raw.searchableProperties === false)) {
+        raw.searchableProperties = true;
+    }
+    raw.settingsRev = 7;
     return raw;
 }
 

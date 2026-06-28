@@ -29,10 +29,24 @@
 // kept as ONE constant so the split regex and the capture-scan below are built
 // from the same source and can never drift. The byte-identity between them is
 // load-bearing (coverage denominator + theoretical bound in bm25.ts enumerate
-// the SAME tokens search() scores with). Mirrors MiniSearch's SPACE_OR_PUNCTUATION
-// (verified dist v7.2.0); if a MiniSearch upgrade changes its default, change
-// this one constant — see the QUERY_SPLIT note in bm25.ts.
-const DELIM_CLASS = '\\n\\r\\p{Z}\\p{P}';
+// the SAME tokens search() scores with) — and is preserved by construction
+// because SCAN and SPACE_OR_PUNCT both rebuild from this constant.
+//
+// MATH SYMBOLS \p{Sm} (= + ~ < > | …) are delimiters (2026-06-25, URL cleanup).
+// Originally this class mirrored MiniSearch's default SPACE_OR_PUNCTUATION
+// (\p{Z}\p{P} only, verified dist v7.2.0), under which \p{Sm} survived as a
+// token — but seekTokenize is now the SOLE tokenizer (passed to MiniSearch in
+// fit() AND used for the coverage/bound enumeration; nothing calls MiniSearch's
+// default anymore — see bm25.ts:720), so that mirror is no longer a live
+// contract. Keeping \p{Sm} as token content locked URL/query-string operators
+// into opaque junk: a Google-Maps link `…/100-198+E+5th+St+Garage/data=…`
+// indexed the place name as ONE token `198+E+5th+St+Garage` (+ is URL-encoded
+// space, never a word char), and `?id=12345&ref=hn` as `id=12345`/`ref=hn`.
+// \p{Sm} is non-glue (not in GLUE_RUN), so it flushes the join — `key=value`
+// → `key`,`value` (distinct), `5th+St` → `5th`,`St` (the encoded space splits).
+// Cost: `C++`→`C`, standalone math operators drop — symbols are not search
+// terms, and `C#` already collapsed to `C` (# is \p{Po}), so this is consistent.
+const DELIM_CLASS = '\\n\\r\\p{Z}\\p{P}\\p{Sm}';
 const SPACE_OR_PUNCT = new RegExp(`[${DELIM_CLASS}]+`, 'u');
 
 // Possessive 's, stripped from the RAW text BEFORE tokenizing (must be here, not
@@ -61,6 +75,28 @@ const POSSESSIVE_S = /(\p{L}\p{M}*)['’]s(?=$|[^\p{L}\p{N}])/giu;
 // [[Seek Search Practice Audit 2026-06-18]] item 6: "gpt4" could not reach a doc
 // that wrote "GPT-4").
 const GLUE_RUN = /^[\p{Pd}._/\p{Pc}'’]+$/u;
+
+// camelCase boundary set for the ADDITIVE inverse-split (2026-06-23). A query
+// token `atlas` could not reach a doc whose only signal is the camelCase tag
+// `theAtlas` (or `blogs/theAtlas`), because the fragment indexes as one opaque
+// token. This is the "conservative split" of the identifier-splitting literature
+// (Hill et al. 2013) — the EASY, ~93%-accurate case (vs same-case concatenation
+// like `hashtable`, which all techniques fail and we deliberately do NOT attempt).
+// It is the exact inverse of the GLUE_RUN join, and just as additive.
+//
+// Two zero-width boundaries, the canonical identifier-split pair:
+//   - lower/digit → Upper  ("theAtlas" → the·Atlas, "mac2evolution"… no: digits
+//     handled by the FIRST alt only as a left edge, never split BETWEEN letter
+//     and number — that collides with versions/ids like r2/gpt4/v2 the fuzzy
+//     ladder keeps exact, so there is no \p{N} on the right side);
+//   - Upper → Upper-then-lower  ("XMLParser" → XML·Parser), so an acronym run
+//     keeps its trailing word.
+// Unicode property escapes (\p{Lu}/\p{Ll}) so non-ASCII camelCase splits too.
+// Runs on the RAW fragment BEFORE processTerm lowercases — the case cue MUST
+// still be present (the load-bearing ordering caveat: a post-lowercase split
+// rule is dead on arrival). seekTokenize already preserves case, so this holds
+// by construction.
+const CAMEL_SPLIT = /(?<=\p{Ll}|\p{N})(?=\p{Lu})|(?<=\p{Lu})(?=\p{Lu}\p{Ll})/u;
 
 // Single-pass scan capturing each token (group 1 = the DELIM_CLASS complement)
 // together with the delimiter run that follows it (group 2), so we can tell a
@@ -109,9 +145,20 @@ export function segmentCjkToken(token: string): string[] {
     return out.length > 0 ? out : [token];
 }
 
+// camelCase sub-parts of one Latin fragment, or [] when it does not split.
+// Returns ONLY the parts (≥2); the caller keeps the canonical fragment and
+// appends these additively (so "theAtlas" → [theAtlas, the, Atlas]). Splitting
+// at zero-width boundaries with String.split preserves every character. Applied
+// to the canonical fragment only, never to the glue-joined form, so the added-
+// token count stays bounded (≤ parts per compound, no combinatorial fan-out).
+export function splitCamel(frag: string): string[] {
+    const parts = frag.split(CAMEL_SPLIT);
+    return parts.length >= 2 ? parts : [];
+}
+
 // The plugin-wide tokenizer: strip possessive 's, MiniSearch-default split, then
 // CJK-aware segmentation per token, PLUS an additive punctuation-joined compound
-// form.
+// form AND an additive camelCase inverse-split.
 //
 // The canonical tokens are byte-identical to the old SPACE_OR_PUNCT split (the
 // SCAN fragment class is its exact char-class complement), so the MiniSearch
@@ -130,7 +177,23 @@ export function segmentCjkToken(token: string): string[] {
 //     re-merged into the segmented pieces;
 //   - whitespace or any non-glue punctuation (comma, bracket, quote) is a real
 //     boundary and flushes the run, so "a,b" and "a b" never join.
-export function seekTokenize(text: string): string[] {
+//
+// `derived` (default true) governs ONLY the two ADDITIVE recall forms — the
+// camelCase inverse-split and the glue-joined compound. With derived:false the
+// function returns the CANONICAL stream alone (the SCAN frags + CJK segments,
+// byte-identical to the old SPACE_OR_PUNCT split). This is NOT for indexing or
+// matching (which always want the recall forms, the default) — it is for the
+// normalization enumerators (getQueryBound's per-term-UB sum and distinct count)
+// that must NOT treat a recall helper as a query term the answer is expected to
+// satisfy: `example.com` emits the joined `examplecom`, which no real clipping
+// carries (its URL glues the whole path into one mega-token) yet which inflates
+// the bound's Σ UB(t)·D denominator and squashes a perfect `example` match. The
+// join is a numerator-only recall affordance; excluding it from the bound is the
+// same contract fuzzy/prefix/synonym derived terms already have (they too score
+// without raising the bound — fusion clips at 1). (2026-06-26, [[Seek BM25
+// Channel Remediation Plan]] Issue 3: multi-token bound squash.)
+export function seekTokenize(text: string, opts?: { derived?: boolean }): string[] {
+    const includeDerived = opts?.derived !== false;   // default true → unchanged
     const out: string[] = [];
     // Possessive 's removed up-front (item 7) so neither the canonical split nor
     // the glue-join below ever sees the junk "s" / "ryans" forms. See POSSESSIVE_S.
@@ -139,7 +202,7 @@ export function seekTokenize(text: string): string[] {
     // flushed (emitting the concatenation) at any non-glue boundary.
     let joinBuf: string[] = [];
     const flushJoin = () => {
-        if (joinBuf.length >= 2) out.push(joinBuf.join(''));
+        if (includeDerived && joinBuf.length >= 2) out.push(joinBuf.join(''));
         joinBuf = [];
     };
     for (const m of scanText.matchAll(SCAN)) {
@@ -150,7 +213,10 @@ export function seekTokenize(text: string): string[] {
             for (const piece of segmentCjkToken(frag)) out.push(piece);
         } else {
             out.push(frag);                       // canonical token (unchanged)
-            joinBuf.push(frag);
+            if (includeDerived) {
+                for (const part of splitCamel(frag)) out.push(part);   // additive camelCase parts
+            }
+            joinBuf.push(frag);                   // join uses the canonical frag, not the split parts
         }
         // Continue the compound only across a pure-glue delimiter; a whitespace
         // or other-punct delimiter (or end of text) ends it. (After a CJK

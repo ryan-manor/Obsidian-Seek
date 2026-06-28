@@ -26,6 +26,7 @@ import {
 
 // Real repo/social URLs for the About footer.
 const GITHUB_URL = 'https://github.com/ryan-manor/Obsidian-Seek';
+const DOCS_URL = 'https://publish.obsidian.md/rmm/Seek+Documentation/About+Seek';
 const X_URL = 'https://x.com/tooape';
 
 // ISO-8601 local stamp (YYYY-MM-DD HH:MM) for the status card — the vault's date
@@ -703,6 +704,8 @@ export class SeekSettingTab extends PluginSettingTab {
         left.createSpan({ cls: 'seek-about-by', text: '© 2026 Ryan Manor' });
 
         const links = about.createDiv({ cls: 'seek-about-links' });
+        const docsLink = links.createEl('a', { cls: 'seek-about-ic', href: DOCS_URL, attr: { 'aria-label': 'Seek Documentation', title: 'Seek Documentation' } });
+        setIcon(docsLink, 'book-open');
         const ghLink = links.createEl('a', { cls: 'seek-about-ic', href: GITHUB_URL, attr: { 'aria-label': 'Repository on GitHub', title: 'Repository on GitHub' } });
         setIcon(ghLink, 'github');
 

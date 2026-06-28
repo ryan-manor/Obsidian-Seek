@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { seekTokenize, hasCjk, segmentCjkToken } from './tokenize';
+import { seekTokenize, hasCjk, segmentCjkToken, splitCamel } from './tokenize';
 
 // Node ≥16 ships Intl.Segmenter with full ICU, so these tests exercise the
 // REAL segmentation path the Obsidian renderer (Electron/V8) uses. Exact
@@ -17,12 +17,13 @@ describe('hasCjk', () => {
     });
 });
 
-describe('seekTokenize — Latin path is MiniSearch-default-identical', () => {
-    it('splits on whitespace and punctuation, preserves tokens verbatim', () => {
-        // '+' survives: it is \p{Sm} (math symbol), not \p{P} — MiniSearch's
-        // default split keeps it as a token too, and parity is the contract.
+describe('seekTokenize — Latin path: space/punct + \\p{Sm} delimiters', () => {
+    it('splits on whitespace, punctuation, AND math symbols', () => {
+        // '+' is now a DELIMITER (2026-06-25 URL cleanup): \p{Sm} joined the
+        // delimiter class so URL/query operators (= + ~) split instead of
+        // locking into opaque tokens. Was ['Hybrid','search','BM25','+','dense'].
         expect(seekTokenize('Hybrid search, BM25 + dense!')).toEqual(
-            ['Hybrid', 'search', 'BM25', '+', 'dense']);
+            ['Hybrid', 'search', 'BM25', 'dense']);
     });
     it('does not fold case or touch diacritics (processTerm owns that)', () => {
         expect(seekTokenize('Café Zürich')).toEqual(['Café', 'Zürich']);
@@ -86,6 +87,99 @@ describe('seekTokenize — glue-compound joins (audit §6)', () => {
     });
 });
 
+// ── camelCase inverse-split (2026-06-23, additive) ────────────────────────
+// Query `atlas` could not reach a doc whose only signal is the tag `theAtlas`
+// (collapsed to one token). The split is the EASY "conservative" case (Hill et
+// al. 2013, ~93% accurate); same-case glued stems (example.com → example) are
+// the HARD case we deliberately do NOT attempt.
+describe('splitCamel — conservative camelCase boundaries', () => {
+    it('returns parts (≥2) on a case transition, [] otherwise', () => {
+        expect(splitCamel('theAtlas')).toEqual(['the', 'Atlas']);
+        expect(splitCamel('XMLParser')).toEqual(['XML', 'Parser']);   // acronym run keeps trailing word
+        expect(splitCamel('blogs')).toEqual([]);                       // no boundary
+        expect(splitCamel('GPT4')).toEqual([]);                        // letter→number is NOT a boundary
+    });
+});
+
+describe('seekTokenize — additive camelCase split', () => {
+    it('emits camelCase parts additively, canonical token first', () => {
+        expect(seekTokenize('theAtlas')).toEqual(['theAtlas', 'the', 'Atlas']);
+        expect(seekTokenize('macEvolution')).toEqual(['macEvolution', 'mac', 'Evolution']);
+        expect(seekTokenize('steveJobsLegacy')).toEqual(['steveJobsLegacy', 'steve', 'Jobs', 'Legacy']);
+        expect(seekTokenize('PowerShot')).toEqual(['PowerShot', 'Power', 'Shot']);
+    });
+    it('makes a camelCase sub-tag reachable by sub-word (blogs/theAtlas)', () => {
+        const terms = seekTokenize('blogs/theAtlas');
+        expect(terms).toContain('Atlas');          // → `atlas` after processTerm lowercases: now an EXACT doc hit
+        expect(terms).toContain('theAtlas');       // canonical preserved
+        expect(terms).toContain('blogstheAtlas');  // glue-join still fires alongside the split
+    });
+    it('splits on the case cue but keeps letter-number ids whole', () => {
+        // r2/v2/SD500 must stay exact (fuzzy ladder + glue-join own them); only
+        // the CASE transition splits, never letter↔number.
+        expect(seekTokenize('GPT4')).toEqual(['GPT4']);
+        expect(seekTokenize('SD500')).toEqual(['SD500']);
+        expect(seekTokenize('graniteR2')).toEqual(['graniteR2', 'granite', 'R2']);  // case splits; R2 stays whole
+    });
+    it('does NOT recover `atlas` from a same-case glued domain stem (documented limit)', () => {
+        // No case cue after the URL is lowercased — the HARD regime we skip. The
+        // `.` split still separates `com`, but `example` stays opaque.
+        const terms = seekTokenize('example.com');
+        expect(terms).not.toContain('atlas');
+        expect(terms).toContain('example');
+    });
+});
+
+// ── canonical-only mode (derived:false) — the bound/normalization enumerator ──
+// The DEFAULT path is byte-identical to the asserts above; derived:false drops
+// ONLY the additive camelCase split + glue-join, leaving the canonical stream.
+describe('seekTokenize — derived:false (canonical-only, for getQueryBound)', () => {
+    it('default is unchanged (derived recall forms still emitted)', () => {
+        expect(seekTokenize('example.com')).toEqual(['example', 'com', 'examplecom']);
+        expect(seekTokenize('GPT-4')).toEqual(['GPT', '4', 'GPT4']);
+        expect(seekTokenize('theAtlas')).toEqual(['theAtlas', 'the', 'Atlas']);
+    });
+    it('drops the glue-join compound — `examplecom` no longer inflates the bound', () => {
+        expect(seekTokenize('example.com', { derived: false })).toEqual(['example', 'com']);
+        expect(seekTokenize('GPT-4', { derived: false })).toEqual(['GPT', '4']);
+        expect(seekTokenize('TCP/IP', { derived: false })).toEqual(['TCP', 'IP']);
+    });
+    it('drops the additive camelCase parts but keeps the canonical token', () => {
+        expect(seekTokenize('theAtlas', { derived: false })).toEqual(['theAtlas']);
+        expect(seekTokenize('blogs/theAtlas', { derived: false })).toEqual(['blogs', 'theAtlas']);
+    });
+    it('leaves single tokens and CJK segmentation untouched (no derived forms there)', () => {
+        expect(seekTokenize('isadora', { derived: false })).toEqual(['isadora']);
+        expect(seekTokenize('我喜欢', { derived: false })).toEqual(seekTokenize('我喜欢'));
+    });
+});
+
+// ── \p{Sm} delimiter: URL/query-string operators split (2026-06-25) ───────
+// `+` (URL-encoded space), `=`/`&` (query params), `~` no longer lock runs into
+// opaque tokens. \p{Sm} is non-glue, so it flushes the join (no `keyvalue`).
+describe('seekTokenize — \\p{Sm} splits URL/query operators', () => {
+    it('splits URL-encoded spaces so place names become searchable words', () => {
+        // Was the single opaque token "198+E+5th+St+Garage" (unsearchable).
+        const t = seekTokenize('100-198+E+5th+St+Garage');
+        expect(t).toContain('5th');
+        expect(t).toContain('St');
+        expect(t).toContain('Garage');
+        expect(t.some(x => x.includes('+'))).toBe(false);
+    });
+    it('splits query-string key=value into distinct tokens (no join)', () => {
+        const t = seekTokenize('id=12345&ref=hn');
+        expect(t).toContain('id');
+        expect(t).toContain('12345');
+        expect(t).toContain('ref');
+        expect(t).toContain('hn');
+        expect(t).not.toContain('id12345');   // non-glue: never concatenated
+    });
+    it('drops standalone math operators (not search terms)', () => {
+        expect(seekTokenize('a = b')).toEqual(['a', 'b']);
+        expect(seekTokenize('C++')).toEqual(['C']);   // consistent with C# -> C
+    });
+});
+
 // ── Item 7: possessive 's strip ───────────────────────────────────────────
 describe('seekTokenize — possessive strip (audit §7)', () => {
     it('drops a true possessive clitic (straight and curly apostrophe)', () => {
@@ -114,7 +208,7 @@ describe('seekTokenize — possessive strip (audit §7)', () => {
 // tokenizer must reproduce the exact MiniSearch-default split, because the
 // coverage denominator + theoretical bound (bm25.ts) enumerate these tokens.
 describe('seekTokenize — additive invariant (byte-identical canonical split)', () => {
-    const refSplit = (t: string) => t.split(/[\n\r\p{Z}\p{P}]+/u).filter(Boolean);
+    const refSplit = (t: string) => t.split(/[\n\r\p{Z}\p{P}\p{Sm}]+/u).filter(Boolean);
     it('matches the reference split on glue-free, possessive-free input', () => {
         const cases = [
             'Hybrid search, BM25 + dense!',

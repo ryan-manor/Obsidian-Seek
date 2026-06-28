@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { depluralize, foldDiacritics, MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, extractPropertiesText, extractHeadingsText } from './bm25';
+import { depluralize, foldDiacritics, MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, extractPropertiesText, extractHeadingsText, BM25_COVERAGE_POW } from './bm25';
 import type { Chunk } from './types';
 
 function makeChunk(id: string, title: string, content: string, tags: string[] = [], aliases: string[] = []): Chunk {
@@ -361,29 +361,28 @@ describe('synonym expansion (per-search overrides)', () => {
 });
 
 // Locks the theoretical query bound (fusion's TM2C2 denominator for the BM25
-// channel). The PARITY test is the load-bearing one: it verifies our replicated
-// IDF formula × MiniSearch-internals df/N reproduces a real mini.search() score
-// — if a MiniSearch upgrade renames internals or changes the formula, this
-// fails in CI (and getQueryBound's runtime guard falls back to empirical /max).
+// channel) — now the WAND/MaxScore tight bound Σ_t UB(t)·D, where UB(t) is the max
+// achievable exact single-term score read from the LIVE index via MiniSearch's own
+// scorer. The one-term parity test is load-bearing: bound == the live max score by
+// construction (no replicated formula left to drift), so a MiniSearch scoring change
+// surfaces here in CI; the runtime guard still falls back to empirical /max if the
+// index is missing.
 describe('getQueryBound', () => {
-    it('parity: replicated idf × internals df reproduces the live MiniSearch score', () => {
-        // Two docs, query term in exactly one content field, tf=1, both docs'
-        // content the same length so fieldLength == avgFieldLength:
-        //   score = boost·idf·(d + (k1+1)/(1+k1))   [lengthNorm = 1]
-        //   bound = boost·idf·(d + k1 + 1)
-        // Recovering idf from the OBSERVED score and predicting the bound from
-        // it must agree with getQueryBound to float precision.
+    it('equals the max single-term score for a one-term query (WAND/MaxScore tight bound)', () => {
+        // The tight bound for a single indexed term is exactly that term's max
+        // achievable EXACT candidate score over the corpus: UB(t)·D with D=1.
+        // getQueryBound drives MiniSearch's OWN scorer, so it reproduces the live
+        // max score by construction — the old analytic sup·(d+k1+1) over-stated it
+        // (it summed the tf→∞ saturation a real doc can't reach).
         const idx = fitBM([
             makeChunk('a', 'Alpha', 'zzqterm xx'),
             makeChunk('b', 'Beta', 'yyother xx'),
         ]);
-        const score = idx.getScores('zzqterm')[0];
-        expect(score).toBeGreaterThan(0);
-        const k = 1.2, b = 0.75, d = 0.5;
-        const idfFromScore = score / (1.0 * (d + (k + 1) / (1 + k)));  // content boost = 1
-        const expectedBound = 1.0 * idfFromScore * (d + k + 1);
-        const bound = idx.getQueryBound('zzqterm');
-        expect(bound).toBeCloseTo(expectedBound, 8);
+        // Same boosts on both sides so scores and bound are strictly comparable.
+        const { scores, bound } = idx.getScoresWithCoverage('zzqterm', { boosts: DEFAULT_FIELD_BOOSTS });
+        const maxScore = Math.max(...scores);
+        expect(maxScore).toBeGreaterThan(0);
+        expect(bound).toBeCloseTo(maxScore, 8);
     });
 
     it('bounds every exact-match score (sup property)', () => {
@@ -399,12 +398,15 @@ describe('getQueryBound', () => {
         }
     });
 
-    it("locks MiniSearch's quality multiplier (score × matched distinct terms) that the bound's ×D models", () => {
-        // Discovered 2026-06-09: search() returns score × quality where quality
-        // = |distinct query terms matched| (dist v7.2.0:1291). A doc matching
-        // both terms of a 2-term query scores exactly 2× the sum of its
-        // single-term scores. If a MiniSearch upgrade changes this, the bound's
-        // ×D factor (and this test) must change with it.
+    it('divides out MiniSearch quality so a 2-term match scores the additive sum (single soft-AND)', () => {
+        // De-franken 2026-06-26: MiniSearch's search() returns score × quality
+        // (quality = |distinct query terms matched|, dist v7.2.0:1291). That is a
+        // hidden term-count boost that USED to stack on Seek's coverage soft-AND
+        // (an m × m/T = m²/T effect) and forced the bound's ×D mirror.
+        // getScoresWithCoverage now divides quality back out, so the stored score
+        // is the pure additive BM25F sum and the soft-AND is applied exactly once,
+        // via coverage. A doc matching BOTH terms therefore scores the SUM of its
+        // single-term scores — NOT 2× the sum.
         const idx = fitBM([
             makeChunk('a', 'Switzerland', 'hotel hotel hotel in switzerland'),
             makeChunk('b', 'Beta', 'unrelated body'),
@@ -414,7 +416,7 @@ describe('getQueryBound', () => {
         const both = idx.getScores('switzerland hotel')[0];
         expect(sw).toBeGreaterThan(0);
         expect(ho).toBeGreaterThan(0);
-        expect(both).toBeCloseTo(2 * (sw + ho), 8);
+        expect(both).toBeCloseTo(sw + ho, 8);
     });
 
     it('is 0 for a fully-OOV query and skips OOV terms in mixed queries', () => {
@@ -621,13 +623,19 @@ describe('CJK tokenization (Intl.Segmenter)', () => {
 // and any digit-bearing token (a year/version typo is a different thing, not a
 // correctable word). Replaces the old flat edit-1 FUZZY_NON_CJK.
 describe('FUZZY_BY_LENGTH predicate', () => {
-    it('scales edit distance by term length (Lucene AUTO ladder)', () => {
-        expect(FUZZY_BY_LENGTH('ml')).toBe(false);        // ≤2 → exact (the precision fix)
-        expect(FUZZY_BY_LENGTH('go')).toBe(false);
-        expect(FUZZY_BY_LENGTH('cat')).toBe(1);           // 3 → edit-1
+    it('scales edit distance by term length (≤2 exact / 3–5 edit-1 / ≥6 edit-2)', () => {
+        // The Lucene AUTO ladder in bm25.ts FUZZY_BY_LENGTH: ≤2 → exact, 3–5 →
+        // edit-1, ≥6 → edit-2 (CJK + digit-bearing exemptions fire before it).
+        expect(FUZZY_BY_LENGTH('ml')).toBe(false);        // 2 → exact
+        expect(FUZZY_BY_LENGTH('cat')).toBe(1);           // 3 → edit-1 (first fuzzy rung)
+        expect(FUZZY_BY_LENGTH('data')).toBe(1);          // 4 → edit-1
         expect(FUZZY_BY_LENGTH('graph')).toBe(1);         // 5 → edit-1
-        expect(FUZZY_BY_LENGTH('granite')).toBe(2);       // ≥6 → edit-2
-        expect(FUZZY_BY_LENGTH('amsterdam')).toBe(2);
+        expect(FUZZY_BY_LENGTH('atlas')).toBe(1);         // 5 → edit-1 (the motivating token)
+        expect(FUZZY_BY_LENGTH('matrix')).toBe(2);        // 6 → edit-2 (first edit-2 rung)
+        expect(FUZZY_BY_LENGTH('granite')).toBe(2);       // 7 → edit-2
+        expect(FUZZY_BY_LENGTH('keywords')).toBe(2);      // 8 → edit-2
+        expect(FUZZY_BY_LENGTH('amsterdam')).toBe(2);     // 9 → edit-2 (long-word, sparse nbhd)
+        expect(FUZZY_BY_LENGTH('pumpernickel')).toBe(2);  // 12 → edit-2
     });
 
     it('exempts CJK terms (edit-1 there is a synonym explosion)', () => {
@@ -640,7 +648,7 @@ describe('FUZZY_BY_LENGTH predicate', () => {
         expect(FUZZY_BY_LENGTH('2024')).toBe(false);      // year: must not edit-1 to 2023/2025
         expect(FUZZY_BY_LENGTH('gpt4')).toBe(false);      // alphanumeric ID
         expect(FUZZY_BY_LENGTH('k8s')).toBe(false);
-        expect(FUZZY_BY_LENGTH('granite2')).toBe(false);  // digit beats the ≥6 edit-2 rung
+        expect(FUZZY_BY_LENGTH('granite2')).toBe(false);  // digit beats the ≥7 edit-2 rung
     });
 
     it('CJK query does not fuzzy-match a different single-char word', () => {
@@ -729,7 +737,7 @@ describe('headings field', () => {
         c.heading_path = headingPath;
         return c;
     }
-    const lr = sectionChunk('lr', 'Sam 1x1', ['Lightroom Aggregations']);
+    const lr = sectionChunk('lr', 'Peter 1x1', ['Lightroom Aggregations']);
     const plain = makeChunk('plain', 'Roadmap', 'planning notes for the quarter');
 
     it('extractHeadingsText joins the path and survives a missing heading_path', () => {
@@ -839,5 +847,44 @@ describe('processTerm folding — end-to-end accent co-match (audit §4)', () =>
         const idx = fitBM([makeChunk('a', 'As', 'the band'),
                            makeChunk('b', 'Other Note', 'unrelated')]);
         expect(idx.getScores('às')[0]).toBeGreaterThan(0);
+    });
+});
+
+describe('BM25_COVERAGE_POW — coordination soft-AND contract (de-franken → pow2 regression lock)', () => {
+    // The soft-AND is applied ONCE, at the search.ts candidate-align site, as
+    // `raw · coverage^BM25_COVERAGE_POW`. This block mirrors that exact formula to
+    // lock the ranking decision: the de-franken dropped the exponent to 1 (linear
+    // m/T), which let a doc matching only a rare high-IDF place token (near-max raw
+    // after WAND-bound normalization, half coverage) out-rank a full-coverage
+    // answer ("bars in austin" → the library beat the bars). P=2 restores the m²/T
+    // penalty so full coverage wins. If a future change reverts the exponent toward
+    // linear, these break — by design.
+    const softAnd = (raw: number, coverage: number) => raw * Math.pow(coverage, BM25_COVERAGE_POW);
+
+    it('the knob is 2 (changing it is a deliberate ranking decision, not a refactor)', () => {
+        expect(BM25_COVERAGE_POW).toBe(2);
+    });
+
+    it('full coverage beats a higher-raw partial match — the "[thing] in [place]" fix', () => {
+        const partial = softAnd(0.95, 0.5);   // rare-place-token-only: near-max raw, half coverage
+        const full = softAnd(0.40, 1.0);       // real answer: lower raw, full coverage
+        expect(full).toBeGreaterThan(partial); // pow2 orders them correctly
+        // Linear (P=1) would have INVERTED this: 0.95·0.5 = 0.475 > 0.40·1 = 0.40.
+        // That inequality is the exact regression pow2 fixes — assert it holds so
+        // the test documents (and depends on) the bug it guards against.
+        expect(0.95 * 0.5).toBeGreaterThan(0.40);
+    });
+
+    it('penalizes partial coverage super-linearly (m²/T, not m/T)', () => {
+        expect(Math.pow(0.5, BM25_COVERAGE_POW)).toBeCloseTo(0.25, 10); // m²/T at half coverage
+        expect(Math.pow(0.5, BM25_COVERAGE_POW)).toBeLessThan(0.5);     // strictly below linear m/T
+    });
+
+    it('is a no-op at full coverage — single-term / fully-covered queries stay faithful', () => {
+        expect(softAnd(0.73, 1)).toBe(0.73); // 1^2 = 1, preserves the single-term-faithful invariant
+    });
+
+    it('annihilates zero coverage', () => {
+        expect(softAnd(0.9, 0)).toBe(0);
     });
 });

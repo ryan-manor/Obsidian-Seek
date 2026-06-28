@@ -256,6 +256,21 @@
     color: var(--text-warning, var(--text-error));
 }
 
+/* Keyboard-selected pill: stepped onto with ←/→, removed with Backspace/Delete.
+   A filled accent chip with a focus ring so it reads as "this is the one a
+   delete will take". Selection visually outranks the warn state above. */
+.seek-pill.is-selected {
+    background: var(--interactive-accent);
+    border-color: var(--interactive-accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 35%, transparent);
+}
+
+.seek-pill.is-selected .seek-pill-k,
+.seek-pill.is-selected .seek-pill-v,
+.seek-pill.is-selected .seek-pill-x {
+    color: var(--text-on-accent);
+}
+
 /* The uncontrolled contenteditable + its inline ghost + placeholder overlay. */
 .seek-editwrap {
     position: relative;
@@ -305,6 +320,12 @@
     animation: seek-caret-blink 1.06s infinite;
 }
 
+/* A keyboard-selected pill is the active cursor — hide the synthetic caret so
+   there aren't two. The extra .is-pill-selected class outranks the show rule. */
+.seek-q.is-pill-selected.is-focused.is-empty-edit .seek-caret {
+    display: none;
+}
+
 /* A non-blinking caret is still a valid focus cue — honor reduced-motion. */
 @media (prefers-reduced-motion: reduce) {
     .seek-q.is-focused.is-empty-edit .seek-caret { animation: none; }
@@ -315,6 +336,14 @@
    a ghost appears the editable leaves is-empty-edit and the native caret — its
    color restored by .seek-edit's own rule — takes back over. */
 .seek-q.is-focused.is-empty-edit .seek-edit {
+    caret-color: transparent;
+}
+
+/* A keyboard-selected pill is THE cursor — blank the editable's native caret
+   too, regardless of whether the editable holds text (an unhidden caret sits to
+   the left of any typed text, e.g. just before "asdf", competing with the
+   highlighted pill). Restored the moment the selection clears. */
+.seek-q.is-pill-selected .seek-edit {
     caret-color: transparent;
 }
 
@@ -500,15 +529,33 @@
 }
 
 /* Heading-path breadcrumb (`› Agenda › Intern pgm`). Lives on its own line
-   directly under the title; font + color match the created/tags meta line. */
+   directly under the title; font + color match the created/tags meta line.
+   Markdown-rendered (a heading can be a link), so it reserves a line for the
+   async render — without the floor the line collapses to 0 for a frame and the
+   rows below jump (same reasoning as .seek-result-snippet). */
 .seek-result-path {
     min-width: 0;
     margin-top: 2px;
+    line-height: 1.35;
+    /* min/max pin the breadcrumb to exactly one line: min stops the async-render
+       collapse, max clips any block the renderer emits (same defence as the
+       snippet's max-height — see its note). */
+    min-height: 1.35em;
+    max-height: 1.35em;
     font-size: 11.5px;
     color: var(--text-faint);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+/* Force the markdown-rendered breadcrumb blocks inline + size-neutral so the
+   `› a › b` path stays one clipped line; links inside keep their own link
+   colour, glyph, and underline (the user's appearance settings). */
+.seek-result-path :is(div, p, blockquote, .math) {
+    display: inline;
+    margin: 0;
+    font-size: inherit;
 }
 
 /* Single-line snippet: force the markdown-rendered blocks inline + clip. */
@@ -525,13 +572,20 @@
        height) lets a rare tall inline span grow rather than clip. Snippet-less
        rows toggle display:none, so this never reserves a phantom line for them. */
     min-height: 1.4em;
+    /* Hard one-line ceiling. min-height alone only stops the async-render
+       collapse; it does NOT stop a display:block child (a $$math$$ block, a
+       callout, a blockquote from pasted text) from breaking onto its own line
+       and growing the row. A block child still breaks the line even under
+       nowrap, so max-height + overflow:hidden clips it to a single line —
+       content-type-agnostic, unlike the :is() allowlist below. */
+    max-height: 1.4em;
     color: var(--text-muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-.seek-result-snippet :is(div, p, ul, ol, h1, h2, h3, h4, h5, h6) {
+.seek-result-snippet :is(div, p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6, .math) {
     display: inline;
     margin: 0;
     font-size: inherit;

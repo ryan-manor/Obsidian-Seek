@@ -129,23 +129,26 @@ describe('MultiFieldBM25 incremental — remove() + vacuum()', () => {
     });
 });
 
-describe('MultiFieldBM25 incremental — getQueryBound is exact ONLY post-vacuum', () => {
-    it('between discard and vacuum the bound reads a stale (too-large) df', async () => {
+describe('MultiFieldBM25 incremental — getQueryBound is exact immediately, even pre-vacuum', () => {
+    it('reflects a discard before vacuum (search-based bound honors tombstones synchronously)', async () => {
         const all = CORPUS();
         const y = 'c1'; // contains "charlie" (also in c5 → df=2 full, 1 after removal)
         const q = 'charlie';
         const freshMinusY = fit(all.filter(c => c.chunk_id !== y)).getQueryBound(q);
 
         const incremental = fit(all);
-        incremental.remove(y);             // discard only — postings NOT yet cleaned
-        const staleBound = incremental.getQueryBound(q);
+        incremental.remove(y);             // discard only — postings NOT yet physically cleaned
+        const preVacuumBound = incremental.getQueryBound(q);
 
-        // The hazard, made observable: stale df still counts the removed doc, so
-        // idf is too small and the bound is too small → diverges from a fresh fit.
-        // (If this assertion ever fails, vacuum became synchronous or discard
-        // started cleaning postings — re-examine the await-vacuum requirement.)
-        expect(staleBound).not.toBeCloseTo(freshMinusY, 6);
-        expect(incremental.dirtCount).toBeGreaterThan(0);
+        // getQueryBound now scores through MiniSearch (the WAND/MaxScore UB is a
+        // single-term search): MiniSearch excludes a discarded doc from results AND
+        // updates its scoring stats (documentCount/df/avgFieldLength) the moment
+        // discard() runs — only the physical posting cleanup is deferred to vacuum().
+        // So the bound is exact pre-vacuum, no stale window. (The old internals-
+        // reading bound read tombstoned df here and was stale until vacuum; this
+        // assertion flipped from `.not.toBeCloseTo` when the MaxScore bound landed.)
+        expect(preVacuumBound).toBeCloseTo(freshMinusY, 9);
+        expect(incremental.dirtCount).toBeGreaterThan(0);   // tombstone still physically present
 
         await incremental.vacuum();
         expect(incremental.getQueryBound(q)).toBeCloseTo(freshMinusY, 9);

@@ -81,19 +81,30 @@ export const DEFAULT_FIELD_BOOSTS: Record<string, number> = {
 // explicitly here to preserve the v0.0.1 baseline.
 const BM25_PARAMS = { k: 1.2, b: 0.75, d: 0.5 } as const;
 
-// Sup of MiniSearch's BM25+ per-(term,field) score as tf→∞, per unit of
-// idf×fieldBoost: score = boost·idf·(d + tf(k+1)/(tf + k·lengthNorm)) and the
-// fraction's supremum is (k+1). Used by getQueryBound to build the per-query
-// THEORETICAL upper bound the fusion layer normalizes by (fusion.ts
-// theoreticalNormBm25) — see that function for why empirical /max was replaced.
-const TERM_SCORE_SUP = BM25_PARAMS.d + BM25_PARAMS.k + 1;
+// Coordination-level exponent on the coverage soft-AND. The fused lexical channel
+// is `raw_bm25 · coverage^P` where coverage = (matched query terms / total) — see
+// search.ts where it's applied (getScoresWithCoverage returns the raw fraction; the
+// exponent is a RANKING decision, kept out of the measurement). P=1 is plain
+// coordination (Lucene's old `coord`); the de-franken left it at 1 and
+// regressed natural "[thing] in [place]" queries — a doc matching only the rare
+// place token ("sf", "austin") normalized to a near-max lexical score and out-ranked
+// real answers. P=2 restores the franken-era m²/T penalty magnitude as an EXPLICIT
+// knob (not the old accidental ×quality squaring), hardening the partial-match
+// discount so full-coverage docs win. Eval-validated 2026-06-27 (~/eval
+// cross-corpus sweep): personal vault bars nDCG@10 0.302→0.457, captures 0.445→0.496,
+// personal-eval guardrail flat-to-up (place stratum pinned 1.000), and a slight gain
+// out-of-domain on BEIR android (+0.006). Rejected alternatives in the same sweep:
+// length-conditional exponent (no gain — queries are short) and conditional-%
+// minimum_should_match (buried "bars in sf" rank 5→69 and regressed android −0.012).
+export const BM25_COVERAGE_POW = 2 as const;
+
 
 // Prefix-match predicate: expand ONLY the final query token, and only when
 // it's ≥3 chars. MiniSearch calls this per processed query term (stopwords
 // already dropped) and, when it returns true, derives every vocab term
 // extending it at weight 0.375·len(term)/len(derived), with the match
 // attributed back to the source term (coverage + the ×quality multiplier
-// see it). Eval-tuned 2026-06-10 (~/eval-pack prefix_arm.py, WS2.3
+// see it). Eval-tuned 2026-06-10 (~/eval prefix_arm.py, WS2.3
 // token-exact cache, α=0.80):
 //   - last-only ≥3 (+syn layer pending): personal 0.8666→0.8730 bin nDCG@10;
 //     wins are literally truncated/typeahead queries ("amster"→Amsterdam,
@@ -457,6 +468,12 @@ export class MultiFieldBM25 {
     private mini: MiniSearch<IndexedDoc> | null = null;
     private idToIdx = new Map<string, number>();
     private chunkCount = 0;
+    // WAND/MaxScore per-term upper bounds: processed term → max achievable EXACT
+    // single-term score over the LIVE index (termUpperBound). Memoized on the
+    // default-boost path and CLEARED on every mutation (fit/fromJSON/add/remove/
+    // vacuum) so the bound always reflects live postings; a fresh search-based
+    // recompute then honors discard() tombstones synchronously, no vacuum needed.
+    private termUpperBounds = new Map<string, number>();
     // Index-shape opts the live index was built with (searchableProperties /
     // headingsField). Stored so incremental add() rebuilds each doc with exactly
     // the same field set fit()/fromJSON() used — a field-set mismatch would index
@@ -487,6 +504,7 @@ export class MultiFieldBM25 {
         this.withHeadings = opts?.headingsField === true;
         this.mapChunkIds(chunks);
         this.mini = new MiniSearch<IndexedDoc>(this.buildMiniOptions(this.withProps, this.withHeadings));
+        this.termUpperBounds.clear();   // fresh index → drop memoized per-term UBs
 
         const docs: IndexedDoc[] = chunks.map(c => this.buildDoc(c, bodies.get(c.chunk_id) ?? ''));
         // addAll is ~10x faster than per-doc add() because it defers
@@ -538,7 +556,10 @@ export class MultiFieldBM25 {
             // text tokenizes exactly like MiniSearch's default; tokens with
             // CJK script chars are dictionary-segmented (Intl.Segmenter) so
             // zh/ja/ko content gets real terms instead of one giant token.
-            tokenize: seekTokenize,
+            // Wrapped so MiniSearch's (text, fieldName) call can't pass fieldName
+            // into seekTokenize's opts slot — indexing always wants the full
+            // recall forms (derived defaults true: glue-join + camelCase split).
+            tokenize: (text: string) => seekTokenize(text),
             searchOptions: {
                 bm25: BM25_PARAMS,
                 boost: this.fieldBoosts,
@@ -588,6 +609,7 @@ export class MultiFieldBM25 {
         this.withHeadings = opts?.headingsField === true;
         this.mapChunkIds(chunks);
         this.mini = MiniSearch.loadJSON<IndexedDoc>(json, this.buildMiniOptions(this.withProps, this.withHeadings));
+        this.termUpperBounds.clear();   // loaded index → drop any memoized UBs
         return this;
     }
 
@@ -614,79 +636,88 @@ export class MultiFieldBM25 {
     }
 
     // Per-query THEORETICAL upper bound on the multi-field BM25+ score:
-    //   bound(q) = [ Σ_t Σ_f boost_f · idf_f(t) · (d + k1 + 1) ] × D
-    // summed over the query's processed token occurrences (duplicates included,
-    // mirroring the OR scoring loop) and the fields where each term is indexed
-    // (df > 0 — a term absent from a field's vocabulary can't score there).
-    // D = the count of DISTINCT indexed query terms: MiniSearch's search()
-    // multiplies each doc's summed score by `quality` = the number of distinct
-    // query terms it matched (dist v7.2.0 `score: score * quality`) — a built-in
-    // hard multiplicative coverage factor that the per-(term,field) sup alone
-    // misses (found 2026-06-09 when the sup-property parity test caught a 3×
-    // violation). A doc can at most match all D indexed terms, so ×D restores
-    // the bound. Query-dependent but DATA-INDEPENDENT given the index: no
-    // document's behavior can move it, which is what makes it a TM2C2-legal
-    // normalizer (the per-query empirical max is not — see theoreticalNormBm25).
+    //   bound(q) = Σ_t UB(t)
+    // where UB(t) = termUpperBound(t) is the WAND/MaxScore per-term upper bound:
+    // the max achievable EXACT single-term candidate score for t over the LIVE
+    // index, read from MiniSearch's OWN scorer (a single-term search). Summed over
+    // the query's processed token occurrences (duplicates included, mirroring the
+    // OR scoring loop). Because getScoresWithCoverage divides MiniSearch's quality
+    // multiplier back out, a doc's stored score is the pure additive BM25F sum over
+    // its matched terms, each ≤ that term's UB — so Σ_t UB(t) is a tight sup, and
+    // for a one-term query it EQUALS the live max score (the parity test), so the
+    // best doc normalizes to exactly 1.0.
     //
-    // df/N are read from MiniSearch's own internals (_index/_fieldIds/
-    // _documentCount) — the exact structures search() scores with — using the
-    // same defensive-reach pattern as isUserIgnored() in search.ts. The reads
-    // are exact BECAUSE the index is always nuke-and-refit per dataGeneration
-    // (search.ts bm25Cache): MiniSearch's lazy discard()-tombstone vacuuming
-    // never runs, so postings sizes equal live df. If internals are missing
-    // (a future MiniSearch rename), return 0 — the fusion layer then falls
-    // back to the empirical max, i.e. exactly the pre-bound behavior, and
-    // the parity test in bm25.test.ts fails loudly in CI.
+    // NO ×D multiplier (removed 2026-06-26). MiniSearch's search() multiplies each
+    // doc's score by `quality` = the count of distinct matched terms (dist v7.2.0
+    // `score: score * quality`) — a hidden term-count boost that STACKED on Seek's
+    // own coverage soft-AND, an m × (m/T) = m²/T effect (the "franken" double
+    // soft-AND). getScoresWithCoverage now divides that `quality` back out, so the
+    // stored score is pure additive BM25F (soft-AND applied once, via coverage) and
+    // the bound no longer needs ×D to stay a ceiling — ×D was the dominant multi-
+    // term over-compression (a 2-term query SQUARED the inflation).
     //
-    // Derived-term caveat (fuzzy AND prefix): the bound models EXACT matching.
-    // With either expansion on, derived terms score with their own (often
-    // higher) IDF, so a doc can exceed the bound — fusion clips to 1 — and a
-    // fully-OOV query (typo, or a bare prefix like "rearch") has bound 0 with
-    // nonzero derived scores — fusion falls back to /max for that query.
-    // Fuzzy side validated on the D&D typo slice (2026-06-09); prefix side
-    // on the same contract in the harness prefix arm (2026-06-10).
+    // UB(t) is DATA-DEPENDENT-given-the-index but CANDIDATE-SET-INDEPENDENT: it is
+    // the corpus max for t, fixed per query term, not a function of the OTHER query
+    // terms or the result set — so it stays a TM2C2-legal normalizer (the per-query
+    // empirical /max over CANDIDATES is not — see theoreticalNormBm25). A fresh
+    // search per term also honors discard() tombstones SYNCHRONOUSLY, so the bound
+    // is exact pre-vacuum. UB is memoized per term (termUpperBounds); the cache is
+    // cleared on every mutation (fit/add/remove/vacuum). If a future MiniSearch
+    // change breaks single-term scoring, the one-term parity test fails loudly in CI.
+    //
+    // Derived-term caveat (fuzzy AND prefix): UB models EXACT matching. With either
+    // expansion on, derived terms score with their own (often higher) IDF, so a doc
+    // can exceed the bound — fusion clips to 1 — and a fully-OOV query (typo, or a
+    // bare prefix like "rearch") has bound 0 with nonzero derived scores — fusion
+    // falls back to /max for that query. Fuzzy side validated on the D&D typo slice
+    // (2026-06-09); prefix side on the harness prefix arm (2026-06-10).
     getQueryBound(query: string, boosts?: Record<string, number>): number {
         if (!this.mini || !query.trim()) return 0;
-        const mini = this.mini as unknown as {
-            _index?: { get(term: string): Map<number, Map<number, number>> | undefined };
-            _fieldIds?: Record<string, number>;
-            _documentCount?: number;
-        };
-        const index = mini._index;
-        const fieldIds = mini._fieldIds;
-        const n = mini._documentCount;
-        if (!index || typeof index.get !== 'function' || !fieldIds || typeof n !== 'number' || n <= 0) {
-            return 0; // internals unavailable → caller falls back to empirical max
-        }
         const fieldBoosts = boosts ?? this.fieldBoosts;
-        // The SAME tokenizer the index was built with (passed to MiniSearch in
-        // fit()), then our processTerm — the identical pipeline search() runs
-        // the query through. Was MiniSearch.getDefault('tokenize') before the
-        // CJK-aware tokenizer landed; using the default here now would
-        // under-count CJK query terms and break the bound.
-        const tokenizeFn = seekTokenize;
-        // All-stopword fallback (S2): bound the kept literal terms, matching
-        // the fallback search — otherwise "will" would score against the
-        // exempt index with bound 0 and ride the F1 empirical-max path for no
-        // reason.
+        // All-stopword fallback (S2): bound the kept literal terms via the same
+        // keep-stopword processing the fallback search uses, so e.g. "will" bounds
+        // against the exempt index instead of riding the empirical-/max path.
         const allStopword = isAllStopwordQuery(query);
         let perTermSum = 0;
-        const indexedDistinct = new Set<string>();
-        for (const raw of tokenizeFn(query)) {
+        for (const raw of seekTokenize(query)) {
             const term = allStopword ? keepStopwordsProcessTerm(raw) : processTerm(raw);
             if (!term) continue;
-            const fieldsData = index.get(term);
-            if (!fieldsData) continue;
-            for (const [field, boost] of Object.entries(fieldBoosts)) {
-                const df = fieldsData.get(fieldIds[field])?.size ?? 0;
-                if (df <= 0) continue;
-                // MiniSearch's calcBM25Score idf (verified v7.2.0):
-                const idf = Math.log(1 + (n - df + 0.5) / (df + 0.5));
-                perTermSum += boost * idf * TERM_SCORE_SUP;
-                indexedDistinct.add(term);
-            }
+            const ub = this.termUpperBound(term, fieldBoosts, allStopword);
+            if (ub <= 0) continue;            // OOV in every field → can't score
+            perTermSum += ub;                 // per-occurrence (mirrors the OR sum)
         }
-        return perTermSum * indexedDistinct.size;
+        return perTermSum;
+    }
+
+    // Max achievable EXACT single-term candidate score for `term` over the live
+    // index = the WAND/MaxScore per-term upper bound UB(t). Driven by MiniSearch's
+    // OWN scorer (a single-term search, fuzzy/prefix OFF) so it needs no formula
+    // replication and stays exact across MiniSearch upgrades. For a single query
+    // term MiniSearch's quality multiplier is ×1, so r.score IS the pure additive
+    // single-term score — directly comparable to the quality-divided scores
+    // getScoresWithCoverage stores. A fresh search honors discard() tombstones, so
+    // the bound is exact pre-vacuum. Memoized on the default-boost path (the
+    // production call); a per-call boost override (eval only) is computed fresh.
+    // Returns 0 for an OOV term (no postings → no results).
+    private termUpperBound(term: string, boosts: Record<string, number>, keepStop: boolean): number {
+        const mini = this.mini;
+        if (!mini) return 0;
+        const useCache = boosts === this.fieldBoosts;
+        const key = keepStop ? ` ${term}` : term;
+        if (useCache) {
+            const hit = this.termUpperBounds.get(key);
+            if (hit !== undefined) return hit;
+        }
+        let mx = 0;
+        const results = mini.search(term, {
+            boost: boosts,
+            fuzzy: false,
+            prefix: false,
+            ...(keepStop ? { processTerm: keepStopwordsProcessTerm } : {}),
+        });
+        for (const r of results) if (r.score > mx) mx = r.score;
+        if (useCache) this.termUpperBounds.set(key, mx);
+        return mx;
     }
 
     // Fraction of docs containing `term` in ANY field (max over fields) —
@@ -860,28 +891,23 @@ export class MultiFieldBM25 {
             // term OUTSIDE the indexed denominator can still match via a
             // derived term (same exception getQueryBound documents for the
             // bound), so clamp at 1 — full coverage, never a >1 boost.
+            // Divide out MiniSearch's `quality` (= |queryTerms|, dist v7.2.0
+            // `score: score * quality`) to recover the pure additive BM25F sum.
+            // The term-count soft-AND is then applied EXACTLY ONCE, by coverage
+            // below — not MiniSearch's hidden ×m SQUARED by Seek's ×(m/T). The
+            // division is exact: queryTerms is the very array `quality` was
+            // computed from. (2026-06-26 de-franken — supersedes the synonym
+            // source-attribution rescale, which had patched only the numerator
+            // of the same double-count; coverage still maps mates → source.)
+            const nativeQ = r.queryTerms.length || 1;
+            scores[idx] = r.score / nativeQ;
             if (m2s) {
+                // Synonym mates map back to their source term so a matched mate
+                // fills its source's coverage slot, not a fresh one (review fix #1).
                 const srcs = new Set<string>();
                 for (const qt of r.queryTerms) srcs.add(m2s.get(qt) ?? qt);
-                // ×quality correction: MiniSearch already multiplied r.score
-                // by |r.queryTerms| (dist: `score * quality`), which counts a
-                // matched mate as an extra distinct term. The 2026-06-10
-                // native-attribution gate measured that double-credit as
-                // FATAL — it doubles exactly the docs matching a term AND its
-                // mate (alias hub/sibling pages: "lr failurecases"
-                // −0.054→−0.387) and erases the synonym gain at EVERY weight,
-                // because the harm is the match, not the score. The
-                // multiplier is linear and queryTerms is the very array
-                // quality was computed from, so dividing it out and
-                // re-multiplying by the source-mapped count restores the
-                // measured source-attribution semantics EXACTLY (+0.0015
-                // personal @ w=0.8). No-op (factor 1) when no mate matched.
-                const nativeQ = r.queryTerms.length || 1;
-                const sourceQ = srcs.size || 1;
-                scores[idx] = r.score * (sourceQ / nativeQ);
                 coverage[idx] = totalTerms > 1 ? Math.min(1, srcs.size / totalTerms) : 1;
             } else {
-                scores[idx] = r.score;
                 const matched = new Set(r.queryTerms).size;
                 coverage[idx] = totalTerms > 1 ? Math.min(1, matched / totalTerms) : 1;
             }
@@ -922,6 +948,7 @@ export class MultiFieldBM25 {
         const row = this.chunkCount;
         if (!this.idToIdx.has(chunk.chunk_id) && this.mini.has(chunk.chunk_id)) this.mini.discard(chunk.chunk_id);
         this.mini.add(this.buildDoc(chunk, body));
+        this.termUpperBounds.clear();   // corpus changed → recompute UBs on next bound
         this.idToIdx.set(chunk.chunk_id, row);
         this.chunkCount = row + 1;
         return row;
@@ -941,6 +968,10 @@ export class MultiFieldBM25 {
         if (!this.mini || !this.idToIdx.has(id)) return;
         this.idToIdx.delete(id);
         try { this.mini.discard(id); } catch { /* ghost posting from a tolerant load — already absent */ }
+        // Drop memoized UBs: the next getQueryBound re-searches the live index,
+        // whose results already exclude the discarded doc — so the bound honors
+        // this tombstone synchronously, with no vacuum (the incremental contract).
+        this.termUpperBounds.clear();
     }
 
     // Reclaim tombstoned postings so `_index` sizes equal live df again — REQUIRED
@@ -952,6 +983,7 @@ export class MultiFieldBM25 {
     async vacuum(): Promise<void> {
         if (!this.mini) return;
         await this.mini.vacuum();
+        this.termUpperBounds.clear();   // postings compacted → recompute UBs
     }
 
     // Drift-detector / compaction surface. size = chunkCount = R (rows incl

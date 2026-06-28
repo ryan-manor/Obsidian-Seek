@@ -11,7 +11,7 @@
 //     N≥200 recover the fp32 ceiling exactly on 512-d Gemma and 320-d F2LLM,
 //     but granite-r2 is 384-d and CLS-pooled, hence anisotropic: mean pairwise
 //     cos ≈ 0.76, ~30–60 dead sign-bits, only ~265–290 effective bits of 384
-//     (binary_recall.py, seek-eval-pack, 614 q). On granite the binary arm
+//     (binary_recall.py, ~/eval, 614 q). On granite the binary arm
 //     ALONE recovers ~95.5% of dense-reachable golds at N=200; parity with
 //     exact dense isn't reached until ~N=800.
 //   - This costs ZERO end-to-end nDCG@10 (Δceiling +0.000 at every N from 100

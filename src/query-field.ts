@@ -104,6 +104,27 @@ function caretToEnd(el: HTMLElement): void {
     s.addRange(r);
 }
 
+// Drop the caret at the very START of the editable (just past the last pill).
+// Used when ←/→ pill-navigation hands focus back to the text: the user arrived
+// from the left edge, so the natural landing spot is before the first typed
+// character, not at the end (where caretToEnd would wrongly jump if text exists).
+function caretToStart(el: HTMLElement): void {
+    const r = document.createRange();
+    r.selectNodeContents(el);
+    r.collapse(true);
+    const s = window.getSelection();
+    if (!s) return;
+    s.removeAllRanges();
+    s.addRange(r);
+}
+
+// Bare modifier keydowns (the user is mid-chord, e.g. about to press ⌘A). These
+// must NOT clear an active pill selection — only a key that actually edits or
+// navigates should. Everything else does.
+function isModifierKey(key: string): boolean {
+    return key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta';
+}
+
 // True when the caret is collapsed at offset 0 of the editable (nothing typed
 // before it) — the condition under which Backspace deletes the last pill.
 function caretAtStart(el: HTMLElement): boolean {
@@ -131,6 +152,15 @@ export class PillQueryField {
     // Enter behavior. Tab remains the always-on accept affordance for both.
     // Reset on every re-derive (refresh) and on Escape-close.
     private menuEngaged = false;
+
+    // Keyboard pill selection. Index into `tokens` of the committed pill the
+    // user has stepped onto with ←/→, or null when the editable holds focus.
+    // The contenteditable NEVER loses DOM focus while this is set (pills aren't
+    // focusable nodes — the highlight is purely logical via the .is-selected
+    // class), so keydowns keep arriving here. Backspace/Delete removes the
+    // selected pill; any edit/navigation key clears the selection and resumes
+    // normal typing. Kept in range by renderPills().
+    private selectedPill: number | null = null;
 
     private rootEl: HTMLElement;
     private magEl: HTMLElement;
@@ -187,7 +217,12 @@ export class PillQueryField {
         // mobile "scroll results → drop keyboard" gesture blurs, correctly hiding
         // the caret until the user taps back in).
         this.editEl.addEventListener('focus', () => this.rootEl.addClass('is-focused'));
-        this.editEl.addEventListener('blur', () => this.rootEl.removeClass('is-focused'));
+        this.editEl.addEventListener('blur', () => {
+            this.rootEl.removeClass('is-focused');
+            // A pill highlight is a focus affordance — drop it when focus leaves
+            // (mobile keyboard dismiss, tapping a result) so it can't strand on.
+            this.clearPillSelection();
+        });
 
         // Clicking anywhere in the query ROW — the glyph, the field padding, the
         // empty space past the caret — should focus the editable and drop the
@@ -205,6 +240,20 @@ export class PillQueryField {
             const t = e.target as HTMLElement;
             if (t === this.editEl || this.editEl.contains(t)) return;
             if (t.closest('.seek-pill') || t.closest('.seek-sugg')) return;
+            // Inside the editable's wrapper but not on the text itself — the empty
+            // space past a short query (.seek-edit is inline, so it's only as wide
+            // as the text; the rest of the line is .seek-editwrap). Do NOT
+            // preventDefault here: that was cancelling a click-drag text selection
+            // that begins in the dead space. Just ensure focus lands in the
+            // editable; the browser then anchors its own caret at the click point
+            // (the query's end), so a drag back across the text selects it.
+            if (t.closest('.seek-editwrap')) {
+                if (document.activeElement !== this.editEl) this.editEl.focus();
+                return;
+            }
+            // Genuine chrome outside the field (the magnifier, the row's padding):
+            // no text to select, so keep the focus-and-caret-to-end affordance —
+            // preventDefault stops the click from blurring the editable.
             e.preventDefault();
             this.editEl.focus();
             caretToEnd(this.editEl);
@@ -509,9 +558,47 @@ export class PillQueryField {
 
     private removeToken(i: number): void {
         this.tokens.splice(i, 1);
+        // The × button can fire while a different pill is keyboard-selected;
+        // drop the now-possibly-stale selection rather than let it dangle.
+        this.selectedPill = null;
         this.renderPills();
         this.editEl.focus();
         caretToEnd(this.editEl);
+        this.refresh();
+    }
+
+    // ---- keyboard pill selection ----
+
+    // Highlight the pill at index `i`. The editable keeps DOM focus (pills aren't
+    // focusable), so this only repaints the highlight and never moves the caret.
+    private selectPill(i: number): void {
+        this.selectedPill = i;
+        this.renderPills();
+        // Guard against an upstream blur having dropped focus, so subsequent
+        // keystrokes still reach onKeyDown. Only re-focus if needed — a redundant
+        // focus() could nudge the caret.
+        if (document.activeElement !== this.editEl) this.editEl.focus();
+    }
+
+    // Drop the pill highlight and return to plain text-editing state. The caret
+    // is left where it was (the caller positions it when leaving via →).
+    private clearPillSelection(): void {
+        if (this.selectedPill == null) return;
+        this.selectedPill = null;
+        this.renderPills();
+    }
+
+    // Remove the keyboard-selected pill and keep a neighbour selected so repeated
+    // Backspace/Delete walks through the filters: the pill that shifts into the
+    // freed slot, or the new last pill, or — when none remain — back to the text.
+    private removeSelectedPill(): void {
+        const i = this.selectedPill;
+        if (i == null) return;
+        this.tokens.splice(i, 1);
+        this.selectedPill = this.tokens.length === 0 ? null : Math.min(i, this.tokens.length - 1);
+        this.renderPills();
+        this.editEl.focus();
+        if (this.selectedPill == null) caretToEnd(this.editEl);
         this.refresh();
     }
 
@@ -522,6 +609,20 @@ export class PillQueryField {
         const last = (text.match(/(\S*)$/)?.[1]) ?? '';
         const openSugg = this.sugg.open && this.sugg.items.length > 0;
         const accel = e.metaKey || e.ctrlKey;
+
+        // While a pill is keyboard-selected, only ←/→ (move) and Backspace/Delete
+        // (remove) act on it; the handlers for those live below. ANY other
+        // editing/navigation key abandons the selection and falls through to its
+        // normal behaviour (the char types into the still-focused editable, ↑/↓
+        // navigate results, Enter submits…). Bare modifiers are left alone so a
+        // chord-in-progress doesn't drop the selection.
+        // Escape is excluded here so its own handler can deselect-without-dismiss.
+        const pillNavKey = e.key === 'ArrowLeft' || e.key === 'ArrowRight'
+            || e.key === 'Backspace' || e.key === 'Delete' || e.key === 'Escape';
+        if (this.selectedPill != null && !pillNavKey && !isModifierKey(e.key)) {
+            this.clearPillSelection();
+            // fall through — the key does its usual job
+        }
 
         // Arrow keys move the MENU selection only when the menu owns them:
         // always for a value-kind menu (it was summoned by an explicit `op:`
@@ -539,6 +640,39 @@ export class PillQueryField {
             e.preventDefault();
             if (menuOwnsArrows) { this.menuEngaged = true; this.sugg.active = Math.max(this.sugg.active - 1, 0); this.updateActive(); }
             else this.cb.onNavigate(-1);
+            return;
+        }
+        // ←/→ step the keyboard selection across the committed pills. We only
+        // hijack the arrow when it has nowhere to go in the text — entering pill
+        // mode requires the caret at the very start (← ) and leaving it drops
+        // the caret back at the start of the editable (→ past the last pill);
+        // anywhere else the arrow is an ordinary caret move (no preventDefault).
+        if (e.key === 'ArrowLeft') {
+            if (this.selectedPill != null) {
+                e.preventDefault();
+                this.selectPill(Math.max(0, this.selectedPill - 1));
+                return;
+            }
+            if (this.tokens.length && caretAtStart(this.editEl)) {
+                e.preventDefault();
+                this.selectPill(this.tokens.length - 1);
+                return;
+            }
+            return;
+        }
+        if (e.key === 'ArrowRight') {
+            if (this.selectedPill != null) {
+                e.preventDefault();
+                const next = this.selectedPill + 1;
+                if (next >= this.tokens.length) {
+                    // Stepped off the right edge → hand focus back to the text.
+                    this.clearPillSelection();
+                    caretToStart(this.editEl);
+                } else {
+                    this.selectPill(next);
+                }
+                return;
+            }
             return;
         }
         if (e.key === 'Tab') {
@@ -602,6 +736,13 @@ export class PillQueryField {
             return;
         }
         if (e.key === 'Escape') {
+            // A selected pill swallows the first Escape (deselect only) so it
+            // doesn't also close the modal — step back to the editable instead.
+            if (this.selectedPill != null) {
+                e.preventDefault();
+                this.clearPillSelection();
+                return;
+            }
             if (this.sugg.open) {
                 e.preventDefault();
                 this.sugg = { open: false, kind: 'op', items: [], active: 0 };
@@ -614,6 +755,15 @@ export class PillQueryField {
             this.cb.onDismiss();
             return;
         }
+        // A keyboard-selected pill is removed by Backspace OR Delete, and the
+        // selection hops to a neighbour so repeated presses chew through filters.
+        if ((e.key === 'Backspace' || e.key === 'Delete') && this.selectedPill != null) {
+            e.preventDefault();
+            this.removeSelectedPill();
+            return;
+        }
+        // No pill selected: Backspace at the start of empty-prefixed text deletes
+        // the last pill outright (the long-standing quick-delete affordance).
         if (e.key === 'Backspace' && caretAtStart(this.editEl) && this.tokens.length) {
             e.preventDefault();
             this.removeToken(this.tokens.length - 1);
@@ -626,8 +776,17 @@ export class PillQueryField {
     private renderPills(): void {
         this.fieldEl.querySelectorAll('.seek-pill').forEach(el => el.remove());
         const editWrap = this.fieldEl.querySelector('.seek-editwrap');
+        // Keep the keyboard selection in range — a delete/seed can shrink or
+        // empty the token list out from under a stale index.
+        if (this.selectedPill != null && this.selectedPill >= this.tokens.length) {
+            this.selectedPill = this.tokens.length ? this.tokens.length - 1 : null;
+        }
+        // Root flag the synthetic-caret CSS keys off: while a pill owns the
+        // keyboard, the blinking text caret would be a second, competing cursor.
+        this.rootEl.toggleClass('is-pill-selected', this.selectedPill != null);
         this.tokens.forEach((t, i) => {
             const pill = createSpan({ cls: `seek-pill seek-pill-${t.op}` });
+            if (i === this.selectedPill) pill.addClass('is-selected');
             if (t.op === 'tag' && !this.cb.validateTag(t.value)) {
                 pill.addClass('seek-pill-warn');
                 pill.setAttr('aria-label', `No vault tag matches "${t.value}". Tag filtering is exact + hierarchical, so a sibling like "${t.value}s" won't match.`);

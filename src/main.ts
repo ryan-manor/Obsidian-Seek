@@ -1344,22 +1344,17 @@ export default class SeekPlugin extends Plugin {
             if (!deferEmbed) await this.ensureModelLoaded();
 
             if (bulk) {
-                // Mini-reindex path. Progress goes on the same sticky Notice the
-                // full reindex uses (deferred embeds have nothing to show). A live
-                // query preempts the embed (shouldContinue → break within one file,
-                // releasing the write mutex so the query runs); the interrupted or
-                // deferred remainder keeps its old searchable chunks and stays dirty
-                // (no file-record advance) for the drain to reconcile.
-                const notice = deferEmbed ? null : new Notice('Seek: indexing new notes…', 0);
-                try {
-                    await orchestrator.reindexDelta(dirty, deleted, {
-                        embed: !deferEmbed,
-                        shouldContinue: () => !this.indexingBlocked,
-                        onProgress: notice ? (msg) => notice.setMessage(`Seek: ${msg}`) : undefined,
-                    });
-                } finally {
-                    notice?.hide();
-                }
+                // Mini-reindex path. Runs silently — no "indexing new notes…"/progress
+                // toast (background deltas shouldn't toast; the Settings loading bar +
+                // completion recap cover user-initiated full reindexes). A live query
+                // preempts the embed (shouldContinue → break within one file, releasing
+                // the write mutex so the query runs); the interrupted or deferred remainder
+                // keeps its old searchable chunks and stays dirty (no file-record advance)
+                // for the drain to reconcile.
+                await orchestrator.reindexDelta(dirty, deleted, {
+                    embed: !deferEmbed,
+                    shouldContinue: () => !this.indexingBlocked,
+                });
                 // Reconcile whatever the embed left undone (deferred cold, or
                 // preempted by a query). runCatchUp is self-guarding (no-op while
                 // searching / hidden / model cold) and computeDelta-idempotent — a
@@ -1694,16 +1689,14 @@ export default class SeekPlugin extends Plugin {
             if (!window.confirm(confirm)) return false;
         }
 
-        const notice = new Notice('Seek: full reindex starting…', 0);
+        // No "starting…" or per-file progress toast: the live "Reindexing…" bar in
+        // Settings → Seek (driven by opts.onProgress) is the progress UI. Only the
+        // completion recap below (and the failure toast) survive.
         this.currentTaskContext = 'indexing';
         try {
             await this.ensureModelLoaded();
             this.orchestrator.invalidateBm25Cache();
-            const result = await this.orchestrator.reindexAll(msg => {
-                notice.setMessage(`Seek: ${msg}`);
-                opts?.onProgress?.(msg);
-            });
-            notice.hide();
+            const result = await this.orchestrator.reindexAll(msg => opts?.onProgress?.(msg));
             const summary = [
                 result.pass ? '✅' : '❌',
                 `${result.filesIndexed} files`,
@@ -1727,7 +1720,6 @@ export default class SeekPlugin extends Plugin {
             this.identityHealNotified = false;
             return true;
         } catch (e) {
-            notice.hide();
             await this.logger.appendError('seek-full-reindex', e);
             // One end-toast whether it passed or failed (the recap). Detail → console + log.
             new Notice('Seek reindex: ❌ failed — see the logging report (Settings → Seek).', 10000);

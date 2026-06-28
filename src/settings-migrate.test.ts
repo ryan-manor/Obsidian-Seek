@@ -24,7 +24,7 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         expect(raw.sidecarEnabled).toBe(true);
         expect(raw.navTitleBoost).toBe(0.5); // 0.8 (old default) → 0.5 (new Default stage)
         expect(raw.recencyEpsilon).toBe(0);  // 0.02 (old tiebreaker) → 0 (ships Off)
-        expect(raw.settingsRev).toBe(6);
+        expect(raw.settingsRev).toBe(7);
     });
 
     it('preserves a hand-tuned navTitleBoost / recencyEpsilon (only the exact old default is moved)', () => {
@@ -33,15 +33,15 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         expect(raw.navTitleBoost).toBe(0.7);
         expect(raw.recencyEpsilon).toBe(0.05);
         expect(raw.sidecarEnabled).toBe(true); // the unconditional boolean flips still apply
-        expect(raw.settingsRev).toBe(6);
+        expect(raw.settingsRev).toBe(7);
     });
 
-    it('does not re-touch the rev-5 fields of an install already at rev 5 (only advances to rev 6)', () => {
+    it('does not re-touch the rev-5 fields of an install already at rev 5 (advances to the latest rev)', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 5, navTitleBoost: 0.8, sidecarEnabled: false };
         migrateSettings(raw);
         expect(raw.navTitleBoost).toBe(0.8);    // not remapped — already past rev 5
         expect(raw.sidecarEnabled).toBe(false); // not forced — already past rev 5
-        expect(raw.settingsRev).toBe(6);        // the rev-6 rename clause still advances the rev
+        expect(raw.settingsRev).toBe(7);        // later clauses (rev-6 rename, rev-7 props) still advance the rev
     });
 
     it('gives a fresh/empty data.json (treated as rev 1) the rev-5 baseline', () => {
@@ -52,7 +52,7 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         expect(raw.sidecarEnabled).toBe(true);
         expect(raw.navTitleBoost).toBe(0.5); // undefined → new default
         expect(raw.recencyEpsilon).toBe(0);
-        expect(raw.settingsRev).toBe(6);
+        expect(raw.settingsRev).toBe(7);
     });
 
     it('still applies the rev-2 denseWeight surgery for a pre-bound install (plus the rev-5 flips)', () => {
@@ -61,7 +61,7 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         expect(raw.denseWeight).toBeUndefined(); // empirical-max value dropped → rev-2 default takes over
         expect(raw.navTitleBoost).toBe(0.5);     // rev-5 flips also apply (rev 1 < 5)
         expect(raw.synonymExpansion).toBe(true);
-        expect(raw.settingsRev).toBe(6);
+        expect(raw.settingsRev).toBe(7);
     });
 
     it('mutates and returns the same object (onload relies on the mutation)', () => {
@@ -79,14 +79,14 @@ describe('migrateSettings — rev 6 debugMode→showScores rename', () => {
         migrateSettings(raw);
         expect(raw.showScores).toBe(false);
         expect((raw as { debugMode?: boolean }).debugMode).toBeUndefined(); // orphan key dropped
-        expect(raw.settingsRev).toBe(6);
+        expect(raw.settingsRev).toBe(7);
     });
 
     it('carries debugMode:true into showScores:true', () => {
         const raw = { settingsRev: 5, debugMode: true } as Partial<SeekSettings>;
         migrateSettings(raw);
         expect(raw.showScores).toBe(true);
-        expect(raw.settingsRev).toBe(6);
+        expect(raw.settingsRev).toBe(7);
     });
 
     it('does not clobber an already-persisted showScores with the legacy key', () => {
@@ -100,6 +100,31 @@ describe('migrateSettings — rev 6 debugMode→showScores rename', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 5 };
         migrateSettings(raw);
         expect(raw.showScores).toBeUndefined(); // falls through to DEFAULT_SETTINGS.showScores in onload
-        expect(raw.settingsRev).toBe(6);
+        expect(raw.settingsRev).toBe(7);
+    });
+});
+
+describe('migrateSettings — rev 7 searchableProperties default ON', () => {
+    it('flips a persisted searchableProperties:false ON for a pre-rev-7 install', () => {
+        // The exact silent no-op the migration prevents: installs created under the old
+        // default persisted `false`, which would win over the new DEFAULT_SETTINGS true.
+        const raw: Partial<SeekSettings> = { settingsRev: 6, searchableProperties: false };
+        migrateSettings(raw);
+        expect(raw.searchableProperties).toBe(true);
+        expect(raw.settingsRev).toBe(7);
+    });
+
+    it('turns it ON for an install that never persisted the key', () => {
+        const raw: Partial<SeekSettings> = { settingsRev: 6 };
+        migrateSettings(raw);
+        expect(raw.searchableProperties).toBe(true);
+        expect(raw.settingsRev).toBe(7);
+    });
+
+    it('does not re-flip an install already at rev 7 (a deliberate later OFF survives)', () => {
+        const raw: Partial<SeekSettings> = { settingsRev: 7, searchableProperties: false };
+        migrateSettings(raw);
+        expect(raw.searchableProperties).toBe(false); // past rev 7 — the user's choice is preserved
+        expect(raw.settingsRev).toBe(7);
     });
 });

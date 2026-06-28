@@ -12,6 +12,7 @@ import type { SearchOrchestrator } from './search';
 import type { SeekLogger } from './logger';
 import { ENGLISH_STOPWORDS } from './bm25';
 import { buildHighlightRanges } from './highlight';
+import { sanitizeSnippet } from './snippet';
 import { matchStrength } from './dense-stats';
 import { SuggestEngine } from './suggest';
 import { PillQueryField } from './query-field';
@@ -42,46 +43,9 @@ const MAX_RESULTS = 50;
 // view, so the rows are already painted by the time the user reaches them.
 const REVEAL_MARGIN_PX = 300;
 
-// A line that's part of a GFM pipe table: either a normal row that's wrapped in
-// outer pipes (`| a | b |`, incl. the header) or a delimiter row (`|---|:--:|`,
-// with or without outer pipes). Requiring outer pipes on content rows keeps a
-// stray inline pipe in prose ("A | B") from being mistaken for a table.
-const TABLE_ROW_RE = /^\s*\|.*\|\s*$/;
-const TABLE_DELIM_RE = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
-
-// Sanitize a snippet before markdown-rendering it. Notes often open with a
-// banner image, a transcluded note, or a table — all of which the renderer
-// would expand into a full-height block and blow out the result row. We strip:
-//   • Obsidian wikilink embeds  `![[cover.jpg]]` / `![[file|size]]`
-//   • markdown image embeds     `![alt](url)`
-//   • GFM pipe-table lines      `| a | b |`, `|---|---|`
-//   • code-fence markers        ```` ```json ```` / `~~~` — see below
-// Plain links (`[[…]]`, `[text](url)`) and inline formatting are left intact so
-// they still render. Leftover blank lines are collapsed.
-//
-// Code fences get only their FENCE LINES removed (not the inner code): a real
-// fenced block renders as a <pre> with Obsidian's floating "copy" button, and
-// the row's nowrap+overflow clip then hides the code text but NOT the
-// absolutely-positioned button — so a config-dump note (body = one ```json
-// block) shows up as a lone copy icon with no preview. Dropping the fence lines
-// lets the inner text render as a normal clipped one-liner instead.
-function sanitizeSnippet(md: string): string {
-    const noEmbeds = md
-        .replace(/!\[\[[^\]]*?\]\]/g, '')       // ![[file]] / ![[file|size]]
-        .replace(/!\[[^\]]*?\]\([^)]*?\)/g, ''); // ![alt](url)
-
-    const noTables = noEmbeds
-        .split('\n')
-        .filter(line => !TABLE_ROW_RE.test(line) && !TABLE_DELIM_RE.test(line))
-        .join('\n');
-
-    const noFences = noTables.replace(/^\s*(?:```|~~~).*$/gm, ''); // ``` / ```json / ~~~
-
-    return noFences.replace(/\n{3,}/g, '\n\n').trim();
-}
-
-// (maskNonBodyText, escapeRegExp and the word-boundary range builder live in
-// ./highlight so they can be unit-tested without Obsidian — see buildMatchHighlight.)
+// (sanitizeSnippet lives in ./snippet, and maskNonBodyText / escapeRegExp / the
+// word-boundary range builder in ./highlight, so they can be unit-tested without
+// Obsidian — see buildMatchHighlight + the snippet render in applyRow.)
 
 // "2026-05-19" from a created date. ISO is rendered deliberately rather than a
 // localized string: it matches the frontmatter shape and is unambiguous in every
@@ -118,20 +82,6 @@ function noteTitle(notePath: string): string {
     return base.replace(/\.md$/i, '');
 }
 
-// Resolve any wikilinks embedded in a heading to their display text, since the
-// breadcrumb is set via plain setText (not the markdown renderer) and would
-// otherwise show raw `[[…]]` source. Mirrors Obsidian's own display rule:
-//   [[Target|alias]]  → alias        (the human label wins when present)
-//   [[Target]]        → Target
-//   [[Target#Section]]→ Target        (page name; bare [[#Section]] → Section)
-function resolveWikilinks(seg: string): string {
-    return seg.replace(/\[\[([^\]]+?)\]\]/g, (_m, inner: string) => {
-        if (inner.includes('|')) return inner.slice(inner.lastIndexOf('|') + 1).trim();
-        const [page, ...rest] = inner.split('#');
-        return (page || rest.join('#') || inner).trim();
-    });
-}
-
 // Status of the embedder model at the time the modal opens. `ready=true` is
 // the warm path (model already in memory from a prior open) and we skip all
 // "loading…" UI. `ready=false` means the caller kicked off
@@ -159,6 +109,10 @@ interface SeekResultRow {
     data: ScoredChunk;
     rank: number;
     lastSnippet: string;
+    // The breadcrumb markdown source last rendered into `breadcrumbEl` — so an
+    // unchanged heading path skips the (async) markdown re-render, mirroring
+    // `lastSnippet`.
+    lastCrumb: string;
 }
 
 // The version-stale banner the modal renders between the query field and the results.
@@ -867,6 +821,7 @@ export class SeekSearchModal extends Modal {
             data: null as unknown as ScoredChunk,
             rank: i + 1,
             lastSnippet: '\0', // sentinel ≠ any real snippet so first apply renders
+            lastCrumb: '\0',   // same sentinel for the breadcrumb
         };
         el.addEventListener('click', e => {
             if ((e.target as HTMLElement).closest('a')) return;
@@ -894,9 +849,26 @@ export class SeekSearchModal extends Modal {
         if (row.titleEl.textContent !== title) row.titleEl.setText(title);
 
         // Heading-path breadcrumb: `› Agenda › Intern pgm` (empty for a
-        // whole-note / pre-heading chunk).
-        const crumb = (r.heading_path ?? []).map(s => `› ${resolveWikilinks(s)}`).join(' ');
-        if (row.breadcrumbEl.textContent !== crumb) row.breadcrumbEl.setText(crumb);
+        // whole-note / pre-heading chunk). Rendered as MARKDOWN, not plain text,
+        // so a heading that is itself a link — an external `[Review…](https://…)`
+        // or a `[[wikilink]]` — shows as a real Obsidian link with the box glyph +
+        // underline the user's appearance settings define, exactly as on the page
+        // (a bare setText left the `[text](url)` source showing). The per-segment
+        // `› ` prefix doubles as a guard against a heading that starts with block
+        // markdown (`1.`, `#`) being parsed as a list/heading. Skipped when the
+        // path is unchanged (async render is comparatively costly).
+        const crumb = (r.heading_path ?? []).map(s => `› ${s}`).join(' ');
+        if (crumb !== row.lastCrumb) {
+            row.lastCrumb = crumb;
+            row.breadcrumbEl.empty();
+            if (crumb) {
+                // Fresh wrapper (as the snippet does) so a late async append from a
+                // superseded row lands on a detached node, never another row's line.
+                const wrap = row.breadcrumbEl.createDiv();
+                MarkdownRenderer.render(this.app, crumb, wrap, r.note_path, this.markdownComponent)
+                    .catch(() => wrap.setText(crumb));
+            }
+        }
         row.breadcrumbEl.toggle(crumb.length > 0);
 
         // Meta line: `created <date> · #tag #tag`. Rebuilt only when it changes.
@@ -931,9 +903,19 @@ export class SeekSearchModal extends Modal {
         // means the corpus isn't calibrated yet → hide the line, no rank fallback.
         const scoresMeaningful = this.app.vault.getMarkdownFiles().length >= MATCH_STRENGTH_MIN_NOTES;
         if (this.settings.showScores && scoresMeaningful && hasTextQuery && strength != null) {
+            // Title shown as a normalized [0,1] match strength (1 = full known-item
+            // title match), mirroring how recency renders its raw signal rather than
+            // the weighted contribution that enters `final`. title_boost is
+            // navTitleBoost·coverage (fusion.ts), so divide the configured weight
+            // back out to recover coverage; the Off stage (weight 0) zeroes the
+            // contribution and coverage isn't recoverable, so it reads 0.00.
+            const titleWeight = this.settings.navTitleBoost;
+            const titleStrength = titleWeight > 0
+                ? r.ranking_signals.title_boost / titleWeight
+                : 0;
             const label = `Matching ${Math.round(strength * 100)}%`
                 + ` · recency ${r.ranking_signals.recency.toFixed(2)}`
-                + ` · title ${r.ranking_signals.title_boost.toFixed(2)}`;
+                + ` · title ${titleStrength.toFixed(2)}`;
             if (row.scoreEl.textContent !== label) row.scoreEl.setText(label);
             row.scoreEl.show();
         } else {

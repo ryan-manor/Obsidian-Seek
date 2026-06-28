@@ -12,7 +12,7 @@ import type { Chunk, ChunkMeta, ScoredChunk, SearchEntry, IndexCompleteEntry, In
 import { snapshotMemory, memoryDelta, distributionStats } from './types';
 import { MarkdownChunker, cyrb53Hex } from './chunker';
 import { extractBaseDocs } from './base-extractor';
-import { MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, ANALYZER_VERSION } from './bm25';
+import { MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, ANALYZER_VERSION, BM25_COVERAGE_POW } from './bm25';
 import { buildSynonymMap, SYNONYM_WEIGHT, type SynonymMap } from './synonyms';
 import { rank, cosineScores, DEFAULT_RANKING_CONFIG } from './ranker';
 import { browseOrder, recencyDate } from './fusion';
@@ -2438,11 +2438,13 @@ export class SearchOrchestrator {
             if (!ch || !v || v.length !== queryVec.length) continue;
             candidateChunks.push(ch);
             candidateFp32.push(v);
-            // Soft-AND: discount a partial multi-term match by its coverage. The
-            // weight is 1 for single-term queries and full-coverage docs (no-op),
-            // and never 0 for a real partial match (recall-safe). rank() then
-            // TM2C2-normalizes this coverage-scaled raw BM25.
-            candidateBm25.push(applyCoverage ? bm25Scores[idx] * bm25Coverage[idx] : bm25Scores[idx]);
+            // Soft-AND: discount a partial multi-term match by its coverage^P (the
+            // coordination-level penalty; see BM25_COVERAGE_POW in bm25.ts). The weight
+            // is 1 for single-term queries and full-coverage docs (no-op regardless of P),
+            // and never 0 for a real partial match (recall-safe). P=2 hardens the discount
+            // so a rare-place-token-only match can't out-rank a full-coverage answer
+            // ("bars in sf"/"bars in austin" fix). rank() then TM2C2-normalizes this.
+            candidateBm25.push(applyCoverage ? bm25Scores[idx] * Math.pow(bm25Coverage[idx], BM25_COVERAGE_POW) : bm25Scores[idx]);
         }
         const alignMs = performance.now() - alignStart;
 
