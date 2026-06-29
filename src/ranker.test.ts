@@ -10,7 +10,7 @@ function chunk(note_path: string, opts: { lexicalOnly?: boolean; created?: strin
         content: '',
         note_path,
         heading_path: [],
-        metadata: { tags: [], aliases: [], pageType: '', created: opts.created ?? null, modified: opts.modified ?? null, properties: {} },
+        metadata: { tags: [], aliases: [], created: opts.created ?? null, modified: opts.modified ?? null, properties: {} },
         start_line: 1,
         end_line: 1,
         ...(opts.lexicalOnly && { lexicalOnly: true }),
@@ -27,7 +27,7 @@ describe('rank — TM2C2 fixes the manufactured-winner (diluted gold below a noi
     // DILUTED (long noisy chunk) BELOW a content-free distractor's, while only the
     // true match has a BM25 hit. Under per-query min-max at high alpha this misranks
     // (distractor's noise cosine stretched to 1.00 wins); TM2C2's fixed endpoints
-    // keep the dense channel flat so BM25 decides. Verified in ~/eval-oov.
+    // keep the dense channel flat so BM25 decides. Verified in ~/seek-dnd-eval.
     const chunks = [
         chunk('Notes/2026-03-01 daily.md'),          // content-free distractor, no bm25
         chunk('Notes/Metrics Service requests.md'),  // gold: diluted cosine, bm25 hit

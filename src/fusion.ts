@@ -3,7 +3,7 @@
 // in ranker.py. Coefficients match the live Python backend's defaults.
 
 import { depluralize, ENGLISH_STOPWORDS, foldDiacritics } from './bm25';
-import { hasCjk, segmentCjkToken } from './tokenize';
+import { hasCjk, segmentCjkToken, seekTokenize } from './tokenize';
 import type { RecencyKeyChoice } from './types';
 
 // (minmaxNormalize deleted 2026-06-11 with the RRF blend mode — its last
@@ -145,7 +145,7 @@ export function computeRecencyScore(dateStr: string | null | undefined, opts: Re
 // BM25 decides. The endpoints are MODEL-INDEPENDENT (no per-model/per-vault
 // calibration), which is the whole point — see [[seek-empty-stub-dense-pollution]].
 //
-// Eval verdict (2026-06-09, ~/eval + ~/eval-oov OOV slice):
+// Eval verdict (2026-06-09, ~/seek-personal-eval + ~/seek-dnd-eval OOV slice):
 // the LESS the cosine is processed, the more bug-robust — per-query stretch is
 // what manufactures false confidence, and calibrated fixed endpoints still
 // stretch. The theoretical (cos+1)/2 form compresses instead: best aggregate
@@ -177,7 +177,7 @@ export function theoreticalNormDense(cos: Float64Array | Float32Array | number[]
 // the α 0.90→0.92 nudge). Under the bound, a weak-lexical query yields
 // uniformly small bm25Norm — the channel self-attenuates — and the scale is
 // query-invariant, so α means one thing everywhere. Validated 2026-06-09
-// (~/eval/bound_norm_eval.py + ~/eval-oov): personal parity
+// (~/seek-personal-eval/bound_norm_eval.py + ~/seek-dnd-eval): personal parity
 // (bootstrap CI spans 0), OOV desc stratum +0.06–0.09, no manufactured-winner
 // regression, and the personal/OOD α optima converge on one plateau (~0.7–0.85
 // → shipped denseWeight 0.80, NOT comparable to the 0.92 empirical-max point).
@@ -186,12 +186,19 @@ export function theoreticalNormDense(cos: Float64Array | Float32Array | number[]
 //   - Clip at 1: with fuzzy on, derived terms score with their own (often
 //     higher) IDF, so a doc can exceed the exact-term bound. Ties at 1.0 are
 //     arbitrated by dense — bounded, local degradation. Exact for fuzzy:false.
-//   - bound==0 with nonzero scores (fully-OOV typo query under fuzzy, or
-//     MiniSearch internals unavailable after an upgrade): the bound has no
-//     opinion about this query, so DON'T let it manufacture silence — fall
-//     back to the empirical max (rank-only normalization, the pre-bound
-//     behavior). Without this, a misspelled entity query zeroes the only
-//     channel that knows the answer (34/40→37/40 gold@1 on the typo slice).
+//   - bound==0 with nonzero scores (fully-OOV typo query under fuzzy; OR a bare
+//     single-token PREFIX still mid-type in typeahead — "amster" before
+//     "amsterdam" is an indexed term — since getQueryBound enumerates with
+//     prefix/fuzzy OFF; OR MiniSearch internals unavailable after an upgrade):
+//     the bound has no opinion about this query, so DON'T let it manufacture
+//     silence — fall back to the empirical max (rank-only normalization, the
+//     pre-bound behavior). The typeahead-prefix case is INTENDED, not a TM2C2
+//     regression (audit 2026-06-29 #5): a half-typed prefix has no stable bound
+//     to honor, so the pre-bound /max floor is the right behavior for a query
+//     that isn't settled yet — the manufactured-1.0-winner TM2C2 fixes only
+//     matters for committed queries. Without the fallback, a misspelled entity
+//     query zeroes the only channel that knows the answer (34/40→37/40 gold@1
+//     on the typo slice).
 // An all-zero channel still maps to all-0 (no spurious uniform vote).
 export function theoreticalNormBm25(bm25: Float64Array | Float32Array | number[], bound?: number): Float64Array {
     const n = bm25.length;
@@ -234,7 +241,7 @@ export function hybridFusion(dense: Float64Array, bm25: Float64Array, alpha: num
 // The original fix only fired when the query was EXACTLY a note's basename or
 // alias. That misses the dominant known-item shape: the query is a SUBSET of
 // the title, not equal to it — "alex 1x1" vs `Alex 1x1 2026-05-19`, "project
-// atlas" vs `Atlas Project`, "graphdb" vs `GraphDB`. So we generalize:
+// eames" vs `Eames Project`, "memgraph" vs `MemGraph`. So we generalize:
 //
 //   fire only when EVERY query token appears in the title (or alias) token set
 //   — "you typed a subset of the title", the known-item gate —
@@ -248,16 +255,28 @@ export function hybridFusion(dense: Float64Array, bm25: Float64Array, alpha: num
 // up, none down) and is flat above 1.0. Precision-scaling is self-limiting —
 // only a near-exact title earns the full 0.8 — so a high magnitude is safe; an
 // overwhelming dense+BM25 signal can still overtake a low-precision false hit.
-// (Tuned by ~/eval/title_coverage.py; see [[Seek Rel]].)
+// (Tuned by ~/seek-personal-eval/title_coverage.py; see [[Seek Rel]].)
 //
-// Tokenization: lowercase, then Unicode letter/number runs (/[\p{L}\p{N}]+/gu).
-// Keeps "1x1" intact and explodes a dated title into year/month/day tokens —
-// which is fine: the date tokens are matched by the date-proximity signal, not
-// here. Was ASCII-only /[a-z0-9]+/g until 2026-06-10 (Three-Lens S3): every
-// token of "Café Zürich" matched as empty, so the known-item boost was
-// structurally DEAD for any non-ASCII title. The Unicode classes align this
-// channel with MiniSearch's tokenizer, which was always Unicode-aware. (CJK
-// remains out of scope as a decision — no segmentation anywhere in the stack.)
+// Tokenization: seekTokenize — the SAME analyzer BM25 indexes/queries with — in
+// its CANONICAL stream (derived:false): possessive-strip ("ryan's"→"ryan") and
+// CJK dictionary segmentation, but WITHOUT the additive glue/camelCase recall
+// forms. Then per token: lowercase, fold diacritics, drop query stopwords,
+// depluralize (the processTerm steps). This retires the ad-hoc THIRD tokenizer
+// this channel used until 2026-06-29 (a bare /[\p{L}\p{N}]+/ run with no
+// possessive-strip), under which "ryan's" carried a stray "s" that failed the
+// all-in-title gate on a `Ryan` title even though BM25 stripped it and matched.
+//
+// derived:FALSE is deliberate and eval-gated (audit 2026-06-29 #4,
+// nav_tokenizer_arm.py over the 483-q personal + 127-q dnd sets). The boost is a
+// coverage RATIO |q∩t|/|t|, so it must match the bound/coverage ENUMERATORS —
+// which also take derived:false — NOT the matching path: the glue/camel forms
+// exist to widen match RECALL, but in a precision DENOMINATOR they are noise (a
+// dated title `2026-05-19` would gain its concatenation `20260519`, shrinking
+// precision on exactly the dated known-item titles this boost targets). Measured:
+// derived:false is a strict no-op (+0.0000), derived:true −0.0002. Dated titles
+// still explode into y/m/d tokens (matched by date-proximity, not here); "1x1"
+// stays intact. (Was ASCII-only /[a-z0-9]+/g until 2026-06-10, which matched
+// every token of "Café Zürich" as empty — non-ASCII titles couldn't fire at all.)
 export interface TitleBoostChunk {
     note_path: string;
     metadata?: { aliases?: string[] };
@@ -272,7 +291,7 @@ function tokenSet(s: string, dropStopwords = false): Set<string> {
     //
     // dropStopwords (query side only, audit 2026-06-09 §6.1): the known-item gate
     // requires EVERY query token to appear in the title, so a single stopword the
-    // user typed ("the atlas project") that the title omits killed the whole boost
+    // user typed ("the eames project") that the title omits killed the whole boost
     // — while BM25 strips that same stopword and matched fine. Dropping the
     // stoplist from the QUERY tokens realigns the two. Checked on the raw lowercased
     // token BEFORE depluralize, exactly as processTerm does (bm25.ts), and against
@@ -280,15 +299,13 @@ function tokenSet(s: string, dropStopwords = false): Set<string> {
     // TITLE side keeps stopwords (default false): we don't touch what's matchable
     // there — that's the BM25-channel name-as-stopword problem (§6.2, deferred).
     const out = new Set<string>();
-    for (const m of s.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
-        // CJK runs are dictionary-segmented with the SAME segmenter BM25
-        // indexes with (tokenize.ts) — otherwise segmented query terms could
-        // never satisfy the all-tokens-in-title gate against an unsegmented
-        // CJK title set, and the boost would silently never fire on CJK. The
-        // non-CJK branch folds diacritics with the SAME helper processTerm uses
-        // (audit §4), so the title-boost keys the term space BM25 indexes
-        // ("Café" boost fires for the query "cafe"); foldDiacritics self-guards
-        // on hasCjk, but the branch only reaches it for non-CJK m anyway.
+    for (const raw of seekTokenize(s, { derived: false })) {
+        const m = raw.toLowerCase();   // seekTokenize preserves case (camel split needs it)
+        // seekTokenize already CJK-segments; the per-token branch re-applies the
+        // SAME segmenter (idempotent on a single CJK piece) and, for non-CJK,
+        // folds diacritics with the SAME helper processTerm uses (audit §4), so
+        // the title-boost keys the exact term space BM25 indexes ("Café" boost
+        // fires for the query "cafe"). foldDiacritics self-guards on hasCjk.
         for (const t of hasCjk(m) ? segmentCjkToken(m) : [foldDiacritics(m)]) {
             if (dropStopwords && ENGLISH_STOPWORDS.has(t)) continue;
             out.add(depluralize(t));

@@ -72,6 +72,12 @@ export interface HydrateResult {
     skippedPartialNotes: number; // notes skipped because a chunk's bytes weren't synced yet
     refusedProducers: number; // producers excluded by the version gate
     acceptedProducers: number;
+    // A refused producer is at a HIGHER chunkerVersion than this build can read — i.e.
+    // another device holds a newer index this plugin is too old to use. Distinct from
+    // refusedProducers (which also counts merely-different/older/torn producers): this is
+    // specifically "I'm behind, the user should update Seek". Drives the peer-ahead banner
+    // and the mobile grind-stop (skip the futile local re-embed).
+    peerAhead: boolean;
     hydratedNotePaths: string[]; // notes fully hydrated (a file record was written) — drives delta dedup
     // Corpus dense-cosine background inherited from the freshest accepted producer
     // (newest lastFullReindex) — the orchestrator writes it into local meta so a
@@ -120,9 +126,35 @@ export async function rankAcceptedProducers(
     return accepted.map(a => a.dev);
 }
 
+// Cheap, hydrate-independent peer-ahead probe: scans ONLY the producer device metas
+// (no jsonl content scan, no whole-vault reChunk) to answer "does a peer hold an index
+// at a newer chunkerVersion than this build can read?". This is the SAME predicate
+// hydrateFromSidecar computes inline (a metaAccepts-refused producer whose chunkerVersion
+// exceeds ours), factored out so the two can't drift. Why it exists: reconcileSidecarIfChanged
+// skips the expensive hydrate whenever the sidecar-dir signature is unchanged (the routine
+// app-relaunch case), and the orchestrator's _peerAhead resets to false on every new boot —
+// so without a hydrate-free way to recover the bit, the peer-ahead banner and the mobile
+// grind-stop would silently stop engaging after the first relaunch (and falsely read
+// "healthy"). An older-or-equal refused producer means WE are ahead, not peer-ahead; an
+// unreadable meta (null) is no evidence of a newer peer. Short-circuits on the first hit.
+export async function probePeerAhead(
+    adapter: DataAdapter,
+    indexDir: string,
+    expect: MetaExpectation,
+): Promise<boolean> {
+    const jsonls = await listDeviceJsonls(adapter, indexDir);
+    for (const jsonl of jsonls) {
+        const dev = deviceIdFromJsonlPath(jsonl);
+        if (!dev) continue;
+        const meta = await readDeviceMeta(adapter, indexDir, dev);
+        if (!metaAccepts(meta, expect) && meta && meta.chunkerVersion > expect.chunkerVersion) return true;
+    }
+    return false;
+}
+
 export async function hydrateFromSidecar(deps: HydrateDeps): Promise<HydrateResult> {
     const { adapter, indexDir, expect } = deps;
-    const empty: HydrateResult = { scanned: 0, needed: 0, hydrated: 0, skippedPartialNotes: 0, refusedProducers: 0, acceptedProducers: 0, hydratedNotePaths: [] };
+    const empty: HydrateResult = { scanned: 0, needed: 0, hydrated: 0, skippedPartialNotes: 0, refusedProducers: 0, acceptedProducers: 0, peerAhead: false, hydratedNotePaths: [] };
 
     // 1. Version gate: keep only producers this consumer can reproduce.
     const allJsonls = await listDeviceJsonls(adapter, indexDir);
@@ -136,6 +168,10 @@ export async function hydrateFromSidecar(deps: HydrateDeps): Promise<HydrateResu
     });
     const accepted: string[] = [];
     let refused = 0;
+    // A refused producer whose chunkerVersion is HIGHER than ours = a newer index we're
+    // too old to read (the user should update Seek). Tracked across the whole scan so a
+    // single ahead peer is reported even when other producers are accepted.
+    let peerAhead = false;
     // Inherit display-calibration stats from the freshest accepted producer (the
     // one whose last full reindex is newest = most representative of the corpus).
     // Compare by parsed epoch, NOT lexicographically: a missing/malformed/null
@@ -155,13 +191,14 @@ export async function hydrateFromSidecar(deps: HydrateDeps): Promise<HydrateResu
             }
         } else {
             refused++;
+            if (meta && meta.chunkerVersion > expect.chunkerVersion) peerAhead = true;
             deps.onRefusedProducer?.(dev, meta, expect);
         }
     }
     const bg = { bgMean: bgSource?.bgMean, bgStd: bgSource?.bgStd };
     if (accepted.length === 0) {
-        deps.log?.('sidecar-hydrate', { ...empty, refusedProducers: refused });
-        return { ...empty, refusedProducers: refused };
+        deps.log?.('sidecar-hydrate', { ...empty, refusedProducers: refused, peerAhead });
+        return { ...empty, refusedProducers: refused, peerAhead };
     }
 
     // 2. Scan accepted producers → resolved id → location map.
@@ -188,7 +225,7 @@ export async function hydrateFromSidecar(deps: HydrateDeps): Promise<HydrateResu
         if (!existing.has(id)) { hasFreshId = true; break; }
     }
     if (!hasFreshId) {
-        const r: HydrateResult = { ...empty, ...bg, scanned: scan.map.size, refusedProducers: refused, acceptedProducers: accepted.length };
+        const r: HydrateResult = { ...empty, ...bg, scanned: scan.map.size, refusedProducers: refused, acceptedProducers: accepted.length, peerAhead };
         deps.log?.('sidecar-hydrate-skip-rechunk', { scanned: scan.map.size, reason: 'no-fresh-ids' });
         deps.log?.('sidecar-hydrate', r);
         return r;
@@ -223,7 +260,7 @@ export async function hydrateFromSidecar(deps: HydrateDeps): Promise<HydrateResu
         needed += entries.length;
     }
     if (candidates.length === 0) {
-        const r: HydrateResult = { ...empty, ...bg, scanned: scan.map.size, refusedProducers: refused, acceptedProducers: accepted.length };
+        const r: HydrateResult = { ...empty, ...bg, scanned: scan.map.size, refusedProducers: refused, acceptedProducers: accepted.length, peerAhead };
         deps.log?.('sidecar-hydrate', r);
         return r;
     }
@@ -295,6 +332,7 @@ export async function hydrateFromSidecar(deps: HydrateDeps): Promise<HydrateResu
         skippedPartialNotes,
         refusedProducers: refused,
         acceptedProducers: accepted.length,
+        peerAhead,
         hydratedNotePaths: fileRecords.map(r => r.note_path),
     };
     deps.log?.('sidecar-hydrate', result);

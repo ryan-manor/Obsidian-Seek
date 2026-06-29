@@ -3,8 +3,10 @@
 // eviction of IndexedDB on iOS. Lifted from the validated spike at
 // github.com/tooape/embeddinggemmaiostest (baseline commit c7198ce) and adapted
 // for production Seek:
-//   - 436 B fixed record stride [q:int8×384 | s:f32 | signbits:48] — the
-//     persisted DB v6 tiers verbatim, NOT fp32 (hydration is a byte copy).
+//   - fixed record stride [q:int8×dim | s:f32 | signbits:ceil(dim/8) | crc] — the
+//     persisted DB v6 tiers verbatim, NOT fp32 (hydration is a byte copy). The
+//     stride is derived from the active model's dim (see Q_BYTES below), so a
+//     model swap re-sizes it automatically; metaAccepts gates cross-dim hydration.
 //   - per-device `index.<deviceId>.jsonl` — every file has exactly one writer,
 //     readers union all devices' jsonls. Sync providers never merge, so a shared
 //     jsonl would lose writes / spawn conflict copies (the shared-NDJSON-log
@@ -16,16 +18,23 @@
 //     delete must never erase device B's live copy of the same content-hash id.
 //   - 4 MB shard cap (Obsidian Sync's default per-file limit is 5 MB).
 //
-// This module is a pure file-format library: it knows nothing about IndexStore,
-// chunking, or the model. SidecarSync (sidecar-sync.ts) is the orchestration.
+// This module is a file-format library: it knows nothing about IndexStore or
+// chunking. Its ONE model dependency is the embedding dimension
+// (ACTIVE_MODEL_SPEC.dim), which sets the record stride. SidecarSync
+// (sidecar-sync.ts) is the orchestration.
 
 import type { DataAdapter } from 'obsidian';
+import { ACTIVE_MODEL_SPEC } from './model-registry';
 
 // ---- record layout (matches IndexStore DB v6 persisted tiers) ----
 
-export const Q_BYTES = 384; // int8 rerank tier, one byte per dim (granite-r2 / ml97)
+// Q_BYTES / SIGN_BYTES are DERIVED from the active model's embedding dimension
+// (the single source — model-registry.ts), so the record stride tracks the model
+// automatically and can never disagree with embedder.EMBEDDING_DIM or the iframe's
+// OUTPUT_DIM. SIGN_BYTES === ceil(dim/8) matches binary.ts packSignBits() exactly.
+export const Q_BYTES = ACTIVE_MODEL_SPEC.dim; // int8 rerank tier, one byte per dim
 export const S_BYTES = 4; // f32 dequant scale (little-endian)
-export const SIGN_BYTES = 48; // packed sign bits for the candidate tier (384 / 8)
+export const SIGN_BYTES = (Q_BYTES + 7) >> 3; // packed sign bits for the candidate tier (ceil(dim/8))
 export const CRC_BYTES = 4; // CRC-32 over [q|s|sign] — detects in-range sync bit-rot (GAP-1)
 export const RECORD_PAYLOAD_BYTES = Q_BYTES + S_BYTES + SIGN_BYTES; // 436 — the CRC covers exactly this prefix
 export const VEC_BYTES = RECORD_PAYLOAD_BYTES + CRC_BYTES; // 440 — fixed per-record stride
@@ -241,10 +250,22 @@ export async function listDeviceJsonls(adapter: DataAdapter, indexDir: string): 
 // when no device file has changed since the last run — a handful of stat calls
 // vs. re-reading and re-chunking every note. Any append (size/mtime) or new
 // device file (path/count) changes the signature; a missing stat sorts to -1.
-export async function sidecarDirSignature(adapter: DataAdapter, indexDir: string): Promise<string> {
+//
+// `selfDeviceId` (when supplied) excludes the LOCAL device's own jsonl from the
+// signature, so a device's own appends cannot wake its own reconcile — only a
+// PEER change should. Without this, a mobile catch-up burst writing to
+// index.<self>.jsonl flips the signature and self-triggers a whole-vault
+// reChunkLive, the device's own writes endlessly waking its own sweep. Own
+// writes never carry new peer data (the local index already has them), so the
+// exclusion loses nothing; the empty-store branch in shouldReconcileSidecar
+// still forces recovery for an evicted/fresh device regardless. The persisted
+// and live signatures must both be computed with the SAME selfDeviceId for the
+// comparison to hold.
+export async function sidecarDirSignature(adapter: DataAdapter, indexDir: string, selfDeviceId?: string): Promise<string> {
     const jsonls = await listDeviceJsonls(adapter, indexDir);
     const parts: string[] = [];
     for (const p of jsonls) {
+        if (selfDeviceId && deviceIdFromJsonlPath(p) === selfDeviceId) continue;
         const st = await adapter.stat(p).catch(() => null);
         parts.push(`${p}:${st?.size ?? -1}:${st?.mtime ?? -1}`);
     }

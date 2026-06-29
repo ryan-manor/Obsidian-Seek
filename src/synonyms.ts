@@ -29,9 +29,9 @@
 // stoplist + depluralizer pipeline as queries (bm25.ts processTerm); the
 // feature is untested on non-English vaults by construction.
 
-import MiniSearch from 'minisearch';
 import type { Chunk, ChunkMeta } from './chunker';
 import { extractNoteName, processQueryTerm } from './bm25';
+import { seekTokenize } from './tokenize';
 
 // Mate score discount, mirroring the harness arm (w=0.8 swept best on the
 // personal eval; cf. MiniSearch's own fuzzy weight 0.45 / prefix 0.375).
@@ -62,16 +62,41 @@ export interface SynonymMap {
     stats: SynonymStats;
 }
 
-const tokenizeFn = MiniSearch.getDefault('tokenize') as (text: string) => string[];
-
 // A class member is usable only if it survives the query pipeline as exactly
 // ONE token (multi-token alias phrases are v2), ≥2 chars, not purely numeric.
+//
+// Tokenized with seekTokenize — the SAME analyzer the index AND query use — in its
+// CANONICAL stream (derived:false): possessive-strip + CJK segmentation, but NOT
+// the additive glue/camelCase recall forms (which would mis-reject a single
+// camelCase alias like "MemGraph" as multi-token). This retires the last caller of
+// MiniSearch.getDefault('tokenize') (audit 2026-06-29 #3), so tokenize.ts's "sole
+// tokenizer" invariant is true again, and a CJK alias no longer forms a dead class
+// the segmented query side can never trigger. Eval-gated as a strict no-op:
+// identical synonym dictionary AND retrieval on personal/dnd/myvault
+// (synonym_tokenizer_arm.py) — those vaults carry no possessive/CJK/\p{Sm} alias,
+// the only members where the two tokenizers' single-token verdict diverges.
 function singleToken(member: string): string | null {
-    const raw = tokenizeFn(member);
+    const raw = seekTokenize(member, { derived: false });
     if (raw.length !== 1) return null;
     const t = processQueryTerm(raw[0]);
     if (t === null || t.length < 2 || /^\d+$/.test(t)) return null;
     return t;
+}
+
+// Cheap, CONSERVATIVE "could this chunk's note affect the dictionary?" probe
+// for the incremental rebuild gate (search.ts applyDelta). The dictionary is a
+// pure function of alias-bearing notes: buildClasses keeps a class only when it
+// has ≥2 single-token members, and a note's name supplies at most one, so a
+// note with no frontmatter aliases NEVER forms a class. A delta that adds or
+// removes no alias-bearing row therefore cannot change the dictionary.
+//
+// Conservative on purpose: a declared alias that tokenizes to nothing usable
+// still returns true here, so the gate may over-trigger a harmless no-op
+// rebuild — but it never UNDER-triggers, which would be a correctness bug
+// (stale mates). Mirrors the `c.metadata?.aliases` access buildClasses uses;
+// aliases is a normalized string[] (chunker extractAliases).
+export function chunkDeclaresAlias(c: ChunkMeta): boolean {
+    return (c.metadata?.aliases?.length ?? 0) > 0;
 }
 
 // One equivalence class per note: single-token members of {note name} +

@@ -23,12 +23,12 @@ describe('toDisplayForm — canonical note name (basename only)', () => {
 
     it('drops the alias, keeping the target basename', () => {
         // Per the agreed policy: alias is display chrome; index the note name.
-        expect(toDisplayForm('[[Jane Doe|Alex]]')).toBe('Jane Doe');
+        expect(toDisplayForm('[[Alex Goel|Alex]]')).toBe('Alex Goel');
         expect(toDisplayForm('[[San Francisco|SF]]')).toBe('San Francisco');
     });
 
     it('drops #heading and ^block refs', () => {
-        expect(toDisplayForm('[[Project Atlas#Status]]')).toBe('Project Atlas');
+        expect(toDisplayForm('[[Project Eames#Status]]')).toBe('Project Eames');
         expect(toDisplayForm('[[Meeting Notes^abc123]]')).toBe('Meeting Notes');
         expect(toDisplayForm('[[Notes/Foo/Bar|Bar#Sec]]')).toBe('Bar');
     });

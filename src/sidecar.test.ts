@@ -545,6 +545,36 @@ describe('sidecarDirSignature', () => {
         const a = adapter();
         expect(await sidecarDirSignature(a, 'no/such/dir')).toBe('');
     });
+
+    it('excludes the local device so its own appends do not move the signature (but a peer append does)', async () => {
+        const a = adapter();
+        await appendOne(a, DIR, 'desktop-aaa', 'c1', tiers(1), 100);  // a peer
+        await appendOne(a, DIR, 'mobile-self', 'm1', tiers(2), 200);  // us
+        const s1 = await sidecarDirSignature(a, DIR, 'mobile-self');
+
+        // A catch-up burst appending to our OWN jsonl must not move the self-excluded
+        // signature — otherwise the device wakes its own whole-vault reconcile.
+        await appendOne(a, DIR, 'mobile-self', 'm2', tiers(3), 300);
+        expect(await sidecarDirSignature(a, DIR, 'mobile-self')).toBe(s1);
+
+        // A PEER append still must move it (real remote arrival → reconcile).
+        await appendOne(a, DIR, 'desktop-aaa', 'c2', tiers(4), 400);
+        expect(await sidecarDirSignature(a, DIR, 'mobile-self')).not.toBe(s1);
+    });
+
+    it('the self-exclusion stops shouldReconcileSidecar firing on an own-jsonl-only change', async () => {
+        const a = adapter();
+        await appendOne(a, DIR, 'desktop-aaa', 'c1', tiers(1), 100);
+        await appendOne(a, DIR, 'mobile-self', 'm1', tiers(2), 200);
+        const persisted = await sidecarDirSignature(a, DIR, 'mobile-self');
+
+        await appendOne(a, DIR, 'mobile-self', 'm2', tiers(3), 300);  // our own burst
+        const live = await sidecarDirSignature(a, DIR, 'mobile-self');
+        // Populated store + unchanged self-excluded sig → no expensive sweep.
+        expect(shouldReconcileSidecar(live, persisted, false)).toBe(false);
+        // But an empty store still forces recovery regardless of the sig.
+        expect(shouldReconcileSidecar(live, persisted, true)).toBe(true);
+    });
 });
 
 // ---- record shape guard (C1): valid-JSON-but-wrong-shape lines are skipped ----

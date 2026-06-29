@@ -46,14 +46,16 @@ export const LOG_SCHEMA_VERSION = 12;
 export interface ChunkMetadata {
     tags: string[];
     aliases: string[];
-    pageType: string;
     created: string | null;
     modified: string | null;
     // All scalar frontmatter values (string-coerced), keyed by frontmatter
     // key — the generic backing store for `[key:value]` inline filters
-    // (context, status, pageType, …). Array fields (tags/aliases) are NOT
-    // duplicated here; they have dedicated fields above. Added when the
-    // inline-filter parser shipped; populated on (re)index.
+    // (context, status, pageType, …) AND the searchable-properties BM25 field.
+    // No frontmatter key gets a dedicated field of its own except tags/aliases
+    // (which are list-valued and have their own operators); everything else,
+    // pageType included, lives here keyed by name. Array fields (tags/aliases)
+    // are NOT duplicated here. Added when the inline-filter parser shipped;
+    // populated on (re)index.
     properties: Record<string, string>;
 }
 
@@ -67,15 +69,46 @@ export interface QueryFilters {
     tagsMatchAll: boolean;
     frontmatter: Record<string, string> | null;
     includePaths: string[] | null;
-    createdAfter: string | null;
-    createdBefore: string | null;
-    modifiedAfter: string | null;
-    modifiedBefore: string | null;
+    // Numeric comparison filters (`[price>50]` / `[price<200]` / `[price=160]`),
+    // value already coerced to a finite number at parse time. Keyed off a
+    // property's DECLARED type (Number), not its name — see FilterContext below
+    // and [[Seek Typed-Value Filters Design]]. All operators are value-INCLUSIVE:
+    // `>`/`<` keep on/above and on/below the bound, `=` is exact. Null = none.
+    numeric: Array<{ key: string; op: '<' | '>' | '='; value: number }> | null;
+    // Date-range filters (`after:D` / `before:D`), both day-inclusive. These read
+    // the SINGLE date field the user selected for Recency (resolved per-chunk via
+    // FilterContext.dateField), so they only bind when Recency is ON. Raw date
+    // strings (parseDateMs-able); the inclusive bounds are computed in the matcher.
+    dateAfter: string | null;
+    dateBefore: string | null;
+    // Keys where a comparison operator was used on a property that is NOT declared
+    // Number (e.g. `[pageType<notes]`). Such a clause CANNOT be honored numerically,
+    // so the whole query is unsatisfiable → the matcher returns 0 results rather
+    // than silently substring-matching (Decision D3). Carried for diagnostics; the
+    // search UI separately flags the offending pill red. Null = no mismatch.
+    numericTypeMismatch: string[] | null;
     // Bare-word negation (`-term`, Obsidian `-` semantics). Normalized lowercase
     // tokens; a note is excluded if ANY of these appears in its title/content.
     // Unlike the metadata filters above, this is applied note-level in search()
     // (compileMatcher is metadata-only and can't see content), not in the matcher.
     exclude: string[] | null;
+}
+
+// Vault-specific facts the PURE parser/matcher (query-parser.ts) can't read for
+// themselves — they import only types + a date helper, never `obsidian`. The call
+// site (search.ts, which has `app` + `settings`) resolves this once and threads it
+// through parseQuery()/compileMatcher(). Optional/defaulted everywhere so existing
+// tests and ad-hoc callers keep working (no ctx ⇒ permissive: any key may compare,
+// dates use `created`). See [[Seek Typed-Value Filters Design]] §Architecture.
+export interface FilterContext {
+    // The date field `before:`/`after:` target — the user's Recency selection.
+    // null when Recency is OFF, which is how the parser knows to leave a typed
+    // `before:`/`after:` as plain search text instead of binding a date filter.
+    dateField: { key: RecencyKeyChoice; createdProp: string } | null;
+    // Properties declared Number in Obsidian's type registry. A comparison on a
+    // key outside this set is a type mismatch (Decision D3); a key inside it is a
+    // numeric filter (and reaches the `[` autocomplete past the cardinality gate).
+    numericKeys: Set<string>;
 }
 
 export interface Chunk {
@@ -187,16 +220,20 @@ export interface SeekSettings {
 
     // Which per-chunk date "recent" means, vault-wide — the GLOBAL definition
     // behind the recency ε-tiebreaker (ranker.ts), the S1 recency candidate arm,
-    // and the filter-only browse sort (all read it through fusion.ts recencyDate,
-    // so they cannot disagree). 'created' (default) = frontmatter `created` with
-    // mtime fallback — copy-proof, and matches the dated-instance semantics
-    // episodic queries want. 'modified' = file mtime as of indexing, i.e.
-    // edit-recency — an explicit opt-in, because mtime is silently mass-
-    // corrupted by vault copies, iCloud sync, and bulk plugin edits. Pick the
-    // vault's definition once and live with it; applied per-search (no reindex,
-    // both dates are already in the index). [[Seek Rel]] §Recency Plan 2026-06-11.
-    // (Replaces `recencyWeight`, the parked blend weight deleted 2026-06-11 with
-    // the rest of the zombie recency machinery; a stale persisted value is inert.)
+    // the filter-only browse sort, AND the before:/after: date filter (all read
+    // it through fusion.ts recencyDate, so they cannot disagree). 'modified'
+    // (DEFAULT) = file mtime as of indexing: the ONLY date every note is
+    // guaranteed to carry, so it's the only generic default we can bank on
+    // across vaults — at the cost of being edit-recency, silently churned by
+    // vault copies, iCloud sync, and bulk plugin edits. 'created' = a frontmatter
+    // date property (createdProp, with filename-date then mtime fallback) —
+    // copy-proof and matches the dated-instance semantics episodic queries want,
+    // but it assumes the vault carries such a property, so it's an explicit
+    // opt-in via the date-field picker, not the default. Applied per-search (no
+    // reindex, both dates are already in the index). [[Seek Rel]] §Recency Plan
+    // 2026-06-11. (Replaces `recencyWeight`, the parked blend weight deleted
+    // 2026-06-11 with the rest of the zombie recency machinery; a stale persisted
+    // value is inert.)
     recencyKey: RecencyKeyChoice;
 
     // Which frontmatter property holds a note's creation date. `created` is
@@ -260,7 +297,7 @@ export interface SeekSettings {
     // being typed ("amster", "roadmap for concep", "lr ac rearch"), and
     // neither exact, fuzzy (edit-1), nor any scorer change can reach
     // "rearchitecture" from "rearch" — only expansion can. Eval
-    // (~/eval-pack prefix_arm.py, α=0.80): personal 483q
+    // (~/seek-eval-pack prefix_arm.py, α=0.80): personal 483q
     // 0.8666→0.8730 bin nDCG@10, gold@1 +1.1pt with the wins concentrated
     // on truncated/typeahead queries; D&D and code stress sets exactly
     // unchanged; capture cap-004 target rank 5→2. Expanding ALL tokens was
@@ -277,7 +314,7 @@ export interface SeekSettings {
     // Guards: ambiguous tokens (shared by >1 class) neither trigger NOR get
     // injected (symmetric — 4 pages aliased "rohit" disable that bridge
     // entirely), and tokens matching >5% of chunks are refused (junk-alias
-    // ceiling). Eval (~/eval-pack, 2026-06-10): personal +0.0015 bin
+    // ceiling). Eval (~/seek-eval-pack, 2026-06-10): personal +0.0015 bin
     // nDCG@10 over the prefix baseline at w=0.8. The native-attribution gate
     // showed MiniSearch's raw ×quality double-credit ERASES that gain at
     // every weight (it doubles alias hub/sibling pages), so bm25.ts rescales
@@ -340,7 +377,7 @@ export interface SeekSettings {
     // term ⇒ factor 1, a no-op). Unlike hard AND it never zeroes a partial match,
     // so recall is intact (hard AND wiped ALL lexical signal for 19% of relevant
     // notes on the 482-q eval and LOST nDCG; coverage was +0.005, monotone ≥ OR
-    // at every alpha — ~/eval/and_coverage_eval.py, 2026-06-09).
+    // at every alpha — ~/seek-personal-eval/and_coverage_eval.py, 2026-06-09).
     // Applied per-search (no reindex).
     bm25Coverage: boolean;
 
@@ -461,27 +498,27 @@ export type RecencyKeyChoice = 'created' | 'modified';
 export type SidecarIndexLocation = 'config' | 'visible';
 
 export const DEFAULT_SETTINGS: SeekSettings = {
-    denseWeight: 0.80,         // BOUND-NORM scale dense weight; mirrors DEFAULT_RANKING_CONFIG.alpha (NOT the 0.92 empirical-max point)
+    denseWeight: 0.85,         // BOUND-NORM scale dense weight; mirrors DEFAULT_RANKING_CONFIG.alpha. Raised 0.80→0.85 (2026-06-27 re-eval): de-franken made BM25 more assertive, so a fixed α=0.80 over-weighted lexical; 0.85 is a cross-corpus win (Example Vault flat-to-+, BEIR +0.01–0.02). Migrated via rev 8. (NOT the 0.92 empirical-max point)
     navTitleBoost: 0.5,        // Title-bonus "Default" stage (segmented 0=Off / 0.5=Default / 0.8=High); softened from the 0.8 swept knee per the 2026-06-19 settings ratification — see field comment
-    recencyKey: 'created',     // global definition of "recent" (ε-tiebreaker + recency arm + browse sort); 'modified' = explicit mtime opt-in
+    recencyKey: 'modified',    // global definition of "recent" (ε-tiebreaker + recency arm + browse sort + before:/after:); mtime is the only universally-present date → the generic default; 'created' (a frontmatter date prop, see createdProp) is an opt-in for true creation-recency
     createdProp: 'created',    // frontmatter property holding the creation date (vault convention; falls back to filename date, then mtime)
     recencyEpsilon: 0,         // ships Off (Recency segmented Off=ε0 / Default=ε0.04·180d / High=ε0.1·270d); was a 0.02 tiebreaker pre-2026-06-19 ratification — additive ε in final = hybrid + ε·recency + titleBoost (see field comment)
     recencyHalfLifeDays: 180,  // recency decay HALF-LIFE in days (0.5^(daysOld/HL)); 180 = 06-04 operating point, shorten (7–30) to concentrate on the last days
     fuzzyEnabled: true,        // typo tolerance ON by default (edit dist scales by term length, ≤3 exact; see bm25.ts FUZZY_BY_LENGTH); +3–4/40 gold@1 on typo'd entity queries, ns cost on clean
     prefixLastToken: true,     // last-token prefix expansion ON by default; +0.0064 personal nDCG, stress sets clean; see field comment
     synonymExpansion: true,    // ON (hidden) per the 2026-06-19 ratification; alias-dictionary query expansion (Lr↔Lightroom); BM25-dict refit, no reindex — see field comment
-    searchableProperties: true, // frontmatter values as a BM25 field; ON as of 2026-06-25 — channel eval measured +0.05 nDCG@10 (place-note recall: austin 22→3, zurich 33→7; combo_eval). Migrated on via rev 7; see field comment
+    searchableProperties: true, // frontmatter values as a BM25 field; ON as of 2026-06-25 — My-Vault channel eval measured +0.05 nDCG@10 (place-note recall: austin 22→3, zurich 33→7; combo_eval). Migrated on via rev 7; see field comment
     headingsField: true,       // ON (hidden) per the 2026-06-19 ratification; heading path as a BM25 field; BM25 refit, no reindex — see field comment
     boostedBm25: false,        // "Boosted BM25" preset (aliases 9 / tags 2 / headings 4); OFF — opt-in field-weight lever, implies heading indexing; see field comment
     bm25Coverage: true,        // soft-AND: scale BM25 by matched-query-term fraction (multi-term only); see field comment
     honorIgnoredFolders: true, // Archive et al. are soft-deletes by default
     indexBases: true,          // ON: index .base files (Obsidian Bases) as synthetic docs; preserves the feature's unconditional pre-toggle behavior
-    showScores: true,          // ON: per-result score line (Matching % · recency · title); auto-disabled until the corpus is calibrated (≥200 notes + full pass)
+    showScores: false,         // OFF by default: per-result score line (Matching % · recency · title); opt-in via Display settings. (Also auto-hidden until the corpus is calibrated — ≥200 notes + full pass.) Default-only flip, no migration: installs that already persisted showScores keep their choice.
     verboseTrace: false,       // OFF: persist only the top-10 ranking trace per search (what the report shows); ON = full 50-deep tail for offline eval. Diagnostic-only, no UI
     showHotkeyHints: true,     // ON: show the modal footer keyboard-hint bar + result counter; OFF = full-results-only modal
     sidecarEnabled: true,      // ON (hidden) per the 2026-06-19 ratification; vault-file index persistence for iOS-eviction survival + cross-device sync; only Index location stays user-facing; seeds on next reindex — see field comment
     sidecarIndexLocation: 'config', // hidden literal '.obsidian/plugins/seek/index'; 'visible' = vault-root 'Seek Index/' for split-config Obsidian Sync; see field comment
-    settingsRev: 7,            // current schema rev; bump alongside a migration in main.ts onload (rev 7 = 2026-06-25 searchableProperties default ON)
+    settingsRev: 8,            // current schema rev; bump alongside a migration in main.ts onload (rev 8 = 2026-06-27 denseWeight 0.80→0.85 re-eval)
 };
 
 // One-time settings migrations, keyed on the persisted settingsRev. Applied to the
@@ -528,8 +565,8 @@ export function migrateSettings(raw: Partial<SeekSettings>): Partial<SeekSetting
         delete legacy.debugMode;
     }
     // Rev 7 (2026-06-25 searchableProperties default ON): the BM25 frontmatter-values
-    // field flips OFF→ON after the channel eval measured +0.05 nDCG@10 (place-note
-    // recall). Installs created under the old default persisted `false`, so a bare
+    // field flips OFF→ON after the My-Vault channel eval measured +0.05 nDCG@10 (place-
+    // note recall). Installs created under the old default persisted `false`, so a bare
     // DEFAULT_SETTINGS flip would be a silent no-op on them — migrate them. The toggle
     // still exists, so move only an install still on the old default; a deliberate post-
     // rev-7 `false` is indistinguishable from the default here (true was never persistable
@@ -539,7 +576,15 @@ export function migrateSettings(raw: Partial<SeekSettings>): Partial<SeekSetting
     if (fromRev < 7 && (raw.searchableProperties === undefined || raw.searchableProperties === false)) {
         raw.searchableProperties = true;
     }
-    raw.settingsRev = 7;
+    // Rev 8 (2026-06-27 field-weight re-eval): denseWeight default moves 0.80 → 0.85.
+    // The de-franken BM25 (more assertive lexical) made a fixed α=0.80 over-weight the
+    // lexical channel; the cross-corpus re-sweep (Example Vault + enriched BEIR) put the knee
+    // at ~0.85. Move ONLY an install still on the exact old default 0.80 — a hand-tuned
+    // value survives, and an undefined falls through to the new DEFAULT_SETTINGS (0.85),
+    // so a pre-bound install whose 0.92 the rev-2 surgery already dropped lands on 0.85
+    // too. Score-time only: no reindex/refit (the dense weight is applied at fusion).
+    if (fromRev < 8 && raw.denseWeight === 0.80) raw.denseWeight = 0.85;
+    raw.settingsRev = 8;
     return raw;
 }
 
@@ -759,7 +804,11 @@ export interface IndexCompleteEntry {
     // currently loaded runtime.
     dtype: Dtype;
     embeddingDim: number;
-    filesIndexed: number;
+    filesIndexed: number;          // files STARTED (== input length on a full reindex)
+    // The subset of filesIndexed whose file-record was actually written (commitFile
+    // succeeded). Drives the catch-up drain's forward-progress accounting — distinct from
+    // filesIndexed whenever a file is empty/skipped/budget-deferred. See embedAndCommitFiles.
+    committedFilePaths: string[];
     chunksIndexed: number;
     vectorsWritten: number;
     filesSkippedError: number;

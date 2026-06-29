@@ -11,7 +11,7 @@
 // channel per query, which manufactured a false 1.00 dense winner on OOV/no-
 // opinion queries (the empty-note/opaque-ID bug). That was first patched with a
 // lexical-only floor + an absolute-cosine confidence gate (magic 0.79/0.83
-// thresholds), then replaced wholesale: an eval study (research + ~/eval-oov
+// thresholds), then replaced wholesale: an eval study (research + ~/seek-dnd-eval
 // OOV slice) showed per-query min-max IS the root cause and TM2C2 theoretical
 // normalization (fusion.ts) fixes it constant-free while improving aggregate
 // nDCG. The gate is deleted; see [[seek-empty-stub-dense-pollution]].
@@ -46,7 +46,9 @@ export const DEFAULT_RANKING_CONFIG: RankingConfig = {
     // now (a weak best match no longer gets a forced 1.0), not by the weight.
     // The live value comes from SeekSettings.denseWeight (search.ts); this
     // default backs the eval harness + any caller that omits config.
-    alpha: 0.80,
+    // 0.80 → 0.85 (2026-06-27 re-eval): de-franken BM25 is more assertive, so the
+    // joint optimum moved up; mirrors DEFAULT_SETTINGS.denseWeight (types.ts rev 8).
+    alpha: 0.85,
     // ε-TIEBREAKER (2026-06-11, [[Seek Rel]] §Recency Plan 2026-06-11) — the
     // additive nudge in final = hybrid + ε·recency + titleBoost. Deliberately
     // sized BELOW any meaningful score gap so it can only break genuine

@@ -96,7 +96,7 @@ function attach(): { store: IndexStore; db: ReturnType<typeof makeDb> } {
 function chunk(id: string, content: string, notePath = `${id}.md`): Chunk {
     return {
         chunk_id: id, title: `T-${id}`, content, note_path: notePath,
-        heading_path: [], metadata: { tags: [], aliases: [], pageType: '', created: null, modified: null, properties: {} },
+        heading_path: [], metadata: { tags: [], aliases: [], created: null, modified: null, properties: {} },
         start_line: 0, end_line: 0,
     };
 }

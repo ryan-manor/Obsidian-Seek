@@ -6,13 +6,24 @@ import { SuggestEngine } from './suggest';
 function fakeApp(opts: {
     tags: Record<string, number>;
     files: Array<{ parent: string; fm?: Record<string, unknown> }>;
+    // Properties declared Number in the (faked) type registry — drives the numeric
+    // inline-filter branch (enumerateNumberPropertyNames reads metadataTypeManager).
+    numberProps?: string[];
+    // Properties declared Date / Date & time — drives the date-key exclusion
+    // branch (enumerateDatePropertyNames reads the same registry).
+    dateProps?: string[];
 }) {
     const files = opts.files.map((f, i) => ({
         path: `${f.parent}/n${i}.md`,
         parent: { path: f.parent },
         __fm: f.fm,
     }));
+    const types = Object.fromEntries([
+        ...(opts.numberProps ?? []).map(name => [name, { name, type: 'number' }]),
+        ...(opts.dateProps ?? []).map(name => [name, { name, type: 'date' }]),
+    ]);
     return {
+        metadataTypeManager: { getAllProperties: () => types },
         metadataCache: {
             getTags: () => opts.tags,
             getFileCache: (f: { __fm?: Record<string, unknown> }) => ({ frontmatter: f.__fm }),
@@ -186,8 +197,8 @@ describe('SuggestEngine — wikilink values (the placeLoc capture, 2026-06-12)',
         files: [
             ...Array.from({ length: 3 }, () => ({ parent: 'Places', fm: { placeLoc: '[[Austin]]' } })),
             ...Array.from({ length: 2 }, () => ({ parent: 'Places', fm: { placeLoc: '[[Paris]]' } })),
-            { parent: 'Places', fm: { visited: '[[2026-05-31|May 31]]' } },
-            { parent: 'Places', fm: { visited: '[[2026-05-31|May 31]]' } },
+            { parent: 'Places', fm: { visited: '[[San Francisco|SF]]' } },
+            { parent: 'Places', fm: { visited: '[[San Francisco|SF]]' } },
         ],
     }));
 
@@ -204,7 +215,7 @@ describe('SuggestEngine — wikilink values (the placeLoc capture, 2026-06-12)',
 
     it('offers an aliased wikilink as its target basename only (display-form; alias dropped, still binds by substring)', () => {
         const rows = places().listSuggestions('[visited:', 8);
-        expect(rows[0]?.value).toBe('visited:2026-05-31');
+        expect(rows[0]?.value).toBe('visited:San Francisco');
     });
 });
 
@@ -241,6 +252,85 @@ describe('SuggestEngine — wide categorical keys (cardinality gate)', () => {
 
     it('still drops a per-note-unique key (distinct ≈ total → free text)', () => {
         expect(wide(1).complete('[city:City4', true)).toBeNull();
+    });
+});
+
+describe('SuggestEngine — numeric keys (typed-value filters)', () => {
+    // `price` is per-note-unique (distinct ≈ total) so the cardinality gate drops
+    // it from categorical completion — the original `[price` autocomplete gap.
+    // Declaring it Number must bring it back in the `[` key-menu.
+    const build = (numberProps: string[]) => new SuggestEngine().build(fakeApp({
+        tags: {},
+        // 45 distinct, per-note-unique prices: >40 AND distinct ≈ total, so the
+        // categorical gate drops it (exactly the original `[price` bug shape).
+        files: Array.from({ length: 45 }, (_, i) => ({ parent: 'Notes', fm: { price: `${100 + i}` } })),
+        numberProps,
+    }));
+
+    it('an untyped numeric-looking key stays dropped (registry-only detection, D1)', () => {
+        expect(build([]).complete('[pric', true)).toBeNull();
+        expect(build([]).isNumericKey('price')).toBe(false);
+    });
+
+    it('a Number-typed key surfaces in the [ key-menu past the cardinality gate', () => {
+        const e = build(['price']);
+        expect(e.complete('[pric', true)?.accept).toBe('[price:');
+        expect(e.isNumericKey('price')).toBe(true);
+    });
+
+    it('the Number-typed key also appears as a dropdown row', () => {
+        const rows = build(['price']).listSuggestions('[pric', 8);
+        expect(rows.map(r => r.value)).toContain('price:');
+    });
+
+    it('reports its real note-count, not 0 (high-cardinality keyTotals fallback)', () => {
+        // 45 notes carry `price`; the key is dropped from the categorical value
+        // dictionary, so the `· N notes` hint must come from keyTotals — a 0 here
+        // is the original "price showing no notes" bug.
+        const rows = build(['price']).listSuggestions('[pric', 8);
+        const priceRow = rows.find(r => r.value === 'price:');
+        expect(priceRow?.count).toBe(45);
+    });
+});
+
+describe('SuggestEngine — date keys excluded by type + value shape (de-specialized)', () => {
+    // Replaces the old hardcoded date NAME blocklist (created/modified/due/
+    // completedDate/dateLink/…). Dates are queried via before:/after:/recency,
+    // never picked categorically — so two registry-/shape-driven signals keep
+    // them out without naming any per-vault key.
+
+    it('a registry Date-typed key is excluded by TYPE, even when its value is not date-shaped', () => {
+        const files = Array.from({ length: 6 }, () => ({ parent: 'Notes', fm: { reviewed: 'someday' } }));
+        // Declared Date in the registry → excluded, though "someday" is not date-shaped.
+        const typed = new SuggestEngine().build(fakeApp({ tags: {}, files, dateProps: ['reviewed'] }));
+        expect(typed.complete('[rev', true)).toBeNull();
+        // Control: identical data, NOT typed → just a categorical text key, offered.
+        const untyped = new SuggestEngine().build(fakeApp({ tags: {}, files }));
+        expect(untyped.complete('[rev', true)?.accept).toBe('[reviewed:');
+    });
+
+    it('an untyped key with date-shaped values is excluded by VALUE shape (the common My-Vault `due:` case)', () => {
+        // 6 repeats → would sail past the cardinality gate; shape guard drops it.
+        const dated = new SuggestEngine().build(fakeApp({
+            tags: {},
+            files: Array.from({ length: 6 }, () => ({ parent: 'Notes', fm: { due: '2026-06-29' } })),
+        }));
+        expect(dated.listSuggestions('[du', 8).map(r => r.value)).not.toContain('due:');
+        // Same key, categorical (non-date) values → offered. Proves exclusion is
+        // by shape, not by a hardcoded `due` name.
+        const categorical = new SuggestEngine().build(fakeApp({
+            tags: {},
+            files: Array.from({ length: 6 }, () => ({ parent: 'Notes', fm: { due: 'soon' } })),
+        }));
+        expect(categorical.complete('[du', true)?.accept).toBe('[due:');
+    });
+
+    it('a formerly-blocklisted vault key (week) now rides the generic path when categorical', () => {
+        const e = new SuggestEngine().build(fakeApp({
+            tags: {},
+            files: Array.from({ length: 6 }, () => ({ parent: 'Notes', fm: { week: 'W26' } })),
+        }));
+        expect(e.listSuggestions('[we', 8).map(r => r.value)).toContain('week:');
     });
 });
 

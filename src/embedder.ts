@@ -132,12 +132,16 @@ export const LOCAL_MODEL = {
 };
 const PLUGIN_VERSION = '0.0.1';
 
-// Output vector dimension. granite-r2 is 384-d native (NO Matryoshka — unlike
-// Gemma's 768→512 slice), so the iframe takes the full CLS-pooled, L2-normalized
-// vector and the slice in iframe-runner.ts is a pass-through. Mirrors OUTPUT_DIM
-// there; kept in sync by convention. If you change this, bump DB_VERSION in
-// index-store.ts so the dim-incompatible vectors are dropped.
-export const EMBEDDING_DIM = 384;
+// Output vector dimension. SINGLE SOURCE OF TRUTH = the active model spec's
+// `dim` (model-registry.ts). The iframe's OUTPUT_DIM and the sidecar record
+// stride (sidecar.ts Q_BYTES/SIGN_BYTES) derive from this SAME spec field, so a
+// model swap can't leave them silently disagreeing (the old failure mode: write
+// N-d vectors into a 384-byte stride). granite-r2 is 384-d native (NO
+// Matryoshka), so the slice in iframe-runner.ts is a pass-through; a Matryoshka
+// model would declare a smaller `dim` and the slice truncates to it. When you
+// change the active model, bump DB_VERSION in index-store.ts so dim-incompatible
+// local vectors are dropped. See dim-consistency.test.ts for the invariant.
+export const EMBEDDING_DIM = ACTIVE_MODEL_SPEC.dim;
 
 export class LocalEmbedder {
     private runner = new IframeRunner();

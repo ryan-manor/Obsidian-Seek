@@ -12,7 +12,7 @@
 // The only indexable signal in a .base is:
 //   - each view's NAME (becomes the chunk title + heading_path, so it earns the
 //     3.0x BM25 headings field and enters the dense channel)
-//   - the string LITERALS inside filter expressions ("writing", "Team Wiki",
+//   - the string LITERALS inside filter expressions ("writing", "Example Wiki",
 //     "Clothing"), which name the domain a view selects
 //
 // Deliberately NOT indexed (chosen scope: "view name + filter literals"):

@@ -9,7 +9,7 @@ function makeChunk(id: string, title: string, content: string, tags: string[] = 
         content,
         note_path: `${id}.md`,
         heading_path: [],
-        metadata: { tags, aliases, pageType: '', created: null, modified: null, properties: {} },
+        metadata: { tags, aliases, created: null, modified: null, properties: {} },
         start_line: 0,
         end_line: 0,
     };
@@ -553,10 +553,10 @@ describe('S2 per-field stopword exemption (name-as-stopword)', () => {
         // "the" is indexed in doc b's title now, but the query has content
         // words, so the fallback must NOT fire; "the" never gets queried.
         const idx = fitBM([
-            makeChunk('a', 'Atlas Project', 'body one'),
+            makeChunk('a', 'Eames Project', 'body one'),
             makeChunk('b', 'The Daily', 'body two'),
         ]);
-        const s = idx.getScores('the atlas project');
+        const s = idx.getScores('the eames project');
         expect(s[0]).toBeGreaterThan(0);
         expect(s[1]).toBe(0); // reachable only via "the" → must not match
     });
@@ -630,7 +630,7 @@ describe('FUZZY_BY_LENGTH predicate', () => {
         expect(FUZZY_BY_LENGTH('cat')).toBe(1);           // 3 → edit-1 (first fuzzy rung)
         expect(FUZZY_BY_LENGTH('data')).toBe(1);          // 4 → edit-1
         expect(FUZZY_BY_LENGTH('graph')).toBe(1);         // 5 → edit-1
-        expect(FUZZY_BY_LENGTH('atlas')).toBe(1);         // 5 → edit-1 (the motivating token)
+        expect(FUZZY_BY_LENGTH('verge')).toBe(1);         // 5 → edit-1 (the motivating token)
         expect(FUZZY_BY_LENGTH('matrix')).toBe(2);        // 6 → edit-2 (first edit-2 rung)
         expect(FUZZY_BY_LENGTH('granite')).toBe(2);       // 7 → edit-2
         expect(FUZZY_BY_LENGTH('keywords')).toBe(2);      // 8 → edit-2
@@ -702,6 +702,20 @@ describe('searchable properties field', () => {
         // display-form indexes the target basename only — the "ATX" alias is
         // dropped (no path/alias stuffing in this boosted field).
         expect(extractPropertiesText(c)).toBe('Austin personal');
+    });
+
+    it('pageType folds into the generic properties field by name (no dedicated page_type field)', () => {
+        // De-specialization 2026-06-29: `pageType` (a Task-Notes / this-vault
+        // convention, not an Obsidian builtin) no longer gets a dedicated
+        // `page_type` BM25 field. It rides the generic properties field like any
+        // other scalar key — so it's only lexically searchable when the
+        // searchable-properties setting is on, while `[pageType:x]` filters and
+        // the dense suffix (other code paths) keep working regardless.
+        const note = placeChunk('mtg', 'Standup', { pageType: 'meeting', context: 'work' });
+        expect(extractPropertiesText(note)).toBe('meeting work'); // not excluded as machinery
+        expect(fitBM([note]).getScores('meeting')[0]).toBe(0);    // off → invisible to free text
+        const on = fitBM([note], { searchableProperties: true });
+        expect(on.getScores('meeting')[0]).toBeGreaterThan(0);    // on → searchable via properties
     });
 
     it('property values match plain query words only when the field is enabled', () => {

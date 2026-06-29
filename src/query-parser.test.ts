@@ -9,7 +9,17 @@
 
 import { describe, it, expect } from 'vitest';
 import { parseQuery, compileMatcher, matchesFilters, excludedNotePaths } from './query-parser';
-import type { Chunk, ChunkMetadata, QueryFilters } from './types';
+import type { Chunk, ChunkMetadata, QueryFilters, FilterContext } from './types';
+
+// A FilterContext stub: `created` is the date field (Recency ON) and the named
+// keys are Number-typed. Lets the typed-value tests exercise the parser/matcher
+// gates the real search path resolves from app + settings.
+function ctx(numericKeys: string[] = [], dateOn = true): FilterContext {
+    return {
+        dateField: dateOn ? { key: 'created', createdProp: 'created' } : null,
+        numericKeys: new Set(numericKeys),
+    };
+}
 
 // ---- helpers ----
 
@@ -18,7 +28,6 @@ function makeChunk(over: Partial<Omit<Chunk, 'metadata'>> & { metadata?: Partial
     const metadata: ChunkMetadata = {
         tags: [],
         aliases: [],
-        pageType: '',
         created: null,
         modified: null,
         properties: {},
@@ -43,10 +52,10 @@ function filters(over: Partial<QueryFilters>): QueryFilters {
         tagsMatchAll: false,
         frontmatter: null,
         includePaths: null,
-        createdAfter: null,
-        createdBefore: null,
-        modifiedAfter: null,
-        modifiedBefore: null,
+        numeric: null,
+        dateAfter: null,
+        dateBefore: null,
+        numericTypeMismatch: null,
         exclude: null,
         ...over,
     };
@@ -177,44 +186,104 @@ describe('parseQuery / [key:value] frontmatter', () => {
     });
 });
 
-describe('parseQuery / date filters', () => {
-    it('created after', () => {
-        const { filters } = parseQuery('alex [created:>2026-04-01]');
-        expect(filters!.createdAfter).toBe('2026-04-01');
-        expect(filters!.createdBefore).toBeNull();
+describe('parseQuery / date filters (before:/after:)', () => {
+    it('after: extracts a lower bound', () => {
+        const { cleanedQuery, filters } = parseQuery('alex after:2026-04-01', ctx());
+        expect(filters!.dateAfter).toBe('2026-04-01');
+        expect(filters!.dateBefore).toBeNull();
         expect(filters!.frontmatter).toBeNull();
+        expect(cleanedQuery).toBe('alex');
     });
 
-    it('created before', () => {
-        const { filters } = parseQuery('alex [created:<2026-05-01]');
-        expect(filters!.createdBefore).toBe('2026-05-01');
+    it('before: extracts an upper bound', () => {
+        const { filters } = parseQuery('alex before:2026-05-01', ctx());
+        expect(filters!.dateBefore).toBe('2026-05-01');
+        expect(filters!.dateAfter).toBeNull();
     });
 
-    it('modified after', () => {
-        const { filters } = parseQuery('alex [modified:>2026-04-01]');
-        expect(filters!.modifiedAfter).toBe('2026-04-01');
+    it('after: + before: combine into a range', () => {
+        const { filters } = parseQuery('after:2026-01-01 before:2026-06-28', ctx());
+        expect(filters!.dateAfter).toBe('2026-01-01');
+        expect(filters!.dateBefore).toBe('2026-06-28');
     });
 
-    it('modified before', () => {
-        const { filters } = parseQuery('alex [modified:<2026-05-01]');
-        expect(filters!.modifiedBefore).toBe('2026-05-01');
+    it('no ctx (ad-hoc) still parses before:/after: (permissive default)', () => {
+        const { filters } = parseQuery('after:2026-04-01');
+        expect(filters!.dateAfter).toBe('2026-04-01');
     });
 
-    it('date keys are case-insensitive', () => {
-        const a = parseQuery('[Created:>2026-04-01]');
-        expect(a.filters!.createdAfter).toBe('2026-04-01');
-        expect(a.filters!.frontmatter).toBeNull();
-
-        const b = parseQuery('[Modified:<2026-05-01]');
-        expect(b.filters!.modifiedBefore).toBe('2026-05-01');
-        expect(b.filters!.frontmatter).toBeNull();
+    it('Recency OFF (ctx.dateField null) leaves before:/after: as plain text', () => {
+        const { cleanedQuery, filters } = parseQuery('alex after:2026-04-01', ctx([], false));
+        expect(filters).toBeNull();
+        expect(cleanedQuery).toBe('alex after:2026-04-01');
     });
 
-    it('created without operator is frontmatter equality, not a date range', () => {
-        const { filters } = parseQuery('[created:2026-04-01]');
+    it('the old [created:>X] bracket date syntax is gone — now a type mismatch', () => {
+        // `created` is not a Number property, so the comparison is unsatisfiable
+        // (D2 removed the date pseudo-keys; D3 governs the fallout).
+        const { filters } = parseQuery('[created:>2026-04-01]', ctx());
+        expect(filters!.dateAfter).toBeNull();
+        expect(filters!.numericTypeMismatch).toEqual(['created']);
+    });
+
+    it('created without operator is frontmatter equality (substring branch)', () => {
+        const { filters } = parseQuery('[created:2026-04-01]', ctx());
         expect(filters!.frontmatter).toEqual({ created: '2026-04-01' });
-        expect(filters!.createdAfter).toBeNull();
-        expect(filters!.createdBefore).toBeNull();
+        expect(filters!.dateAfter).toBeNull();
+        expect(filters!.dateBefore).toBeNull();
+    });
+});
+
+describe('parseQuery / numeric filters', () => {
+    it('colon-less comparison on a Number key', () => {
+        const { cleanedQuery, filters } = parseQuery('rapha [price>50]', ctx(['price']));
+        expect(filters!.numeric).toEqual([{ key: 'price', op: '>', value: 50 }]);
+        expect(filters!.frontmatter).toBeNull();
+        expect(cleanedQuery).toBe('rapha');
+    });
+
+    it('whitespace and colon are both tolerated', () => {
+        expect(parseQuery('[price > 50]', ctx(['price'])).filters!.numeric).toEqual([{ key: 'price', op: '>', value: 50 }]);
+        expect(parseQuery('[price:>50]', ctx(['price'])).filters!.numeric).toEqual([{ key: 'price', op: '>', value: 50 }]);
+        expect(parseQuery('[price : > 50]', ctx(['price'])).filters!.numeric).toEqual([{ key: 'price', op: '>', value: 50 }]);
+    });
+
+    it('all three operators, value coerced to number', () => {
+        expect(parseQuery('[price<200]', ctx(['price'])).filters!.numeric).toEqual([{ key: 'price', op: '<', value: 200 }]);
+        expect(parseQuery('[price=160]', ctx(['price'])).filters!.numeric).toEqual([{ key: 'price', op: '=', value: 160 }]);
+        expect(parseQuery('[price=50.00]', ctx(['price'])).filters!.numeric).toEqual([{ key: 'price', op: '=', value: 50 }]);
+    });
+
+    it('comparison on a non-Number key is a type mismatch, NOT substring (D3)', () => {
+        const { filters } = parseQuery('[pageType<notes]', ctx(['price']));
+        expect(filters!.numericTypeMismatch).toEqual(['pageType']);
+        expect(filters!.numeric).toBeNull();
+        expect(filters!.frontmatter).toBeNull(); // never falls back to substring
+    });
+
+    it('a non-numeric literal on a Number key is also a mismatch', () => {
+        const { filters } = parseQuery('[price>abc]', ctx(['price']));
+        expect(filters!.numericTypeMismatch).toEqual(['price']);
+        expect(filters!.numeric).toBeNull();
+    });
+
+    it('substring [key:value] is untouched by the comparison branch', () => {
+        const { filters } = parseQuery('[context:work]', ctx(['price']));
+        expect(filters!.frontmatter).toEqual({ context: 'work' });
+        expect(filters!.numeric).toBeNull();
+        expect(filters!.numericTypeMismatch).toBeNull();
+    });
+
+    it('an operator not adjacent to the key stays a substring value', () => {
+        const { filters } = parseQuery('[note:a>b]', ctx(['price']));
+        expect(filters!.frontmatter).toEqual({ note: 'a>b' });
+        expect(filters!.numeric).toBeNull();
+    });
+
+    it('no ctx (ad-hoc) treats any comparison key as numeric (permissive)', () => {
+        const { filters } = parseQuery('[price>50]');
+        expect(filters!.numeric).toEqual([{ key: 'price', op: '>', value: 50 }]);
+        expect(filters!.numericTypeMismatch).toBeNull();
     });
 });
 
@@ -259,9 +328,17 @@ describe('parseQuery / combinations', () => {
     });
 
     it('date + tag', () => {
-        const { filters } = parseQuery('alex [created:>2026-04-01] #meetings/1x1');
-        expect(filters!.createdAfter).toBe('2026-04-01');
+        const { filters } = parseQuery('alex after:2026-04-01 #meetings/1x1', ctx());
+        expect(filters!.dateAfter).toBe('2026-04-01');
         expect(filters!.tags).toEqual(['meetings/1x1']);
+    });
+
+    it('numeric + tag + path', () => {
+        const { cleanedQuery, filters } = parseQuery('rapha [price<200] #brands path:Notes/Gear', ctx(['price']));
+        expect(filters!.numeric).toEqual([{ key: 'price', op: '<', value: 200 }]);
+        expect(filters!.tags).toEqual(['brands']);
+        expect(filters!.includePaths).toEqual(['Notes/Gear']);
+        expect(cleanedQuery).toBe('rapha');
     });
 });
 
@@ -548,50 +625,113 @@ describe('matchesFilters / frontmatter (Obsidian-style: substring + wikilink + q
     });
 });
 
-describe('matchesFilters / dates (missing→reject)', () => {
+describe('matchesFilters / dates (day-inclusive, missing→reject)', () => {
     const c = makeChunk({ metadata: { created: '2026-05-16', modified: '2026-05-19' } });
 
-    it('createdAfter passes when on/after', () => {
-        expect(matchesFilters(c, filters({ createdAfter: '2026-05-01' }))).toBe(true);
+    it('after: passes when on/after the bound', () => {
+        expect(matchesFilters(c, filters({ dateAfter: '2026-05-01' }), ctx())).toBe(true);
+        expect(matchesFilters(c, filters({ dateAfter: '2026-05-16' }), ctx())).toBe(true); // inclusive of the day itself
     });
 
-    it('createdAfter rejects when before', () => {
-        expect(matchesFilters(c, filters({ createdAfter: '2026-06-01' }))).toBe(false);
+    it('after: rejects when before the bound', () => {
+        expect(matchesFilters(c, filters({ dateAfter: '2026-06-01' }), ctx())).toBe(false);
     });
 
-    it('createdBefore passes when on/before', () => {
-        expect(matchesFilters(c, filters({ createdBefore: '2026-05-20' }))).toBe(true);
+    it('before: passes when on/before the bound', () => {
+        expect(matchesFilters(c, filters({ dateBefore: '2026-05-20' }), ctx())).toBe(true);
+        expect(matchesFilters(c, filters({ dateBefore: '2026-05-16' }), ctx())).toBe(true); // inclusive of the day itself
     });
 
-    it('createdBefore rejects when after', () => {
-        expect(matchesFilters(c, filters({ createdBefore: '2026-05-10' }))).toBe(false);
+    it('before: rejects when after the bound', () => {
+        expect(matchesFilters(c, filters({ dateBefore: '2026-05-10' }), ctx())).toBe(false);
     });
 
-    it('missing created date rejects a created filter', () => {
-        const noDate = makeChunk({ metadata: { created: null } });
-        expect(matchesFilters(noDate, filters({ createdAfter: '2026-01-01' }))).toBe(false);
+    it('before: includes a same-day afternoon timestamp (the inclusivity fix)', () => {
+        const afternoon = makeChunk({ metadata: { created: '2026-05-16T15:30:00' } });
+        expect(matchesFilters(afternoon, filters({ dateBefore: '2026-05-16' }), ctx())).toBe(true);
     });
 
-    it('modified range', () => {
-        expect(matchesFilters(c, filters({ modifiedAfter: '2026-05-18' }))).toBe(true);
-        expect(matchesFilters(c, filters({ modifiedAfter: '2026-05-20' }))).toBe(false);
+    it('before: a bare year covers the whole year', () => {
+        const dec = makeChunk({ metadata: { created: '2026-12-31' } });
+        expect(matchesFilters(dec, filters({ dateBefore: '2026' }), ctx())).toBe(true);
+        const next = makeChunk({ metadata: { created: '2027-01-01' } });
+        expect(matchesFilters(next, filters({ dateBefore: '2026' }), ctx())).toBe(false);
+    });
+
+    it('missing date rejects a date filter', () => {
+        const noDate = makeChunk({ metadata: { created: null, modified: null } });
+        expect(matchesFilters(noDate, filters({ dateAfter: '2026-01-01' }), ctx())).toBe(false);
+    });
+
+    it('the date field follows ctx.dateField (modified vs created)', () => {
+        const onModified: FilterContext = { dateField: { key: 'modified', createdProp: 'created' }, numericKeys: new Set() };
+        // created 05-16, modified 05-19 → after:05-18 passes on modified, fails on created.
+        expect(matchesFilters(c, filters({ dateAfter: '2026-05-18' }), onModified)).toBe(true);
+        expect(matchesFilters(c, filters({ dateAfter: '2026-05-18' }), ctx())).toBe(false);
+    });
+
+    it('NO filename-date fallback (D4): a dated filename with no property is rejected', () => {
+        const dailyNote = makeChunk({ note_path: 'Daily/2026-05-16.md', metadata: { created: null, modified: null } });
+        expect(matchesFilters(dailyNote, filters({ dateAfter: '2026-01-01' }), ctx())).toBe(false);
+    });
+});
+
+describe('matchesFilters / numeric (value-inclusive, missing→reject)', () => {
+    const c = makeChunk({ metadata: { properties: { price: '160', importance: '3' } } });
+
+    it('> is inclusive of the bound', () => {
+        expect(matchesFilters(c, filters({ numeric: [{ key: 'price', op: '>', value: 160 }] }))).toBe(true);
+        expect(matchesFilters(c, filters({ numeric: [{ key: 'price', op: '>', value: 161 }] }))).toBe(false);
+    });
+
+    it('< is inclusive of the bound', () => {
+        expect(matchesFilters(c, filters({ numeric: [{ key: 'price', op: '<', value: 160 }] }))).toBe(true);
+        expect(matchesFilters(c, filters({ numeric: [{ key: 'price', op: '<', value: 159 }] }))).toBe(false);
+    });
+
+    it('= is exact (post-coercion)', () => {
+        expect(matchesFilters(c, filters({ numeric: [{ key: 'price', op: '=', value: 160 }] }))).toBe(true);
+        expect(matchesFilters(c, filters({ numeric: [{ key: 'price', op: '=', value: 16 }] }))).toBe(false);
+    });
+
+    it('coerces a quoted / messy stored value', () => {
+        const q = makeChunk({ metadata: { properties: { price: '"299.00"' } } });
+        expect(matchesFilters(q, filters({ numeric: [{ key: 'price', op: '=', value: 299 }] }))).toBe(true);
+        const bad = makeChunk({ metadata: { properties: { price: '197, 344, 218' } } });
+        expect(matchesFilters(bad, filters({ numeric: [{ key: 'price', op: '>', value: 1 }] }))).toBe(false); // NaN → reject
+    });
+
+    it('missing key rejects', () => {
+        const none = makeChunk({ metadata: { properties: {} } });
+        expect(matchesFilters(none, filters({ numeric: [{ key: 'price', op: '>', value: 1 }] }))).toBe(false);
+    });
+
+    it('numericTypeMismatch makes the whole query reject everything (D3)', () => {
+        const f = filters({ numericTypeMismatch: ['pageType'], tags: null });
+        expect(matchesFilters(c, f)).toBe(false);
+        // even a chunk that would satisfy every OTHER clause is rejected:
+        const f2 = filters({ frontmatter: { price: '160' }, numericTypeMismatch: ['pageType'] });
+        expect(matchesFilters(c, f2)).toBe(false);
     });
 });
 
 describe('matchesFilters / combined predicates (AND across filter types)', () => {
     const c = makeChunk({
         note_path: 'Notes/Work/q2.md',
-        metadata: { tags: ['projects'], properties: { context: 'work' }, created: '2026-05-16' },
+        metadata: { tags: ['projects'], properties: { context: 'work', price: '120' }, created: '2026-05-16' },
     });
 
     it('all conditions satisfied', () => {
-        const f = filters({ tags: ['projects'], frontmatter: { context: 'work' }, createdAfter: '2026-05-01', includePaths: ['Notes/*'] });
-        expect(matchesFilters(c, f)).toBe(true);
+        const f = filters({
+            tags: ['projects'], frontmatter: { context: 'work' }, dateAfter: '2026-05-01',
+            numeric: [{ key: 'price', op: '<', value: 200 }], includePaths: ['Notes/*'],
+        });
+        expect(matchesFilters(c, f, ctx(['price']))).toBe(true);
     });
 
     it('one failing condition fails the whole match', () => {
-        const f = filters({ tags: ['projects'], frontmatter: { context: 'personal' } });
-        expect(matchesFilters(c, f)).toBe(false);
+        const f = filters({ tags: ['projects'], numeric: [{ key: 'price', op: '>', value: 200 }] });
+        expect(matchesFilters(c, f, ctx(['price']))).toBe(false);
     });
 });
 

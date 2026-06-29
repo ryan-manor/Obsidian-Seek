@@ -21,6 +21,10 @@ export const Platform = {
 export class TFile {
     path = '';
     stat = { mtime: 0, ctime: 0, size: 0 };
+    // Real Obsidian TFiles carry the lowercased extension; the index path reads
+    // it (search.ts filters `.base` views via `f.extension === 'base'`). Default
+    // '' so existing tests that only set path/stat are unaffected.
+    extension = '';
 }
 export class Notice {
     constructor(_message?: string, _timeout?: number) {}

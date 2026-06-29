@@ -88,13 +88,13 @@ describe('seekTokenize — glue-compound joins (audit §6)', () => {
 });
 
 // ── camelCase inverse-split (2026-06-23, additive) ────────────────────────
-// Query `atlas` could not reach a doc whose only signal is the tag `theAtlas`
+// Query `verge` could not reach a doc whose only signal is the tag `theVerge`
 // (collapsed to one token). The split is the EASY "conservative" case (Hill et
-// al. 2013, ~93% accurate); same-case glued stems (example.com → example) are
+// al. 2013, ~93% accurate); same-case glued stems (theverge.com → theverge) are
 // the HARD case we deliberately do NOT attempt.
 describe('splitCamel — conservative camelCase boundaries', () => {
     it('returns parts (≥2) on a case transition, [] otherwise', () => {
-        expect(splitCamel('theAtlas')).toEqual(['the', 'Atlas']);
+        expect(splitCamel('theVerge')).toEqual(['the', 'Verge']);
         expect(splitCamel('XMLParser')).toEqual(['XML', 'Parser']);   // acronym run keeps trailing word
         expect(splitCamel('blogs')).toEqual([]);                       // no boundary
         expect(splitCamel('GPT4')).toEqual([]);                        // letter→number is NOT a boundary
@@ -103,16 +103,16 @@ describe('splitCamel — conservative camelCase boundaries', () => {
 
 describe('seekTokenize — additive camelCase split', () => {
     it('emits camelCase parts additively, canonical token first', () => {
-        expect(seekTokenize('theAtlas')).toEqual(['theAtlas', 'the', 'Atlas']);
+        expect(seekTokenize('theVerge')).toEqual(['theVerge', 'the', 'Verge']);
         expect(seekTokenize('macEvolution')).toEqual(['macEvolution', 'mac', 'Evolution']);
         expect(seekTokenize('steveJobsLegacy')).toEqual(['steveJobsLegacy', 'steve', 'Jobs', 'Legacy']);
         expect(seekTokenize('PowerShot')).toEqual(['PowerShot', 'Power', 'Shot']);
     });
-    it('makes a camelCase sub-tag reachable by sub-word (blogs/theAtlas)', () => {
-        const terms = seekTokenize('blogs/theAtlas');
-        expect(terms).toContain('Atlas');          // → `atlas` after processTerm lowercases: now an EXACT doc hit
-        expect(terms).toContain('theAtlas');       // canonical preserved
-        expect(terms).toContain('blogstheAtlas');  // glue-join still fires alongside the split
+    it('makes a camelCase sub-tag reachable by sub-word (blogs/theVerge)', () => {
+        const terms = seekTokenize('blogs/theVerge');
+        expect(terms).toContain('Verge');          // → `verge` after processTerm lowercases: now an EXACT doc hit
+        expect(terms).toContain('theVerge');       // canonical preserved
+        expect(terms).toContain('blogstheVerge');  // glue-join still fires alongside the split
     });
     it('splits on the case cue but keeps letter-number ids whole', () => {
         // r2/v2/SD500 must stay exact (fuzzy ladder + glue-join own them); only
@@ -121,12 +121,12 @@ describe('seekTokenize — additive camelCase split', () => {
         expect(seekTokenize('SD500')).toEqual(['SD500']);
         expect(seekTokenize('graniteR2')).toEqual(['graniteR2', 'granite', 'R2']);  // case splits; R2 stays whole
     });
-    it('does NOT recover `atlas` from a same-case glued domain stem (documented limit)', () => {
+    it('does NOT recover `verge` from a same-case glued domain stem (documented limit)', () => {
         // No case cue after the URL is lowercased — the HARD regime we skip. The
-        // `.` split still separates `com`, but `example` stays opaque.
-        const terms = seekTokenize('example.com');
-        expect(terms).not.toContain('atlas');
-        expect(terms).toContain('example');
+        // `.` split still separates `com`, but `theverge` stays opaque.
+        const terms = seekTokenize('theverge.com');
+        expect(terms).not.toContain('verge');
+        expect(terms).toContain('theverge');
     });
 });
 
@@ -135,21 +135,21 @@ describe('seekTokenize — additive camelCase split', () => {
 // ONLY the additive camelCase split + glue-join, leaving the canonical stream.
 describe('seekTokenize — derived:false (canonical-only, for getQueryBound)', () => {
     it('default is unchanged (derived recall forms still emitted)', () => {
-        expect(seekTokenize('example.com')).toEqual(['example', 'com', 'examplecom']);
+        expect(seekTokenize('theverge.com')).toEqual(['theverge', 'com', 'thevergecom']);
         expect(seekTokenize('GPT-4')).toEqual(['GPT', '4', 'GPT4']);
-        expect(seekTokenize('theAtlas')).toEqual(['theAtlas', 'the', 'Atlas']);
+        expect(seekTokenize('theVerge')).toEqual(['theVerge', 'the', 'Verge']);
     });
-    it('drops the glue-join compound — `examplecom` no longer inflates the bound', () => {
-        expect(seekTokenize('example.com', { derived: false })).toEqual(['example', 'com']);
+    it('drops the glue-join compound — `thevergecom` no longer inflates the bound', () => {
+        expect(seekTokenize('theverge.com', { derived: false })).toEqual(['theverge', 'com']);
         expect(seekTokenize('GPT-4', { derived: false })).toEqual(['GPT', '4']);
         expect(seekTokenize('TCP/IP', { derived: false })).toEqual(['TCP', 'IP']);
     });
     it('drops the additive camelCase parts but keeps the canonical token', () => {
-        expect(seekTokenize('theAtlas', { derived: false })).toEqual(['theAtlas']);
-        expect(seekTokenize('blogs/theAtlas', { derived: false })).toEqual(['blogs', 'theAtlas']);
+        expect(seekTokenize('theVerge', { derived: false })).toEqual(['theVerge']);
+        expect(seekTokenize('blogs/theVerge', { derived: false })).toEqual(['blogs', 'theVerge']);
     });
     it('leaves single tokens and CJK segmentation untouched (no derived forms there)', () => {
-        expect(seekTokenize('isadora', { derived: false })).toEqual(['isadora']);
+        expect(seekTokenize('imogene', { derived: false })).toEqual(['imogene']);
         expect(seekTokenize('我喜欢', { derived: false })).toEqual(seekTokenize('我喜欢'));
     });
 });

@@ -28,13 +28,14 @@ import type { Chunk, ChunkMeta } from './types';
 import { packSignBits } from './binary';
 import { quantizeInt8, dequantizeInt8, type QuantVec } from './quant';
 import { sizeOfRow, type SizingRule, type StoreSizeRow } from './index-size';
+import { ACTIVE_MODEL_SPEC } from './model-registry';
 
 // Base IDB name. IndexedDB is ORIGIN-scoped and every Obsidian vault window
 // shares the app://obsidian.md origin, so a bare constant name is ONE database
 // shared by all open vaults — vault A's reindex (deleteDatabase) nukes vault
 // B's index and force-closes B's connection via versionchange (live incident
-// 2026-06-10: one vault's reindex killed a second vault's fresh index +
-// every subsequent transaction there threw "connection is closing"). The store therefore scopes
+// 2026-06-10: Example Vault's reindex killed ACME's fresh index + every subsequent
+// ACME transaction threw "connection is closing"). The store therefore scopes
 // the name per vault: `seek-index:<appId>` (open() takes the scope; appId is
 // Obsidian's stable per-vault id — the same key it uses to vault-scope its own
 // localStorage). The legacy unscoped DB is deleted fire-and-forget on first
@@ -542,7 +543,7 @@ export class IndexStore {
         const store = tx.objectStore(STORE_META);
         const existing = await awaitRequest(store.get(META_KEY));
         if (existing) return existing as MetaConfig;
-        return { embeddingDim: 384, lastIndexedAt: null, schemaVersion: DB_VERSION };
+        return { embeddingDim: ACTIVE_MODEL_SPEC.dim, lastIndexedAt: null, schemaVersion: DB_VERSION };
     }
 
     async setMeta(meta: MetaConfig): Promise<void> {

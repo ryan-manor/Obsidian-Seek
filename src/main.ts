@@ -29,7 +29,7 @@ import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
 import { SearchOrchestrator, driftRecoveryDecision } from './search';
 import { SeekSearchModal, type IndexBanner } from './search-modal';
-import { indexBannerSpec, INDEX_STALE_MSG, type DegradedReason } from './index-notice';
+import { indexBannerSpec, INDEX_STALE_MSG, INDEX_SYNCING_MSG, INDEX_PEER_AHEAD_MSG, type DegradedReason } from './index-notice';
 import { SeekSettingTab } from './settings-tab';
 import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash, getBackendOverride, setBackendOverride, isWebgpuDemoted, clearWebgpuDemoted, type BackendChoice } from './platform';
 import { CompositorPacer } from './pacer';
@@ -166,12 +166,25 @@ export default class SeekPlugin extends Plugin {
     private lastDriftRecoveryGen = -1;           // coord generation we last escalated for; -1 = never
     private indexHealth: 'healthy' | 'recovering' | 'degraded' = 'healthy';
     get indexHealthState(): 'healthy' | 'recovering' | 'degraded' { return this.indexHealth; }
-    // WHY the index is degraded, so the search-modal banner says the true thing per
-    // cause (a 'drift' degradation must not claim "this update changed indexing"). Only
-    // ever meaningful alongside indexHealth==='degraded'; cleared on every return to
-    // 'healthy'. 'version' = a CHUNKER_VERSION/model bump the user hasn't reindexed for;
-    // 'drift' = drift-recovery exhausted. See indexBannerSpec (index-notice.ts).
+    // WHY the index is in a non-healthy state, so the search-modal banner says the true
+    // thing per cause (a 'drift' degradation must not claim "this update changed indexing").
+    // Read alongside indexHealth, which splits the SAME 'version' reason into two banners:
+    // 'recovering' = a peer's current index is syncing in (calm, no action); 'degraded' =
+    // genuinely stale, reindex needed. Cleared on every return to 'healthy'. 'version' = a
+    // CHUNKER_VERSION/model bump the user hasn't reindexed for; 'drift' = drift-recovery
+    // exhausted; 'peer-ahead' = a PEER's index is newer than this build (update Seek), set
+    // from orchestrator.peerAhead by applyPeerAheadBanner. See indexBannerSpec.
     private degradedReason: DegradedReason = null;
+    // True while the local index is version-stale AND a peer device's current-version
+    // sidecar is present (so it WILL hydrate us embed-free on a later poll). Set from
+    // peerSidecarPresent() at the version-stale branch and cleared on every heal. This —
+    // NOT indexHealth==='recovering' — drives the calm "syncing from another device"
+    // banner, because the local drift-recovery ladder also sets 'recovering' and must not
+    // claim a (non-existent) peer is syncing on a single-device vault. See indexBannerSpec.
+    private peerSyncPending = false;
+    // Fires the "update Seek" toast once per peer-ahead spell (cleared when the signal
+    // clears, e.g. after the user updates and the newer sidecar becomes readable).
+    private peerAheadNotified = false;
     // Fires the version-identity mismatch log + the mobile "reindex on desktop" notice
     // once per stale spell (the gate re-checks every 5 min); cleared when identity heals
     // so a future version ship reports again. See enforceIndexIdentity.
@@ -394,6 +407,9 @@ export default class SeekPlugin extends Plugin {
                     // re-chunk (the iOS 1fps loop), while an empty/evicted store
                     // still forces the recovery sweep.
                     await this.orchestrator.reconcileSidecarIfChanged();
+                    // Sidecar just scanned → raise the "update Seek" banner if a peer's index
+                    // is newer than this build (and gate the mobile catch-up below off it).
+                    this.applyPeerAheadBanner();
                 }
             } catch (e) {
                 await this.logger.appendError('sidecar-hydrate-onload', e).catch(() => {});
@@ -527,7 +543,6 @@ export default class SeekPlugin extends Plugin {
             else this.openSearchModal(query);
         });
 
-
         // Reindex and diagnostics are intentionally NOT palette commands: a full
         // reindex nukes and re-embeds the whole vault (too destructive for a fuzzy
         // palette match), so it lives in Settings → Seek → Index behind a confirm;
@@ -535,7 +550,7 @@ export default class SeekPlugin extends Plugin {
         // reconcile/rebuild are automatic. Search is the only command Seek adds.
 
         // ---- Headless CLI query handler --------------------------------
-        // `obsidian seek:search query="..." [limit=N]`.
+        // `obsidian seek:search query="..." [limit=N] [verbose]`.
         //
         // registerCliHandler is provided by the obsidian-cli companion, not the
         // core Obsidian API typings — hence the cast and the runtime guard. On
@@ -841,13 +856,15 @@ export default class SeekPlugin extends Plugin {
                 }
                 // Active model from the registry (debug override wins, else the
                 // shipped default). spec.repo is the CDN-streamed load base on the
-                // remote path; spec.key is the index drift-identity. A dim mismatch
-                // means EMBEDDING_DIM + DB_VERSION weren't bumped with the registry
-                // — loud-log it (mis-indexing into the wrong-dim store is worse).
+                // remote path; spec.key is the index drift-identity. EMBEDDING_DIM
+                // now DERIVES from ACTIVE_MODEL_SPEC.dim (the single source), so a
+                // shipped-model swap can't trip this. It only fires for a debug
+                // model OVERRIDE whose real width differs from the build dim —
+                // loud-log it (mis-indexing into the wrong-dim store is worse).
                 const spec = activeModelSpec(this.settings);
                 if (spec.dim !== EMBEDDING_DIM) {
                     await this.logger.appendError('model-registry', new Error(
-                        `active model ${spec.key} dim ${spec.dim} != EMBEDDING_DIM ${EMBEDDING_DIM}; bump EMBEDDING_DIM + DB_VERSION together`));
+                        `override model ${spec.key} dim ${spec.dim} != build dim ${EMBEDDING_DIM}; a model override needs a matching-dim build (registry dim is the single source — bump DB_VERSION when changing the shipped model)`));
                 }
                 // Device selection is per-DEVICE (platform.ts resolveDevice),
                 // not a synced setting — see the NOTE in types.ts for why a
@@ -994,7 +1011,7 @@ export default class SeekPlugin extends Plugin {
             // A peer sidecar (or a completed reindex) healed a version-stale index out
             // from under us: clear the banner/health. Scoped to 'version' so a concurrent
             // DRIFT degradation (separate axis) isn't stomped healthy here.
-            if (this.degradedReason === 'version') { this.indexHealth = 'healthy'; this.degradedReason = null; }
+            if (this.degradedReason === 'version') { this.indexHealth = 'healthy'; this.degradedReason = null; this.peerSyncPending = false; }
             return false;
         }
 
@@ -1019,7 +1036,7 @@ export default class SeekPlugin extends Plugin {
                 // A current-version peer existed: the fleet self-heals embed-free even
                 // with desktop auto-reindex gone. Clear any version banner this device
                 // was showing while it waited.
-                if (this.degradedReason === 'version') { this.indexHealth = 'healthy'; this.degradedReason = null; }
+                if (this.degradedReason === 'version') { this.indexHealth = 'healthy'; this.degradedReason = null; this.peerSyncPending = false; }
                 return true;
             }
 
@@ -1035,6 +1052,7 @@ export default class SeekPlugin extends Plugin {
                 this.identityHealNotified = false;
                 this.indexHealth = 'healthy';
                 this.degradedReason = null;
+                this.peerSyncPending = false;
                 return true;
             }
             if (healed === 'drained') {
@@ -1071,12 +1089,28 @@ export default class SeekPlugin extends Plugin {
             //    Reindex, and a phone never bulk-embeds — the jetsam rule) stays degraded
             //    indefinitely. Intentional: an honest banner beats a surprise auto-nuke,
             //    and the embed-free heal still converges it the moment any desktop reindexes.
-            this.indexHealth = 'degraded';
+            //
+            //    Split the message by whether a heal is actually coming. A peer device's
+            //    sidecar is present (this vault is multi-device) but not yet at the current
+            //    identity → its current index is mid-sync and WILL hydrate us embed-free on
+            //    a later poll. That's a calm 'recovering' "syncing" state (answers the
+            //    user's real questions: yes you can search, no you needn't do anything —
+            //    and tapping Reindex on a phone is exactly the bulk re-embed we want them
+            //    NOT to trigger). Only a genuinely-stuck index (no peer in sight) is
+            //    'degraded' with the action-needed banner + sticky toast.
+            const peerComing = await this.orchestrator.peerSidecarPresent();
+            this.indexHealth = peerComing ? 'recovering' : 'degraded';
             this.degradedReason = 'version';
-            // Sticky (duration 0 = stays until the user clicks it away): this is rare
-            // enough that the intrusion is worth not having it auto-vanish unseen. Same
-            // copy as the modal banner (INDEX_STALE_MSG), once per stale spell.
-            if (firstReport) new Notice(INDEX_STALE_MSG, 0);
+            // Drive the calm "syncing" banner off this explicit peer fact, not indexHealth:
+            // local drift recovery also sets 'recovering' and must stay silent (see indexBannerSpec).
+            this.peerSyncPending = peerComing;
+            if (firstReport) {
+                // Syncing: a brief, non-sticky heads-up (it self-heals, so don't nag).
+                // Stale: sticky (duration 0) — rare enough that the intrusion is worth not
+                // letting it auto-vanish unseen. Same copy as the modal banner, once per spell.
+                if (peerComing) new Notice(INDEX_SYNCING_MSG, 8000);
+                else new Notice(INDEX_STALE_MSG, 0);
+            }
             return true;
         } finally {
             this.identityHealInFlight = false;
@@ -1107,6 +1141,10 @@ export default class SeekPlugin extends Plugin {
             if (this.isIndexBusy()) return;
             if (await this.enforceIndexIdentity()) return;
             await this.orchestrator.reconcileSidecarIfChanged();
+            // The reconcile above scanned the sidecar dir, so peerAhead is fresh: raise (or
+            // clear) the "update Seek" banner. Runs only on the local-healthy path, since
+            // enforceIndexIdentity returns early when the local index is itself version-stale.
+            this.applyPeerAheadBanner();
             // Once per session, after identity is confirmed healthy: GC orphan chunks
             // from same-version churn (a missed delete event, a file record overwritten
             // by hydrate). Embed-free set-arithmetic; if backgrounded mid-sweep it
@@ -1340,21 +1378,33 @@ export default class SeekPlugin extends Plugin {
             // cold delta still loads, because the user is actively in that note.
             const coldMobile = isMobilePlatform() && !this.embedder.loaded;
             const coldDesktopBulk = !isMobilePlatform() && !this.embedder.loaded && bulk;
-            const deferEmbed = coldMobile || coldDesktopBulk;
+            // Peer-ahead grind-stop (mobile): a newer-version peer index exists that this
+            // build can't read, so any local embed now is throwaway work (discarded the
+            // moment the user updates Seek and hydrates the peer's index). Defer instead —
+            // the file keeps its old chunks (queryable, stale-not-wrong) and the banner
+            // tells the user to update. Mobile-only: desktop embedding isn't jetsam-bound
+            // and a desktop is the fleet's heal path.
+            const peerAheadDefer = isMobilePlatform() && (this.orchestrator?.peerAhead ?? false);
+            const deferEmbed = coldMobile || coldDesktopBulk || peerAheadDefer;
             if (!deferEmbed) await this.ensureModelLoaded();
 
             if (bulk) {
-                // Mini-reindex path. Runs silently — no "indexing new notes…"/progress
-                // toast (background deltas shouldn't toast; the Settings loading bar +
-                // completion recap cover user-initiated full reindexes). A live query
-                // preempts the embed (shouldContinue → break within one file, releasing
-                // the write mutex so the query runs); the interrupted or deferred remainder
-                // keeps its old searchable chunks and stays dirty (no file-record advance)
-                // for the drain to reconcile.
-                await orchestrator.reindexDelta(dirty, deleted, {
-                    embed: !deferEmbed,
-                    shouldContinue: () => !this.indexingBlocked,
-                });
+                // Mini-reindex path. Progress goes on the same sticky Notice the
+                // full reindex uses (deferred embeds have nothing to show). A live
+                // query preempts the embed (shouldContinue → break within one file,
+                // releasing the write mutex so the query runs); the interrupted or
+                // deferred remainder keeps its old searchable chunks and stays dirty
+                // (no file-record advance) for the drain to reconcile.
+                const notice = deferEmbed ? null : new Notice('Seek: indexing new notes…', 0);
+                try {
+                    await orchestrator.reindexDelta(dirty, deleted, {
+                        embed: !deferEmbed,
+                        shouldContinue: () => !this.indexingBlocked,
+                        onProgress: notice ? (msg) => notice.setMessage(`Seek: ${msg}`) : undefined,
+                    });
+                } finally {
+                    notice?.hide();
+                }
                 // Reconcile whatever the embed left undone (deferred cold, or
                 // preempted by a query). runCatchUp is self-guarding (no-op while
                 // searching / hidden / model cold) and computeDelta-idempotent — a
@@ -1373,7 +1423,7 @@ export default class SeekPlugin extends Plugin {
                     embed: !deferEmbed,
                     shouldContinue: () => !this.indexingBlocked,
                 });
-                if ((coldMobile || this.indexingBlocked) && dirty.length > 0) this.catchUpPending = true;
+                if ((deferEmbed || this.indexingBlocked) && dirty.length > 0) this.catchUpPending = true;
                 this.runCatchUp();
             }
 
@@ -1452,7 +1502,33 @@ export default class SeekPlugin extends Plugin {
     // here is "is the index version-stale?". Re-evaluated by the modal on each open, so a
     // reindex done from Settings clears it the next time the modal opens.
     private indexNotice(): IndexBanner | null {
-        return indexBannerSpec(this.indexHealth, this.degradedReason);
+        return indexBannerSpec(this.indexHealth, this.degradedReason, this.peerSyncPending);
+    }
+
+    // Translate the orchestrator's peer-ahead signal (a sidecar refused for being at a
+    // NEWER chunkerVersion than this build) into the banner state. This is the MIRROR of
+    // enforceIndexIdentity: there the LOCAL index is stale vs the local build; here the
+    // local index matches the build, but a peer holds an index this build can't read, so
+    // the honest fix is "update Seek", not "reindex". Called after every reconcile/hydrate.
+    //
+    // A real local problem ('version'/'drift') always wins — it's worse and more specific,
+    // and it's what an actual reindex/update would clear first. We only own the otherwise-
+    // healthy case, so we never stomp those reasons, and we only clear back to healthy a
+    // banner WE set (degradedReason === 'peer-ahead').
+    private applyPeerAheadBanner(): void {
+        const ahead = this.orchestrator?.peerAhead ?? false;
+        if (ahead) {
+            if (this.degradedReason === 'version' || this.degradedReason === 'drift') return;
+            this.indexHealth = 'degraded';
+            this.degradedReason = 'peer-ahead';
+            if (!this.peerAheadNotified) {
+                this.peerAheadNotified = true;
+                new Notice(INDEX_PEER_AHEAD_MSG, 8000); // brief, non-sticky — informational, not urgent
+            }
+        } else {
+            this.peerAheadNotified = false;
+            if (this.degradedReason === 'peer-ahead') { this.indexHealth = 'healthy'; this.degradedReason = null; }
+        }
     }
 
     private openSearchModal(initialQuery = ''): void {
@@ -1522,6 +1598,12 @@ export default class SeekPlugin extends Plugin {
     private runCatchUp(): void {
         if (!this.catchUpPending || this.catchUpRunning || !this.embedder.loaded || !this.orchestrator) return;
         if (document.hidden || this.indexingBlocked) return;  // never start in a bad window (typing OR a query in flight)
+        // Peer-ahead grind-stop: while a newer-version peer index exists, draining the
+        // deferred backlog would re-embed (on the iOS main thread) chunks this build will
+        // discard the moment it updates. Leave catchUpPending set so the drain resumes
+        // automatically once the user updates Seek and peerAhead clears. (This is the exact
+        // loop behind the 2026-06-28 mobile bog-down: v7 phone grinding against a v8 sidecar.)
+        if (isMobilePlatform() && this.orchestrator.peerAhead) return;
         this.catchUpRunning = true;
         const orchestrator = this.orchestrator;
         const mobile = isMobilePlatform();
@@ -1689,14 +1771,16 @@ export default class SeekPlugin extends Plugin {
             if (!window.confirm(confirm)) return false;
         }
 
-        // No "starting…" or per-file progress toast: the live "Reindexing…" bar in
-        // Settings → Seek (driven by opts.onProgress) is the progress UI. Only the
-        // completion recap below (and the failure toast) survive.
+        const notice = new Notice('Seek: full reindex starting…', 0);
         this.currentTaskContext = 'indexing';
         try {
             await this.ensureModelLoaded();
             this.orchestrator.invalidateBm25Cache();
-            const result = await this.orchestrator.reindexAll(msg => opts?.onProgress?.(msg));
+            const result = await this.orchestrator.reindexAll(msg => {
+                notice.setMessage(`Seek: ${msg}`);
+                opts?.onProgress?.(msg);
+            });
+            notice.hide();
             const summary = [
                 result.pass ? '✅' : '❌',
                 `${result.filesIndexed} files`,
@@ -1714,12 +1798,14 @@ export default class SeekPlugin extends Plugin {
             // the version banner, and the suppression baseline all reset.
             this.indexHealth = 'healthy';
             this.degradedReason = null;
+            this.peerSyncPending = false;
             // Re-arm version reporting: this build just stamped its identity, so a FUTURE
             // ship should toast/banner again. (Without this, identityHealNotified could
             // stay latched until the next poll's identityMatches clears it.)
             this.identityHealNotified = false;
             return true;
         } catch (e) {
+            notice.hide();
             await this.logger.appendError('seek-full-reindex', e);
             // One end-toast whether it passed or failed (the recap). Detail → console + log.
             new Notice('Seek reindex: ❌ failed — see the logging report (Settings → Seek).', 10000);

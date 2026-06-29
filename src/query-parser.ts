@@ -16,8 +16,13 @@
 //   [key:value]                    -> frontmatter match, Obsidian-style:
 //                                     substring + case-insensitive + wikilink-aware
 //   [key:"value"]                  -> frontmatter whole-value exact match (quoted)
-//   [created:>YYYY-MM-DD] / [<…]   -> createdAfter / createdBefore
-//   [modified:>…] / [<…]           -> modifiedAfter / modifiedBefore
+//   [key>n] [key<n] [key=n]        -> numeric comparison (colon optional), but ONLY
+//                                     when `key` is a Number-typed property (ctx);
+//                                     value-inclusive. Operator on a non-Number key
+//                                     -> numericTypeMismatch (unsatisfiable, D3).
+//   after:DATE / before:DATE       -> dateAfter / dateBefore (day-inclusive), keyed
+//                                     off the Recency date field; recognized only
+//                                     when Recency is ON (ctx.dateField present).
 //   -term                          -> exclude (note-level negation, Obsidian `-`)
 // Matched tokens are STRIPPED from the text and NOT re-injected: the residual
 // is pure semantic content for the embedder, and tag hierarchy is enforced by
@@ -34,7 +39,7 @@
 // (`-#tag`, `-"phrase"`, `-(a b)`, `-path:`), `file:`, phrase "…", boolean OR /
 // grouping, `match-case:`, line/block/section/task, `/regex/`.
 
-import type { ChunkMeta, QueryFilters } from './types';
+import type { ChunkMeta, QueryFilters, FilterContext, RecencyKeyChoice } from './types';
 import { parseDateMs } from './fusion';
 import { toBindForm } from './prop-normalize';
 
@@ -57,16 +62,82 @@ const TAG_RUN = `${TAG_CH}+(?:/${TAG_CH}+)*`; // hierarchical: parent/child/...
 // `g`/`u` flags (u = codepoint-aware so astral emoji match as one unit).
 //   path: takes a quoted form ("…") so paths with spaces bind — Obsidian's
 //   path:"Daily notes/2022-07"; the bare \S+ form covers everything else.
+// Two bracket alternatives, comparison tried first:
+//   COMPARISON `[key>n]` `[key < n]` `[key:>n]` — an operator is REQUIRED and the
+//     colon is OPTIONAL (so the readable colon-less form binds). TAG_CH excludes
+//     `<`/`=`/`>`, so `key` stops cleanly before the operator. Routes to the numeric
+//     path (or numericTypeMismatch) — never substring.
+//   SUBSTRING `[key:value]` — a colon is REQUIRED and there is no operator. The
+//     unchanged Obsidian-style frontmatter match. Reached only when the comparison
+//     branch fails (no operator right after the key/colon), so `[context:work]` and
+//     `[note:a>b]` (operator not adjacent) stay substring.
+// after:/before: are bare prefixed date operators (like path:/tag:); a quoted form
+// is accepted for symmetry though dates carry no spaces.
 const INLINE_FILTER_RE = new RegExp(
-    `\\[(?<bkey>${TAG_CH}+)\\s*:\\s*(?<bop>[<>]?)\\s*(?<bval>[^\\]]+?)\\s*\\]` +
+    `\\[(?<ckey>${TAG_CH}+)\\s*(?::\\s*)?(?<cop>[<>=])\\s*(?<cval>[^\\]]+?)\\s*\\]` +
+    `|\\[(?<skey>${TAG_CH}+)\\s*:\\s*(?<sval>[^\\]]+?)\\s*\\]` +
     `|tag:(?<texp>#?${TAG_RUN})` +
     `|path:(?<ipath>"[^"]+"|\\S+)` +
+    `|after:(?<dafter>"[^"]+"|\\S+)` +
+    `|before:(?<dbefore>"[^"]+"|\\S+)` +
     `|#(?<thash>${TAG_RUN})`,
     'gu',
 );
 
-// Frontmatter keys that become top-level date filters when used with `>`/`<`.
-const DATE_KEYS = new Set(['created', 'modified']);
+// Coerce a stored property value to a finite number, defensively — frontmatter is
+// stored as strings and real data is messy (quoted "299.00", empty, null, even
+// malformed "197, 344, 218"). A non-number yields null, which the matcher treats
+// as "does not match" — so a numeric comparison is robust even if a value slips
+// past type detection. Mirrors parseDateMs's quote-stripping posture.
+function parseNum(raw: string | null | undefined): number | null {
+    const cleaned = String(raw ?? '').trim().replace(/^["']+|["']+$/g, '').trim();
+    if (!cleaned) return null;
+    const n = Number(cleaned);          // strict: "197, 344, 218" → NaN
+    return Number.isFinite(n) ? n : null;
+}
+
+const ONE_DAY_MS = 86_400_000;
+
+// Inclusive upper bound for `before:D`: the first instant AFTER the whole period
+// D names, so everything up to and including that period is kept. Granularity
+// follows what the user typed — a bare year covers the year, YYYY-MM the month,
+// YYYY-MM-DD the day. UTC-anchored to match parseDateMs (which Date.parses ISO
+// dates as UTC midnight), so both sides of the comparison live in one frame.
+// Returns null when D doesn't parse.
+function endBoundMs(d: string): number | null {
+    const cleaned = String(d).trim().replace(/^["'{]+|["'}]+$/g, '').trim();
+    let m = /^(\d{4})$/.exec(cleaned);
+    if (m) return Date.parse(`${+m[1] + 1}-01-01T00:00:00Z`);
+    m = /^(\d{4})-(\d{2})$/.exec(cleaned);
+    if (m) {
+        let y = +m[1], mo = +m[2] + 1;
+        if (mo > 12) { mo = 1; y++; }
+        return Date.parse(`${y}-${String(mo).padStart(2, '0')}-01T00:00:00Z`);
+    }
+    m = /^(\d{4})-(\d{2})-(\d{2})/.exec(cleaned);
+    if (m) return Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) + ONE_DAY_MS;
+    const base = parseDateMs(cleaned); // a parseable datetime → +1 day from its instant
+    return base === null ? null : base + ONE_DAY_MS;
+}
+
+// The date a date-FILTER reads for a chunk: the user's selected Recency field,
+// then mtime — and nothing else. Deliberately NARROWER than fusion.ts recencyDate
+// (the RANKING ladder), which also falls back to a filename date: parsing a date
+// out of a filename is too vault-specific to be a safe FILTER behavior (D4).
+// Missing both the selected property and mtime → null → the chunk is rejected.
+function filterDate(
+    meta: ChunkMeta['metadata'] | undefined,
+    dateField: { key: RecencyKeyChoice; createdProp: string },
+): number | null {
+    const prop = dateField.key === 'modified'
+        ? meta?.modified
+        : (dateField.createdProp === 'created' ? meta?.created : meta?.properties?.[dateField.createdProp]);
+    return parseDateMs(prop ?? meta?.modified);
+}
+
+// Default date field for the permissive path (no ctx supplied): this vault's
+// `created` convention. The real search path always passes ctx.dateField.
+const DEFAULT_DATE_FIELD = { key: 'created' as RecencyKeyChoice, createdProp: 'created' };
 
 // Bare-word negation: a `-` that STARTS a token (preceded by start-of-string or
 // whitespace) and is followed by a non-space run. The lookbehind keeps mid-word
@@ -99,11 +170,15 @@ function tokenizeForMatch(text: string): string[] {
 }
 
 interface ParsedGroups {
-    bkey?: string;
-    bop?: string;
-    bval?: string;
+    ckey?: string;   // comparison: [key>n]
+    cop?: string;
+    cval?: string;
+    skey?: string;   // substring: [key:value]
+    sval?: string;
     texp?: string;
     ipath?: string;
+    dafter?: string;  // after:DATE
+    dbefore?: string; // before:DATE
     thash?: string;
 }
 
@@ -114,15 +189,25 @@ interface ParsedGroups {
  * filters. When no operators are found, `filters` is null and `cleanedQuery`
  * is the trimmed original — byte-identical search behavior to a no-parser build.
  */
-export function parseQuery(raw: string): { cleanedQuery: string; filters: QueryFilters | null } {
+export function parseQuery(raw: string, ctx?: FilterContext): { cleanedQuery: string; filters: QueryFilters | null } {
     const tags: string[] = [];
     const frontmatter: Record<string, string> = {};
     const includePaths: string[] = [];
     const exclude: string[] = [];
-    let createdAfter: string | null = null;
-    let createdBefore: string | null = null;
-    let modifiedAfter: string | null = null;
-    let modifiedBefore: string | null = null;
+    const numeric: Array<{ key: string; op: '<' | '>' | '='; value: number }> = [];
+    const numericMismatch: string[] = [];
+    let dateAfter: string | null = null;
+    let dateBefore: string | null = null;
+
+    // Type/field gates from the call site. No ctx ⇒ permissive (ad-hoc callers and
+    // the vitest matcher tests): any key may compare, and bare after:/before: bind.
+    // A provided ctx enforces the design's gates: numericKeys decides comparison vs
+    // mismatch (D3), and a null dateField (Recency OFF) leaves after:/before: as text.
+    const numericKeys = ctx?.numericKeys;
+    const isNumericKey = (k: string): boolean => numericKeys ? numericKeys.has(k) : true;
+    const dateEnabled = ctx === undefined || ctx.dateField !== null;
+    const stripQuotes = (s: string): string =>
+        s.length >= 2 && s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1) : s;
 
     // Negation pass FIRST, so `-term` is consumed before the inline-filter
     // regex sees the residual text. A captured run that looks like a negated
@@ -150,31 +235,46 @@ export function parseQuery(raw: string): { cleanedQuery: string; filters: QueryF
     const stripped = afterNegation.replace(INLINE_FILTER_RE, (...args: unknown[]): string => {
         // With named groups, the final replace() argument is the groups object.
         const groups = args[args.length - 1] as ParsedGroups;
-        const { bkey, bop, bval, texp, ipath, thash } = groups;
+        const { ckey, cop, cval, skey, sval, texp, ipath, dafter, dbefore, thash } = groups;
 
-        if (bkey !== undefined && bval !== undefined) {
-            const value = bval.trim();
-            const keyLower = bkey.toLowerCase();
-            if (DATE_KEYS.has(keyLower) && (bop === '<' || bop === '>')) {
-                // Date pseudo-keys are case-insensitive ([Created:>X] == [created:>X]).
-                if (keyLower === 'created') {
-                    if (bop === '>') createdAfter = value; else createdBefore = value;
-                } else {
-                    if (bop === '>') modifiedAfter = value; else modifiedBefore = value;
-                }
+        // Comparison `[key>n]` — operator present, colon optional. Routes by the
+        // key's DECLARED type (key case preserved for property lookup):
+        if (ckey !== undefined && cop !== undefined && cval !== undefined) {
+            const op = cop as '<' | '>' | '=';
+            if (isNumericKey(ckey)) {
+                const value = parseNum(cval);
+                // A finite value is a real numeric filter; a non-number on a Number
+                // key (`[price>abc]`) can't be honored → mismatch (0 results, D3).
+                if (value !== null) numeric.push({ key: ckey, op, value });
+                else numericMismatch.push(ckey);
             } else {
-                // Frontmatter exact-match: preserve key case so camelCase fields
-                // like `pageType` resolve correctly against the metadata index.
-                frontmatter[bkey] = value;
+                // Operator on a non-Number property: unsatisfiable, never substring
+                // (D3 — substring would be plausibly-but-silently wrong).
+                numericMismatch.push(ckey);
             }
+            return ' ';
+        }
+        // Substring `[key:value]` — preserve key case so camelCase fields like
+        // `pageType` resolve correctly against the metadata index.
+        if (skey !== undefined && sval !== undefined) {
+            frontmatter[skey] = sval.trim();
             return ' ';
         }
         if (texp !== undefined) { tags.push(texp.replace(/^#/, '')); return ' '; }
         if (ipath !== undefined) {
-            // Strip the optional surrounding quotes (the spaces-allowed form).
-            const p = ipath.length >= 2 && ipath.startsWith('"') && ipath.endsWith('"')
-                ? ipath.slice(1, -1) : ipath;
-            includePaths.push(p);
+            includePaths.push(stripQuotes(ipath));
+            return ' ';
+        }
+        // after:/before: bind only when Recency is ON (a date field exists to key
+        // off). Otherwise leave the token verbatim so it falls through to search text.
+        if (dafter !== undefined) {
+            if (!dateEnabled) return args[0] as string;
+            dateAfter = stripQuotes(dafter).trim();
+            return ' ';
+        }
+        if (dbefore !== undefined) {
+            if (!dateEnabled) return args[0] as string;
+            dateBefore = stripQuotes(dbefore).trim();
             return ' ';
         }
         if (thash !== undefined) { tags.push(thash); return ' '; }
@@ -188,8 +288,8 @@ export function parseQuery(raw: string): { cleanedQuery: string; filters: QueryF
         Object.keys(frontmatter).length === 0 &&
         includePaths.length === 0 &&
         exclude.length === 0 &&
-        createdAfter === null && createdBefore === null &&
-        modifiedAfter === null && modifiedBefore === null;
+        numeric.length === 0 && numericMismatch.length === 0 &&
+        dateAfter === null && dateBefore === null;
 
     if (nothingExtracted) {
         // No filters. Preserve the raw text byte-for-byte (no-parser-identical)
@@ -203,10 +303,10 @@ export function parseQuery(raw: string): { cleanedQuery: string; filters: QueryF
         tagsMatchAll: false, // reserved; always OR in v1
         frontmatter: Object.keys(frontmatter).length ? frontmatter : null,
         includePaths: includePaths.length ? includePaths : null,
-        createdAfter,
-        createdBefore,
-        modifiedAfter,
-        modifiedBefore,
+        numeric: numeric.length ? numeric : null,
+        dateAfter,
+        dateBefore,
+        numericTypeMismatch: numericMismatch.length ? numericMismatch : null,
         exclude: exclude.length ? exclude : null,
     };
     return { cleanedQuery, filters };
@@ -239,12 +339,17 @@ function normalizePropValue(s: string): string {
 
 /**
  * Compile a QueryFilters into a fast per-chunk predicate. Globs, lowercased
- * filter tags, and parsed date bounds are computed ONCE here; the returned
- * closure is the hot path applied across every chunk to build the match-mask.
- * Ported from _apply_chunk_filters (search.py:565-657); frontmatter matching
- * diverges from the port toward Obsidian semantics (substring/wikilink/quoted).
+ * filter tags, numeric clauses, and parsed date bounds are computed ONCE here;
+ * the returned closure is the hot path applied across every chunk to build the
+ * match-mask. Ported from _apply_chunk_filters (search.py:565-657); frontmatter
+ * matching diverges from the port toward Obsidian semantics. `ctx.dateField`
+ * resolves which per-chunk date the date filter reads (defaults to `created`).
  */
-export function compileMatcher(f: QueryFilters): (chunk: ChunkMeta) => boolean {
+export function compileMatcher(f: QueryFilters, ctx?: FilterContext): (chunk: ChunkMeta) => boolean {
+    // D3: a comparison on a non-Number key makes the whole query unsatisfiable —
+    // every chunk is rejected, never substring-matched. Short-circuit the closure.
+    if (f.numericTypeMismatch && f.numericTypeMismatch.length > 0) return () => false;
+
     // Each include pattern matches the full path OR a `*/pattern` suffix, and
     // any one pattern matching is enough (OR across patterns).
     const pathRes = (f.includePaths ?? []).flatMap(p => [globToRegExp(p), globToRegExp(`*/${p}`)]);
@@ -258,10 +363,14 @@ export function compileMatcher(f: QueryFilters): (chunk: ChunkMeta) => boolean {
         const exact = raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"');
         return { key: k, expected: normalizePropValue(exact ? raw.slice(1, -1) : raw), exact };
     });
-    const cAfter = f.createdAfter ? parseDateMs(f.createdAfter) : null;
-    const cBefore = f.createdBefore ? parseDateMs(f.createdBefore) : null;
-    const mAfter = f.modifiedAfter ? parseDateMs(f.modifiedAfter) : null;
-    const mBefore = f.modifiedBefore ? parseDateMs(f.modifiedBefore) : null;
+    const numericClauses = f.numeric ?? [];
+    // Date bounds: `after:D` lower bound = start-of-period(D) (parseDateMs already
+    // floors a bare year/month/day to its start); `before:D` upper bound is the
+    // first instant AFTER D's whole period, so it's exclusive at the top → both
+    // bounds day-INCLUSIVE. The date field is the user's Recency selection.
+    const afterMs = f.dateAfter ? parseDateMs(f.dateAfter) : null;
+    const beforeBoundMs = f.dateBefore ? endBoundMs(f.dateBefore) : null;
+    const dateField = ctx?.dateField ?? DEFAULT_DATE_FIELD;
 
     const tagMatches = (chunkTags: string[], ft: string): boolean =>
         chunkTags.some(ct => ct === ft || ct.startsWith(ft + '/'));
@@ -292,18 +401,20 @@ export function compileMatcher(f: QueryFilters): (chunk: ChunkMeta) => boolean {
             if (exact ? actNorm !== expected : !actNorm.includes(expected)) return false;
         }
 
-        // Date filtering. Missing/unparseable date → reject (matches reference).
-        if (cAfter !== null || cBefore !== null) {
-            const dt = parseDateMs(meta.created);
-            if (dt === null) return false;
-            if (cAfter !== null && dt < cAfter) return false;
-            if (cBefore !== null && dt > cBefore) return false;
+        // Numeric comparison (value-inclusive). Missing key / non-numeric value →
+        // reject (consistent with "missing field → reject"; robust to bad data).
+        for (const { key, op, value } of numericClauses) {
+            const n = parseNum(meta.properties?.[key]);
+            if (n === null) return false;
+            if (op === '>' ? n < value : op === '<' ? n > value : n !== value) return false;
         }
-        if (mAfter !== null || mBefore !== null) {
-            const dt = parseDateMs(meta.modified);
+
+        // Date filtering (day-inclusive). Missing/unparseable date → reject.
+        if (afterMs !== null || beforeBoundMs !== null) {
+            const dt = filterDate(meta, dateField);
             if (dt === null) return false;
-            if (mAfter !== null && dt < mAfter) return false;
-            if (mBefore !== null && dt > mBefore) return false;
+            if (afterMs !== null && dt < afterMs) return false;
+            if (beforeBoundMs !== null && dt >= beforeBoundMs) return false;
         }
 
         return true;
@@ -312,8 +423,8 @@ export function compileMatcher(f: QueryFilters): (chunk: ChunkMeta) => boolean {
 
 /** Convenience single-shot matcher (compiles per call) — for tests/ad-hoc use.
  *  In the search hot path use compileMatcher() once and reuse the closure. */
-export function matchesFilters(chunk: ChunkMeta, f: QueryFilters): boolean {
-    return compileMatcher(f)(chunk);
+export function matchesFilters(chunk: ChunkMeta, f: QueryFilters, ctx?: FilterContext): boolean {
+    return compileMatcher(f, ctx)(chunk);
 }
 
 /**

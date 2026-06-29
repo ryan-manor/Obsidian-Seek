@@ -36,7 +36,7 @@ views:
     name: Wikis
     filters:
       and:
-        - pageSource == "Team Wiki"
+        - pageSource == "Example Wiki"
 `;
 
 const READING_LIST = `filters:
@@ -53,7 +53,7 @@ views:
       file.name: 346
 `;
 
-const ALEX_1X1S = `summaries:
+const RITU_1X1S = `summaries:
   Filled: values.filter(!value.isType("null")).length
 views:
   - type: table
@@ -113,10 +113,10 @@ describe('extractBaseDocs', () => {
         for (const d of docs) expect(d.content).toContain('Clippings'); // file.inFolder("Clippings")
     });
 
-    it('keeps each view content distinct (Posts→writing, Wikis→Team Wiki)', () => {
+    it('keeps each view content distinct (Posts→writing, Wikis→Example Wiki)', () => {
         const docs = extractBaseDocs(CLIPPINGS, 'Bases/Clippings.base');
         expect(view(docs, 'Posts')!.content).toContain('writing');
-        expect(view(docs, 'Wikis')!.content).toContain('Team Wiki');
+        expect(view(docs, 'Wikis')!.content).toContain('Example Wiki');
         expect(view(docs, 'Products')!.content).toContain('product');
     });
 
@@ -133,7 +133,7 @@ describe('extractBaseDocs', () => {
     it('folds a generic view\'s own literals into the base-level entry', () => {
         // ALEX's only view is a generic "Table" — its filter literals still describe
         // the base, so they land on the base-level entry, not a dropped view.
-        const docs = extractBaseDocs(ALEX_1X1S, 'Alex 1x1s.base');
+        const docs = extractBaseDocs(RITU_1X1S, 'Alex 1x1s.base');
         expect(docs.map(d => d.viewName)).toEqual([null]);
         const c = base(docs).content;
         expect(c).toContain('meetings/1x1s');

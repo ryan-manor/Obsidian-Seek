@@ -22,6 +22,7 @@
 
 import type { App } from 'obsidian';
 import { toDisplayForm } from './prop-normalize';
+import { enumerateDatePropertyNames, enumerateNumberPropertyNames } from './prop-types';
 
 export interface Completion {
     // What the input's full value becomes if accepted (head + completed token).
@@ -44,13 +45,18 @@ export interface SuggestItem extends Completion {
     count: number;
 }
 
-// Frontmatter keys never offered as [key:value] filters. Tags/aliases have
-// their own operators; dates aren't categorical; the rest are Task-Notes /
-// Obsidian machinery or per-note unique values that would bloat the menu.
+// Frontmatter keys never offered as [key:value] filters. Two residual reasons
+// only: keys with their own operator (tags/aliases), and universal UI/identity
+// machinery that is neither type- nor cardinality-detectable (cssclasses can be
+// low-cardinality, so the cap won't catch it). Dates are NOT named here — they
+// are excluded generically in build() via Obsidian's type registry
+// (enumerateDatePropertyNames) PLUS a date-shaped-value guard, so no per-vault
+// date key (created / modified / due / completedDate / dateLink / …) has to be
+// hardcoded. Per-note-unique free text (week, relatedPages, …) is left to the
+// cardinality cap below — categorical keys survive it, unique ones don't.
 const KEY_BLOCKLIST = new Set([
     'position', 'tags', 'aliases', 'cssclass', 'cssclasses',
-    'created', 'modified', 'date', 'dateLink', 'due', 'completedDate',
-    'week', 'relatedPages', 'title', 'id', 'uuid', 'permalink',
+    'title', 'id', 'uuid', 'permalink',
 ]);
 
 // A key with more distinct values than this is dropped from completion UNLESS
@@ -62,6 +68,14 @@ const MAX_KEY_CARDINALITY = 40;
 // Skip absurdly long values — they're prose, not categories, and make terrible
 // ghost suffixes.
 const MAX_VALUE_LEN = 40;
+
+// A value opening with YYYY-MM-DD is a date, never a useful categorical pick
+// (dates are queried via before:/after:/recency). Mirrors bm25.ts
+// PROPERTY_DATE_RE — duplicated, not imported, to keep suggest's dependency
+// surface light (same rationale as TAG_CH below). This is the by-VALUE backstop
+// for date fields the user hasn't typed Date in Obsidian's registry, so the
+// registry check and this guard together replace the old date NAME blocklist.
+const VALUE_DATE_RE = /^\d{4}-\d{2}-\d{2}/;
 
 // What the parser (query-parser.ts) can actually capture, mirrored here so the
 // completion never offers a value that wouldn't bind. TAG_CH is the same
@@ -92,11 +106,31 @@ export class SuggestEngine {
     private fields = new Map<string, Map<string, number>>();
     // Completable keys, most-populated first (drives the [ menu order).
     private fieldKeys: string[] = [];
+    // Total note-count per key, retained for EVERY key seen — including the
+    // high-cardinality ones dropped from `fields`. Backs the `[` menu's
+    // `· N notes` hint for numeric keys like `price` (192 near-unique values →
+    // excluded from `fields`, so the old fields-only count read a misleading 0).
+    private keyTotals = new Map<string, number>();
+    // Properties declared Number in Obsidian's type registry. Offered in the `[`
+    // key-menu REGARDLESS of cardinality (the categorical gate is for value
+    // completion, which numerics don't do — they complete to an operator), so a
+    // high-cardinality field like `price` reappears once it's typed Number. This
+    // is the direct fix for the original `[price` autocomplete gap.
+    private numericKeys = new Set<string>();
+    // Properties declared Date / Date & time in Obsidian's type registry,
+    // lowercased. Excluded from value completion entirely — a date is per-note
+    // temporal data, queried via before:/after:/recency, never a categorical
+    // pick. The VALUE_DATE_RE guard in build() additionally catches date fields
+    // the user hasn't typed in the registry (e.g. a bare `due:`), so neither
+    // path needs the date key NAMES the blocklist used to carry.
+    private dateKeys = new Set<string>();
 
     // Build all dictionaries from the in-memory metadata cache. Cheap enough to
     // run on every modal open (a single pass over getMarkdownFiles, no I/O), so
     // suggestions always reflect the current vault.
     build(app: App): this {
+        this.numericKeys = enumerateNumberPropertyNames(app);
+        this.dateKeys = new Set(enumerateDatePropertyNames(app).map(k => k.toLowerCase()));
         const cache = app.metadataCache as unknown as { getTags?: () => Record<string, number> };
         for (const [t, c] of Object.entries(cache.getTags?.() ?? {})) {
             const tag = t.replace(/^#/, '');
@@ -111,7 +145,9 @@ export class SuggestEngine {
             const fm = app.metadataCache.getFileCache(f)?.frontmatter;
             if (!fm) continue;
             for (const [k, v] of Object.entries(fm)) {
-                if (KEY_BLOCKLIST.has(k) || !PARSER_KEY.test(k)) continue; // key must be parser-capturable (\w+)
+                // Skip own-operator/machinery keys (blocklist), registry-typed
+                // Date keys (by type), and non-parser-capturable keys (\w+).
+                if (KEY_BLOCKLIST.has(k) || this.dateKeys.has(k.toLowerCase()) || !PARSER_KEY.test(k)) continue;
                 const add = (val: unknown) => {
                     // Coerce numbers/booleans the same way the index does
                     // (extractProperties String()s them), so completed:true /
@@ -128,6 +164,13 @@ export class SuggestEngine {
                     // hits. See [[Seek Index Processing Audit]].
                     const s = toDisplayForm(val);
                     if (!s || s.length > MAX_VALUE_LEN) return;
+                    // Date-shaped values are temporal data, never a useful
+                    // categorical pick — drop them by VALUE shape so an untyped
+                    // date field (`due:`, `date:`) stays out of the menu without
+                    // being named. A key whose values are ALL dates ends up with
+                    // an empty map and is never offered. (Registry-typed Date
+                    // keys are already skipped above, before reaching add().)
+                    if (VALUE_DATE_RE.test(s)) return;
                     // Stray bracket chars (outside wikilink syntax) break the
                     // [key:value] token grammar in the pill field (activeToken's
                     // lastIndexOf bracket detection) — never offer those.
@@ -144,11 +187,36 @@ export class SuggestEngine {
             // average ≥2 notes each; a per-note-unique field (distinct ≈ total)
             // stays excluded however it's measured.
             const total = [...m.values()].reduce((a, b) => a + b, 0);
+            this.keyTotals.set(k, total);
             if (m.size <= MAX_KEY_CARDINALITY || total >= 2 * m.size) this.fields.set(k, m);
         }
         const keyTotal = (k: string) => [...this.fields.get(k)!.values()].reduce((a, b) => a + b, 0);
         this.fieldKeys = [...this.fields.keys()].sort((a, b) => keyTotal(b) - keyTotal(a));
         return this;
+    }
+
+    // Is `key` a Number-typed property? Drives the numeric comparison filter
+    // (`[price>50]`) — the search modal's red error-pill validation reads this,
+    // and the bracket value-menu uses it to offer operator scaffolds.
+    isNumericKey(key: string): boolean {
+        return this.numericKeys.has(key);
+    }
+
+    // Keys offered in the `[` key-menu: the gated categorical keys (most-populated
+    // first), then any Number-typed keys not already among them (alphabetical).
+    // Numeric keys ride past the cardinality gate (see numericKeys above).
+    private completableKeys(): string[] {
+        const extra = [...this.numericKeys].filter(k => !this.fields.has(k)).sort((a, b) => a.localeCompare(b));
+        return [...this.fieldKeys, ...extra];
+    }
+
+    // Note-count backing a completable key, for the menu's `· N notes` hint.
+    // Reads `keyTotals` (populated for every key, categorical or not) so a
+    // numeric-only key like `price` — absent from `fields` — still reports its
+    // real count instead of 0. Returns 0 only for a Number-typed key the index
+    // has no usable values for (registry-declared but unindexed).
+    private keyCount(k: string): number {
+        return this.keyTotals.get(k) ?? 0;
     }
 
     // Detect what filter the user is completing at the cursor (always the tail,
@@ -278,9 +346,9 @@ export class SuggestEngine {
                 return best ? build(best.tok, 'field', `${key}:${best.value} · ${best.count} notes`) : null;
             }
             case 'fieldkey': {
-                // fieldKeys is already most-populated-first; take the first that
-                // prefix-extends, preserving that frequency order.
-                for (const k of this.fieldKeys) {
+                // completableKeys is categorical-first (most-populated) then numeric;
+                // take the first that prefix-extends, preserving that order.
+                for (const k of this.completableKeys()) {
                     const tok = `[${k}:`;
                     if (this.extendsTok(tok, typedTok)) {
                         return build(tok, 'fieldkey', `${k}:`);
@@ -330,11 +398,10 @@ export class SuggestEngine {
             }
             case 'fieldkey': {
                 const out: SuggestItem[] = [];
-                for (const k of this.fieldKeys) {
+                for (const k of this.completableKeys()) {
                     const tok = `[${k}:`;
                     if (this.extendsTok(tok, typedTok)) {
-                        const count = [...this.fields.get(k)!.values()].reduce((a, b) => a + b, 0);
-                        out.push(item(tok, 'fieldkey', `${k}:`, count, `${k}:`));
+                        out.push(item(tok, 'fieldkey', `${k}:`, this.keyCount(k), `${k}:`));
                     }
                     if (out.length >= limit) break;
                 }

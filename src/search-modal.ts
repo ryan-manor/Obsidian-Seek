@@ -115,12 +115,15 @@ interface SeekResultRow {
     lastCrumb: string;
 }
 
-// The version-stale banner the modal renders between the query field and the results.
-// The plugin supplies only the message (index-notice.ts policy); the modal owns the
-// fixed "Open settings" action (where the reindex affordance lives), so this is a pure
-// signpost — no async, no button-state to manage.
+// The index-state banner the modal renders between the query field and the results.
+// The plugin supplies the copy + tone (index-notice.ts policy); the modal owns the
+// "Open settings" action (where the reindex affordance lives), shown only when the spec
+// asks for it (showAction) — the syncing/info state needs no button. A twin of
+// IndexBannerSpec (index-notice.ts), kept separate so the UI module owns no policy.
 export interface IndexBanner {
     message: string;
+    tone: 'info' | 'warn';
+    showAction: boolean;
 }
 
 export class SeekSearchModal extends Modal {
@@ -267,14 +270,22 @@ export class SeekSearchModal extends Modal {
         this.suggester = new SuggestEngine().build(this.app);
         this.vaultTagSet = this.collectVaultTags();
 
-        // Component 1 — the token/pill query field.
+        // Component 1 — the token/pill query field. The 4th arg gates after:/before:
+        // date filters on Recency being ON (a date field exists to key off — D4);
+        // numeric-key validation (the red error pill) routes through the shared
+        // suggester (SuggestEngine.isNumericKey), so no extra callback is needed.
+        // Name of the date field after:/before: compare — the user's Recency
+        // selection (their chosen frontmatter property, or file-modified time),
+        // mirroring the Settings → Recency picker. Drives the suggestion hint so
+        // it labels the real field instead of a hardcoded `created`.
+        const dateFieldLabel = this.settings.recencyKey === 'modified' ? 'modified' : this.settings.createdProp;
         this.field = new PillQueryField(contentEl, this.suggester, {
             onQueryChange: q => this.scheduleSearch(q),
             onNavigate: dir => this.moveSelection(dir),
             onSubmit: newTab => this.openSelected(newTab),
             onDismiss: () => this.close(),
             validateTag: tag => this.tagBinds(tag),
-        });
+        }, this.settings.recencyEpsilon > 0, dateFieldLabel);
         this.field.focus();
 
         // Seed from a deep link (obsidian://seek?query=…). setQuery emits the
@@ -558,8 +569,25 @@ export class SeekSearchModal extends Modal {
 
     private renderEmpty(): void {
         if (this.indexEmpty) { this.renderNoIndex(); return; }
-        const msg = this.modelReady ? 'Type to search…' : 'Loading model… you can start typing.';
-        this.renderStatus(msg);
+        // Resting state (no active query, index present): collapse the lower section to
+        // nothing so the modal is just the search bar (+ the version-stale banner, if
+        // any). The field placeholder ("Search your vault…") already says what to do, so
+        // a "Type to search…" box is redundant chrome — and a tall idle body pushed the
+        // mobile keyboard-aware layout around. Active-query feedback ("No notes match.",
+        // "Searching…", errors) and the empty-index onboarding still render via their own
+        // paths (renderResults / renderNoIndex); only this idle placeholder is dropped.
+        this.renderResting();
+    }
+
+    // Empty the results body without painting a status line — the modal collapses to the
+    // query field (and the banner slot, which self-collapses when empty). clearRows()
+    // already empties the container + resets the row pool; we just drop the loading dim
+    // and the cached result list so a later click can't reference a stale set.
+    private renderResting(): void {
+        if (!this.resultsEl) return;
+        this.clearRows();
+        this.currentResults = [];
+        this.resultsEl.removeClass('is-loading');
     }
 
     // Full-replace the results area with a single status line. Resets the row
@@ -626,9 +654,16 @@ export class SeekSearchModal extends Modal {
         const notice = this.getIndexNotice?.();
         if (!notice) return;
         const banner = this.bannerSlot.createDiv({ cls: 'seek-index-banner' });
+        // Calm (info) variant for the "syncing from another device" state; the default
+        // warning style for the stale/action-needed state.
+        banner.toggleClass('is-info', notice.tone === 'info');
         banner.createSpan({ cls: 'seek-index-banner-msg', text: notice.message });
-        banner.createEl('button', { cls: 'seek-index-banner-btn mod-cta', text: 'Open settings' })
-            .addEventListener('click', () => this.openSeekSettings());
+        // Only the action-needed banner carries the reindex affordance; the syncing
+        // banner has nothing for the user to do, so it shows no button.
+        if (notice.showAction) {
+            banner.createEl('button', { cls: 'seek-index-banner-btn mod-cta', text: 'Open settings' })
+                .addEventListener('click', () => this.openSeekSettings());
+        }
     }
 
     // Loading feedback that does NOT destroy what's on screen: dim the existing

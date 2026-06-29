@@ -22,7 +22,8 @@
         "@types/js-yaml": "^4.0.9",
         "@types/node": "^22.0.0",
         "esbuild": "^0.24.0",
-        "js-yaml": "^4.1.0",
+        "fake-indexeddb": "^6.2.5",
+        "js-yaml": "^4.2.0",
         "obsidian": "^1.7.2",
         "typescript": "^5.6.0",
         "vitest": "^2.1.0"

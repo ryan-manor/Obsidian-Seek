@@ -7,10 +7,12 @@
 //
 // The field is a VIEW over a query STRING: pills + free text serialize back to
 // the canonical inline-filter syntax the backend already parses
-// (`tag:`, `path:…/*`, `[created:>date]`), so the search pipeline
-// (scheduleSearch → runSearch → parseQuery) is untouched — it still receives a
-// string. `after:`/`before:` are friendly sugar that serialize to the real
-// `[created:>…]` / `[created:<…]` date filters.
+// (`tag:`, `path:…/*`, `[key:value]`, `[price>50]`, `after:`/`before:`), so the
+// search pipeline (scheduleSearch → runSearch → parseQuery) is untouched — it
+// still receives a string. `after:`/`before:` serialize verbatim (they ARE the
+// canonical date syntax now) and target the Recency date field; a numeric
+// comparison rides as a `prop` pill whose value carries the operator
+// (`[price:>50]`).
 //
 // Caret discipline (ported from the design prototype): the contenteditable is
 // UNCONTROLLED — we never rewrite its text on a re-render, only on the discrete
@@ -36,11 +38,15 @@ export interface PillToken {
 // respectively — see derive()/pendingCommit()), so every filter the backend
 // understands now gets the same inline-pill treatment. Only `-term` negation
 // stays free text (parseQuery handles it; it has no value to pill).
+// Static operator registry. tag/path hints are final; the after/before hints
+// are SUFFIXES only — opHint() prefixes them with the user's configured Recency
+// date-field name at render time, because that field is per-vault and these
+// filters compare it, not a fixed `created` property (see opHint / dateFieldLabel).
 const OPS: Array<{ key: PillOp; hint: string }> = [
     { key: 'tag', hint: 'filter by #tag' },
     { key: 'path', hint: 'filter by folder' },
-    { key: 'after', hint: 'created on/after a date' },
-    { key: 'before', hint: 'created on/before a date' },
+    { key: 'after', hint: 'on/after a date' },
+    { key: 'before', hint: 'on/before a date' },
 ];
 const TOK_RE = /^(tag|path|after|before):(.*)$/i;
 
@@ -176,6 +182,16 @@ export class PillQueryField {
         parent: HTMLElement,
         private suggester: SuggestEngine,
         private cb: PillQueryFieldCallbacks,
+        // Whether `after:`/`before:` date filters are available — i.e. Recency is
+        // ON, so there's a chosen date field to key off. When false they're not
+        // offered or committed (the parser ignores them too). See D4.
+        private dateFiltersEnabled = true,
+        // Display name of the date field `after:`/`before:` compare against — the
+        // user's Recency selection (their chosen frontmatter property name, or
+        // 'modified' for file-modified time). Surfaced in the suggestion hint via
+        // opHint() so it names the real field, not a hardcoded `created`. Defaults
+        // to 'created' so ad-hoc/test construction still reads sensibly.
+        private dateFieldLabel = 'created',
     ) {
         this.rootEl = parent.createDiv({ cls: 'seek-q' });
 
@@ -242,13 +258,24 @@ export class PillQueryField {
             if (t.closest('.seek-pill') || t.closest('.seek-sugg')) return;
             // Inside the editable's wrapper but not on the text itself — the empty
             // space past a short query (.seek-edit is inline, so it's only as wide
-            // as the text; the rest of the line is .seek-editwrap). Do NOT
-            // preventDefault here: that was cancelling a click-drag text selection
-            // that begins in the dead space. Just ensure focus lands in the
-            // editable; the browser then anchors its own caret at the click point
-            // (the query's end), so a drag back across the text selects it.
+            // as the text; the rest of the line is .seek-editwrap, which fills the
+            // row via `flex: 1` but is NOT editable). There's no editable text node
+            // under the pointer here, so the browser places NO native caret on its
+            // own. Worse, if we let the native mousedown proceed it anchors the
+            // selection in the non-editable wrapper, which then CLOBBERS any caret
+            // we set — the field ends up focused but caretless (it looks dead and
+            // won't take typing, the .seek-editwrap dead-click bug). So preventDefault
+            // to stop that native anchoring, then focus + drop the caret at the
+            // query's end ourselves — the natural landing spot for a click past the
+            // text, and with nothing under the pointer there's nothing else it could
+            // mean. (This is the same treatment as the chrome branch below; an
+            // earlier version skipped preventDefault here to preserve a click-drag
+            // back into the text, but that's exactly what left a plain click in this
+            // region with no visible caret — the reported bug.)
             if (t.closest('.seek-editwrap')) {
-                if (document.activeElement !== this.editEl) this.editEl.focus();
+                e.preventDefault();
+                this.editEl.focus();
+                caretToEnd(this.editEl);
                 return;
             }
             // Genuine chrome outside the field (the magnifier, the row's padding):
@@ -313,13 +340,14 @@ export class PillQueryField {
             case 'path':
                 return /\s/.test(t.value) ? `path:"${t.value}"` : `path:${t.value}`;
             case 'after':
-                return `[created:>${t.value}]`;
+                return `after:${t.value}`;
             case 'before':
-                return `[created:<${t.value}]`;
+                return `before:${t.value}`;
             case 'prop':
                 // Round-trips any `[key:value]` parseQuery accepts: a plain
-                // substring match, a `"quoted"` exact value, or a date op like
-                // `created:>2026` (the operator rides along inside `value`).
+                // substring match, a `"quoted"` exact value, or a numeric
+                // comparison like `price:>50` (the operator rides inside `value`,
+                // and the colon is harmless — the comparison grammar accepts it).
                 return `[${t.key}:${t.value}]`;
         }
     }
@@ -337,6 +365,21 @@ export class PillQueryField {
 
     // ---- suggestion derivation ----
 
+    // The operators offered for keyword completion. after:/before: drop out when
+    // Recency is OFF (no date field to target — D4); tag:/path: are always on.
+    private availableOps(): typeof OPS {
+        return this.dateFiltersEnabled ? OPS : OPS.filter(o => o.key !== 'after' && o.key !== 'before');
+    }
+
+    // Resolve the dropdown hint for an operator. tag:/path: use their static
+    // hint as-is; after:/before: get the configured Recency date-field name
+    // prefixed onto the suffix in OPS, so the hint names the field the filter
+    // actually compares (e.g. "modified on/before a date" or "<myDateProp>
+    // on/after a date") rather than a hardcoded `created`.
+    private opHint(o: { key: PillOp; hint: string }): string {
+        return o.key === 'after' || o.key === 'before' ? `${this.dateFieldLabel} ${o.hint}` : o.hint;
+    }
+
     private derive(text: string): { ghost: string; sugg: SuggestState } {
         const last = (text.match(/(\S*)$/)?.[1]) ?? '';
 
@@ -349,6 +392,27 @@ export class PillQueryField {
         // stands) and the completed [key:value] binds through parseQuery.
         const lastOpen = text.lastIndexOf('[');
         if (lastOpen > text.lastIndexOf(']') && !text.slice(lastOpen).startsWith('[[')) {
+            // Numeric-key operator scaffolds: at `[price:` (colon typed, no value
+            // yet) on a Number-typed property, offer the three comparison operators
+            // instead of categorical values. Accepting rewrites to `[price:>` and
+            // re-derives; the user then types the number → `[price:>50]` binds.
+            const inner = text.slice(lastOpen + 1);
+            const ci = inner.indexOf(':');
+            const bracketKey = (ci >= 0 ? inner.slice(0, ci) : inner).trim();
+            const valuePart = ci >= 0 ? inner.slice(ci + 1) : null;
+            if (valuePart !== null && valuePart.trim() === '' && this.suggester.isNumericKey(bracketKey)) {
+                const head = text.slice(0, lastOpen);
+                const ops: Array<{ o: '>' | '<' | '='; lbl: string }> = [
+                    { o: '>', lbl: 'greater than (incl.)' },
+                    { o: '<', lbl: 'less than (incl.)' },
+                    { o: '=', lbl: 'equal to' },
+                ];
+                const items: MenuItem[] = ops.map(({ o, lbl }) => ({
+                    type: 'text', accept: `${head}[${bracketKey}:${o}`, label: `[${bracketKey} ${o}`, hint: lbl,
+                }));
+                return { ghost: '', sugg: { open: true, kind: 'value', items, active: 0, hintRow: 'type a number' } };
+            }
+
             const list = this.suggester.listSuggestions(text, 8)
                 .filter(s => s.kind === 'field' || s.kind === 'fieldkey');
             const items: MenuItem[] = list.map(s => {
@@ -392,13 +456,13 @@ export class PillQueryField {
 
         // Operator-keyword stage: a trailing alpha run that prefixes an operator.
         if (/^[a-zA-Z]+$/.test(last)) {
-            const matches = OPS.filter(o => o.key.startsWith(last.toLowerCase()));
+            const matches = this.availableOps().filter(o => o.key.startsWith(last.toLowerCase()));
             if (matches.length) {
                 return {
                     ghost: matches[0].key.slice(last.length) + ':',
                     sugg: {
                         open: true, kind: 'op', active: 0,
-                        items: matches.map(o => ({ type: 'op', label: o.key + ':', hint: o.hint, opKey: o.key })),
+                        items: matches.map(o => ({ type: 'op', label: o.key + ':', hint: this.opHint(o), opKey: o.key })),
                     },
                 };
             }
@@ -421,6 +485,12 @@ export class PillQueryField {
                     ghost: list[0]?.ghost ?? '',
                     sugg: { open: items.length > 0, kind: 'value', items, active: 0 },
                 };
+            }
+
+            // after:/before: are unavailable with Recency OFF — no date field to key
+            // off (D4). Leave the token as plain text (the parser ignores it too).
+            if (!this.dateFiltersEnabled) {
+                return { ghost: '', sugg: { open: false, kind: 'op', items: [], active: 0 } };
             }
 
             // after: / before: — date presets + a free-entry hint.
@@ -504,6 +574,14 @@ export class PillQueryField {
         if (last.startsWith('#') && last.length > 1 && !last.startsWith('##')) {
             return { op: 'tag', value: last.slice(1) };
         }
+        // Numeric comparison `[price>50]` / `[price > 50]` — operator required,
+        // colon optional (mirrors the parser's comparison branch). Commit a `prop`
+        // pill whose value carries the operator (`>50`), which serializes to
+        // `[price:>50]` and re-parses as a numeric filter. Tried BEFORE the
+        // substring form so the colon-less comparison binds; the substring regex
+        // (which needs a colon) never matches `price > 50` anyway.
+        const cm = last.match(/^\[([^\]:[<>=]+?)\s*([<>=])\s*([^\]]*)\]$/);
+        if (cm && cm[3].trim()) return { op: 'prop', key: cm[1].trim(), value: `${cm[2]}${cm[3].trim()}` };
         // Complete `[key:value]`: key is any non-`]:[` run, value any non-`]`
         // run, split on the FIRST colon (a value may contain `:`).
         const bm = last.match(/^\[([^\]:[]+):([^\]]*)\]$/);
@@ -519,7 +597,9 @@ export class PillQueryField {
     // commit leaves the text in the editable instead. tag:/path: stay
     // permissive (tags get the warn-pill state, paths are normalized below).
     private canCommit(op: PillOp, value: string): boolean {
-        if (op === 'after' || op === 'before') return parseDateMs(value) !== null;
+        // With Recency OFF a date pill would serialize to a token the parser
+        // ignores — an active-looking filter that filters nothing. Decline it.
+        if (op === 'after' || op === 'before') return this.dateFiltersEnabled && parseDateMs(value) !== null;
         return true;
     }
 
@@ -790,6 +870,15 @@ export class PillQueryField {
             if (t.op === 'tag' && !this.cb.validateTag(t.value)) {
                 pill.addClass('seek-pill-warn');
                 pill.setAttr('aria-label', `No vault tag matches "${t.value}". Tag filtering is exact + hierarchical, so a sibling like "${t.value}s" won't match.`);
+            }
+            // D3: a numeric comparison (`[price>50]`, value starts with an
+            // operator) on a key that isn't a declared Number property can't be
+            // honored — flag the pill red. It serializes fine but matches nothing
+            // (the matcher returns 0 results for the whole query). The fix is to set
+            // the property's type to Number in Obsidian.
+            if (t.op === 'prop' && !!t.key && /^\s*[<>=]/.test(t.value) && !this.suggester.isNumericKey(t.key)) {
+                pill.addClass('seek-pill-error');
+                pill.setAttr('aria-label', `"${t.key}" isn't a Number property — set its type to Number in Obsidian to filter numerically. This filter currently matches nothing.`);
             }
             // A prop pill's keycap is its frontmatter key (`context:`), not the
             // internal op name; every other op labels with the op itself.

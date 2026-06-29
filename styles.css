@@ -232,16 +232,40 @@
     color: var(--text-normal);
 }
 
-.seek-pill-x {
+/* The remove × is a real <button>, so themes that style modal buttons (min-width,
+   padding, background, native appearance) can balloon it — it rendered as an
+   oversized grey box on some themes (the "filter button too wide" report).
+   `all: unset` clears the basics, but it sits at one-class specificity, which a
+   theme's `.modal button` (0,1,1) or `.theme-x .modal button` (0,2,1) outranks —
+   so the theme chrome reasserts. Scope under `.seek-modal .seek-pill` (0,3,0) to
+   win the cascade, and pin a fixed square box so no leaking min-width/padding can
+   stretch it. (The is-selected colour rule below is bumped to match, so it still
+   outranks this.) */
+.seek-modal .seek-pill .seek-pill-x {
     all: unset;
-    cursor: pointer;
-    padding: 0 3px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 1.2em;
+    height: 1.2em;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
     border-radius: 4px;
+    background: transparent;
+    box-shadow: none;
+    appearance: none;
+    -webkit-appearance: none;
     color: var(--text-muted);
+    font-size: inherit;
     line-height: 1;
+    cursor: pointer;
 }
 
-.seek-pill-x:hover {
+.seek-modal .seek-pill .seek-pill-x:hover {
     background: var(--background-modifier-hover);
     color: var(--text-normal);
 }
@@ -256,6 +280,20 @@
     color: var(--text-warning, var(--text-error));
 }
 
+/* A numeric-comparison pill (`[price>50]`) on a property that isn't typed Number,
+   so it can't be honored — an error, not a soft warning (D3). Red, and the value
+   tints too (the whole comparison is inert), distinguishing it from the amber
+   non-binding-tag warn above. Fix: set the property's type to Number in Obsidian. */
+.seek-pill-error {
+    background: color-mix(in srgb, var(--text-error) 13%, var(--background-primary));
+    border-color: var(--text-error);
+}
+
+.seek-pill-error .seek-pill-k,
+.seek-pill-error .seek-pill-v {
+    color: var(--text-error);
+}
+
 /* Keyboard-selected pill: stepped onto with ←/→, removed with Backspace/Delete.
    A filled accent chip with a focus ring so it reads as "this is the one a
    delete will take". Selection visually outranks the warn state above. */
@@ -265,9 +303,12 @@
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 35%, transparent);
 }
 
-.seek-pill.is-selected .seek-pill-k,
-.seek-pill.is-selected .seek-pill-v,
-.seek-pill.is-selected .seek-pill-x {
+/* Scoped under .seek-modal so the .seek-pill-x part stays above the bumped
+   .seek-modal .seek-pill .seek-pill-x base rule (else the selected × would fall
+   back to --text-muted on the accent-filled chip). */
+.seek-modal .seek-pill.is-selected .seek-pill-k,
+.seek-modal .seek-pill.is-selected .seek-pill-v,
+.seek-modal .seek-pill.is-selected .seek-pill-x {
     color: var(--text-on-accent);
 }
 
@@ -390,6 +431,17 @@
 .seek-modal:not(.seek-mobile) .modal-content.seek-sugg-open {
     min-height: min(380px, 74vh);
 }
+/* Mobile needs the SAME reserve, or the absolutely-positioned dropdown overflows the
+   collapsed content box and `overflow:hidden` clips the lower suggestions (and any
+   results behind them) — the "cut itself off" report. The original rule excluded mobile
+   to avoid burying the footer below the keyboard, so cap the reserve at the keyboard-
+   aware viewport (--seek-vvh minus the top offset, == .modal-content's own max-height):
+   modal-content never grows past what's visible, so the footer stays pinned above the
+   keyboard while the menu still gets room (the 280px dropdown scrolls internally if a
+   short viewport leaves less). */
+.seek-modal.seek-mobile .modal-content.seek-sugg-open {
+    min-height: min(380px, calc(var(--seek-vvh, 100vh) - var(--seek-top)));
+}
 
 .seek-sugg-hint {
     padding: 5px 10px;
@@ -440,6 +492,11 @@
     overflow-y: auto;
     padding: 6px;
 }
+/* Resting state: the results body is emptied (renderResting), so drop its padding too —
+   the modal collapses to just the query field + footer (and the banner slot, which has
+   its own :empty collapse). Any painted state (results, "No notes match.", onboarding)
+   refills the body and the padding returns. */
+.seek-results:empty { padding: 0; }
 
 /* Non-destructive "searching" state: dim the existing results in place while
    the next set is fetched, so a fast warm search shows no flash. */
@@ -670,6 +727,13 @@
     border: 1px solid var(--text-warning);
     background: rgba(224, 160, 48, 0.12);                        /* fallback for older WebKit */
     background: color-mix(in srgb, var(--text-warning) 12%, transparent);
+}
+/* Calm variant for the "syncing from another device" state: reassuring (accent), not the
+   warning amber. This banner carries no button — it heals itself, nothing for the user to do. */
+.seek-index-banner.is-info {
+    border-color: var(--text-accent);
+    background: rgba(82, 139, 255, 0.10);                       /* fallback for older WebKit */
+    background: color-mix(in srgb, var(--text-accent) 10%, transparent);
 }
 .seek-index-banner-msg { flex: 1 1 auto; overflow-wrap: anywhere; }
 .seek-index-banner-btn {
@@ -1078,7 +1142,7 @@
 }
 .seek-settings .seek-about-by {
     font-size: 11px;
-    color: var(--text-faint);
+    color: var(--text-muted);
 }
 .seek-settings .seek-about-links {
     display: flex;

@@ -77,15 +77,15 @@ const POSSESSIVE_S = /(\p{L}\p{M}*)['’]s(?=$|[^\p{L}\p{N}])/giu;
 const GLUE_RUN = /^[\p{Pd}._/\p{Pc}'’]+$/u;
 
 // camelCase boundary set for the ADDITIVE inverse-split (2026-06-23). A query
-// token `atlas` could not reach a doc whose only signal is the camelCase tag
-// `theAtlas` (or `blogs/theAtlas`), because the fragment indexes as one opaque
+// token `verge` could not reach a doc whose only signal is the camelCase tag
+// `theVerge` (or `blogs/theVerge`), because the fragment indexes as one opaque
 // token. This is the "conservative split" of the identifier-splitting literature
 // (Hill et al. 2013) — the EASY, ~93%-accurate case (vs same-case concatenation
 // like `hashtable`, which all techniques fail and we deliberately do NOT attempt).
 // It is the exact inverse of the GLUE_RUN join, and just as additive.
 //
 // Two zero-width boundaries, the canonical identifier-split pair:
-//   - lower/digit → Upper  ("theAtlas" → the·Atlas, "mac2evolution"… no: digits
+//   - lower/digit → Upper  ("theVerge" → the·Verge, "mac2evolution"… no: digits
 //     handled by the FIRST alt only as a left edge, never split BETWEEN letter
 //     and number — that collides with versions/ids like r2/gpt4/v2 the fuzzy
 //     ladder keeps exact, so there is no \p{N} on the right side);
@@ -147,7 +147,7 @@ export function segmentCjkToken(token: string): string[] {
 
 // camelCase sub-parts of one Latin fragment, or [] when it does not split.
 // Returns ONLY the parts (≥2); the caller keeps the canonical fragment and
-// appends these additively (so "theAtlas" → [theAtlas, the, Atlas]). Splitting
+// appends these additively (so "theVerge" → [theVerge, the, Verge]). Splitting
 // at zero-width boundaries with String.split preserves every character. Applied
 // to the canonical fragment only, never to the glue-joined form, so the added-
 // token count stays bounded (≤ parts per compound, no combinatorial fan-out).
@@ -185,9 +185,9 @@ export function splitCamel(frag: string): string[] {
 // matching (which always want the recall forms, the default) — it is for the
 // normalization enumerators (getQueryBound's per-term-UB sum and distinct count)
 // that must NOT treat a recall helper as a query term the answer is expected to
-// satisfy: `example.com` emits the joined `examplecom`, which no real clipping
+// satisfy: `theverge.com` emits the joined `thevergecom`, which no real clipping
 // carries (its URL glues the whole path into one mega-token) yet which inflates
-// the bound's Σ UB(t)·D denominator and squashes a perfect `example` match. The
+// the bound's Σ UB(t)·D denominator and squashes a perfect `theverge` match. The
 // join is a numerator-only recall affordance; excluding it from the bound is the
 // same contract fuzzy/prefix/synonym derived terms already have (they too score
 // without raising the bound — fusion clips at 1). (2026-06-26, [[Seek BM25

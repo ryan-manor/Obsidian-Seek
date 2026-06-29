@@ -8,12 +8,13 @@
 
 import type { App } from 'obsidian';
 import { TFile, Notice } from 'obsidian'; // value imports: reindexDelta uses `instanceof TFile`; the coherence-drift guard surfaces a Notice
-import type { Chunk, ChunkMeta, ScoredChunk, SearchEntry, IndexCompleteEntry, IndexProgressEntry, ResetEntry, QueryFilters, SeekSettings, MemorySnapshot } from './types';
+import type { Chunk, ChunkMeta, ScoredChunk, SearchEntry, IndexCompleteEntry, IndexProgressEntry, ResetEntry, QueryFilters, FilterContext, SeekSettings, MemorySnapshot } from './types';
 import { snapshotMemory, memoryDelta, distributionStats } from './types';
 import { MarkdownChunker, cyrb53Hex } from './chunker';
+import { cleanDenseText } from './dense-clean';
 import { extractBaseDocs } from './base-extractor';
 import { MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, ANALYZER_VERSION, BM25_COVERAGE_POW } from './bm25';
-import { buildSynonymMap, SYNONYM_WEIGHT, type SynonymMap } from './synonyms';
+import { buildSynonymMap, chunkDeclaresAlias, SYNONYM_WEIGHT, type SynonymMap } from './synonyms';
 import { rank, cosineScores, DEFAULT_RANKING_CONFIG } from './ranker';
 import { browseOrder, recencyDate } from './fusion';
 import { IndexStore, nukeDatabase, classifyFileDelta, findOrphanChunkIds, isStoreClosedError, type MetaConfig, type FileRecord } from './index-store';
@@ -30,13 +31,14 @@ import { quantizeInt8, dequantizeInt8, type QuantVec } from './quant';
 import { VecReservoir, denseBgStats, calibratedConfidence, BG_RESERVOIR, MIN_BG_SAMPLE } from './dense-stats';
 import { bulkAppend, clearDevice, sidecarDirSignature, shouldReconcileSidecar, SIDECAR_FORMAT, bm25PathFor, writeBytesAtomic, ensureDir, listSidecarDeviceIds, compactDevice, deviceShardBytes, type CompactResult, type TierBytes } from './sidecar';
 import { writeDeviceMeta, readDeviceMeta, metaAccepts, expectationFor, type SidecarMeta, type MetaExpectation } from './sidecar-meta';
-import { hydrateFromSidecar, rankAcceptedProducers, type ReChunkedNote, type HydrateResult, type HydrateDeps } from './sidecar-sync';
+import { hydrateFromSidecar, rankAcceptedProducers, probePeerAhead, type ReChunkedNote, type HydrateResult, type HydrateDeps } from './sidecar-sync';
 import { pluginIdentity, shouldStampLiveIdentity, identityHealEligibility } from './identity';
 import { gzipString, gunzipToString, gzipAvailable } from './gzip';
 import { IndexCoordinator } from './index-coordinator';
 import { CompositorPacer } from './pacer';
 import { isMobilePlatform, residentInt8Enabled } from './platform';
 import { parseQuery, compileMatcher, excludedNotePaths } from './query-parser';
+import { enumerateNumberPropertyNames } from './prop-types';
 
 // Indexing batches via PER-BUCKET ROLLING BUFFERS (2026-06-03 redesign).
 //
@@ -340,6 +342,13 @@ export class SearchOrchestrator {
         let filesSkippedError = 0;
         let embedRecycles = 0;
         let filesCommitted = 0;
+        // The paths whose file-record was ACTUALLY written (commitFile succeeded) — NOT
+        // the same as the prefix of started files: an empty/below-min-chunk note or a
+        // mid-list skip-error commits nothing yet still advances processedFiles, so a
+        // count-based prefix over-reports. The catch-up drain shrinks its remainder by
+        // exactly this set, so an un-committed file stays dirty and is retried (never
+        // dropped from the work-list to spin the outer sweep). See reindexDelta.
+        const committedFilePaths: string[] = [];
         let processedFiles = 0;   // files we STARTED (for the incremental burst budget + filesDeferred)
         let lastProgress = 0;
         let lastProgressAt = performance.now();
@@ -559,6 +568,7 @@ export class SearchOrchestrator {
             try {
                 await commitFile(p.fs);
                 filesCommitted++;
+                committedFilePaths.push(p.fs.file.path);  // real progress for the catch-up drain
             } catch (ce) {
                 // A closed store (onunload, or an onversionchange from another
                 // instance deleting the DB mid-reindex) makes EVERY subsequent commit
@@ -898,6 +908,10 @@ export class SearchOrchestrator {
             // have started fewer than it was handed (the rest are filesDeferred).
             // Identical to files.length on a full reindex (never budget-broken).
             filesIndexed: processedFiles,
+            // The files actually committed this pass (record written), so the catch-up
+            // drain advances by real progress, not by count-of-started. Distinct from
+            // filesIndexed (started) whenever a file is empty/skipped/budget-deferred.
+            committedFilePaths,
             chunksIndexed: totalChunks,
             vectorsWritten: totalVectors,
             filesSkippedError,
@@ -1138,7 +1152,7 @@ export class SearchOrchestrator {
         // multi-minute embed isn't silent; undefined for an ordinary single-note
         // flush. embedAndCommitFiles already calls it in 'incremental' mode.
         opts: { embed: boolean; maxFiles?: number; budgetMs?: number; shouldContinue?: () => boolean; onProgress?: (msg: string) => void },
-    ): Promise<{ deletedPaths: number; deletedChunks: number; embedded: IndexCompleteEntry | null; deferredEmbed: number; sidecarHydrated: number; carriedOver: number }> {
+    ): Promise<{ deletedPaths: number; deletedChunks: number; embedded: IndexCompleteEntry | null; deferredEmbed: number; sidecarHydrated: number; carriedOver: number; committedPaths: string[] }> {
         // Set inside the mutex by applyDelta; read after to gate the re-warm. A
         // successful incremental patch IS the warm, so warmCaches is skipped (it
         // would re-pay the O(N) fit the patch just avoided).
@@ -1183,6 +1197,10 @@ export class SearchOrchestrator {
                 let deferredEmbed = 0;
                 let sidecarHydrated = 0;
                 let carriedOver = 0;
+                // Paths this burst actually committed (now non-dirty). Drives the
+                // catch-up drain's advance-by-real-progress (see the computation after
+                // the embed block, and drainCatchUp).
+                let committedPaths: string[] = [];
                 // Model-drift guard: if the loaded model differs from the one
                 // that built the stored index (a legacy english-r2 index not
                 // yet full-reindexed onto ml97), embedding dirty files
@@ -1240,6 +1258,24 @@ export class SearchOrchestrator {
                             // meta stamp below — not a count() taken after hydration.
                             { budgetMs: opts.budgetMs, shouldContinue: opts.shouldContinue, addsSink: adds, storeWasEmpty });
                     }
+                    // Paths this burst actually committed (now non-dirty), so the catch-up
+                    // drain advances by REAL progress instead of by maxFiles: carry-over
+                    // reuse (toEmbed \ afterCarry) + sidecar hydration (afterCarry \
+                    // remaining) + the files embedAndCommitFiles ACTUALLY committed
+                    // (committedFilePaths — record written). NOT a count-based prefix of
+                    // `remaining`: an empty/below-min-chunk note or a mid-list skip-error
+                    // advances processedFiles without committing, so a prefix would punch a
+                    // hole and drop a still-dirty file from the work-list — re-finding it
+                    // dirty every sweep and spinning the outer loop. A budget-deferred file
+                    // is likewise absent (stale chunks dropped, not re-embedded), so the
+                    // drain retries it next burst (the searchable-during-drain invariant).
+                    const afterCarrySet = new Set(afterCarry.map(f => f.path));
+                    const remainingSet = new Set(remaining.map(f => f.path));
+                    committedPaths = [
+                        ...toEmbed.filter(f => !afterCarrySet.has(f.path)).map(f => f.path),   // carried over
+                        ...afterCarry.filter(f => !remainingSet.has(f.path)).map(f => f.path), // sidecar-hydrated
+                        ...(embedded?.committedFilePaths ?? []),                              // actually embedded + committed
+                    ];
                 } else {
                     deferredEmbed = indexable.length;
                 }
@@ -1304,7 +1340,7 @@ export class SearchOrchestrator {
                 //   no-forward-progress / drift signal. (Budget deferral is detected
                 //   instead by the shrinking dirty set on the next computeDelta, so it
                 //   needs no separate return field.)
-                return { deletedPaths: deletedPaths.length, deletedChunks, embedded, deferredEmbed, sidecarHydrated, carriedOver };
+                return { deletedPaths: deletedPaths.length, deletedChunks, embedded, deferredEmbed, sidecarHydrated, carriedOver, committedPaths };
             } finally {
                 release();
                 this.coord.currentDelta = null;
@@ -1374,11 +1410,21 @@ export class SearchOrchestrator {
         // The adds that actually land after the duplicate filter (declared out here
         // so the success log reports the true row count, not the pre-filter total).
         let fresh: DeltaAdd[] = [];
+        // Did this delta touch an alias-bearing note? If not, the synonym
+        // dictionary is provably unchanged and its O(notes) rebuild is skipped at
+        // the commit below (chunkDeclaresAlias). Tracked across BOTH removes (an
+        // alias deletion/edit drops the old alias-bearing row) and adds, so an
+        // alias EDIT — remove-old + add-new — trips it from either side.
+        let aliasDictDirty = false;
         try {
             const removeRows: number[] = [];
             for (const id of removedIds) {
                 const row = bm.rowOf(id);
-                if (row !== undefined) removeRows.push(row);
+                if (row !== undefined) {
+                    removeRows.push(row);
+                    // Read the row's metadata BEFORE tombstoneFrameRows drops it.
+                    if (chunkDeclaresAlias(frame.orderedChunks[row])) aliasDictDirty = true;
+                }
                 bm.remove(id);
             }
             tombstoneFrameRows(frame, removeRows);
@@ -1387,6 +1433,7 @@ export class SearchOrchestrator {
             // see freshDeltaAdds. Runs AFTER the removes so edit re-commits survive.
             // The SAME list feeds bm.add and appendFrameRows → row spaces stay aligned.
             fresh = freshDeltaAdds(adds, id => bm.rowOf(id) !== undefined);
+            if (!aliasDictDirty) aliasDictDirty = fresh.some(a => chunkDeclaresAlias(a.chunk));
             for (const a of fresh) bm.add(a.chunk, a.chunk.content ?? '');
             appendFrameRows(frame, fresh);
             // Async: reclaims tombstoned postings so getQueryBound reads exact df (the
@@ -1422,9 +1469,14 @@ export class SearchOrchestrator {
         this.coord.bumpGeneration();
         frame.generation = this.coord.generation;
         this.stampBm25Cache(bm.size);
-        // Synonym dict is O(notes); refresh it (over LIVE rows only) when the
-        // experimental expansion toggle is on, so mates stay current after a delta.
-        if (this.settings.synonymExpansion) {
+        // Synonym dict derives ONLY from alias-bearing notes (see chunkDeclaresAlias
+        // / buildClasses), so refresh it — over LIVE rows only — when the expansion
+        // toggle is on AND this delta actually touched an alias. A body-only edit
+        // can't change the dictionary, so it skips the O(notes) rebuild. (The
+        // df-ceiling guard then rides slightly stale between alias deltas; it's a
+        // coarse 5% junk filter, refreshed on the next alias-touching delta, full
+        // reindex, or cold lazy build in ensureBm25.)
+        if (this.settings.synonymExpansion && aliasDictDirty) {
             const liveChunks = frame.tombstoneCount === 0
                 ? frame.orderedChunks
                 : frame.orderedChunks.filter((_, i) => frame.validRows[i]);
@@ -1503,6 +1555,7 @@ export class SearchOrchestrator {
         const result = await this.coord.runExclusive(() =>
             hydrateFromSidecar(this.hydrateDeps(() => this.reChunkLive())),
         );
+        this._peerAhead = result.peerAhead; // refresh the "newer index exists" signal per scan
         // Stamp the build identity when hydrating onto a PREVIOUSLY-EMPTY index: every
         // chunk came from a metaAccepts-filtered (current-identity) producer, so the
         // index is provably at the current identity. This lets a hydrate-only device
@@ -1564,7 +1617,7 @@ export class SearchOrchestrator {
         if (producers.length === 0) {
             // Nothing compatible to rebuild FROM — do NOT nuke. acceptedProducers:0
             // signals the caller to tell the user the sidecar hasn't synced yet.
-            return { scanned: 0, needed: 0, hydrated: 0, skippedPartialNotes: 0, refusedProducers: 0, acceptedProducers: 0, hydratedNotePaths: [] };
+            return { scanned: 0, needed: 0, hydrated: 0, skippedPartialNotes: 0, refusedProducers: 0, acceptedProducers: 0, peerAhead: false, hydratedNotePaths: [] };
         }
         // 1. Nuke + reopen under the write mutex (mirrors reindexAllInner's reset) so a
         //    delta/search can't race the close→delete→open window. modelId = the
@@ -1581,6 +1634,20 @@ export class SearchOrchestrator {
         //    (its own write mutex; the now-empty store forces a full reconcile).
         this.invalidateBm25Cache();
         return this.hydrateSidecar();
+    }
+
+    // Does ANY other device have a sidecar in the index dir, regardless of its identity?
+    // A cheap, embed-free signal (a directory listing — no meta read, no model) that this
+    // vault is multi-device. When the local index is version-stale and rebuildFromSidecar
+    // found no CURRENT-identity producer, a present peer means a current index is (or will
+    // be) on its way — so the UI says "syncing", not "reindex". Self is excluded: our own
+    // stale sidecar is not an incoming heal. A long-dead peer's leftover sidecar is a rare,
+    // benign false-positive (it only keeps the calm banner up a little longer; reapDead-
+    // IdentitySidecars clears it at the next full reindex on some device).
+    async peerSidecarPresent(): Promise<boolean> {
+        if (!this.coord.sidecarOn()) return false;
+        const ids = await listSidecarDeviceIds(this.app.vault.adapter, this.coord.dir!);
+        return ids.some(id => id !== this.logger.deviceId);
     }
 
     // Referential-integrity sweep (Phase 3 steady-state GC): delete every chunk no
@@ -1727,9 +1794,18 @@ export class SearchOrchestrator {
     // user / recovery intent must never be gated).
     async reconcileSidecarIfChanged(): Promise<HydrateResult | null> {
         if (!this.coord.sidecarOn()) return null;
-        const sig = await sidecarDirSignature(this.app.vault.adapter, this.coord.dir!);
+        const sig = await sidecarDirSignature(this.app.vault.adapter, this.coord.dir!, this.logger.deviceId);
         const prev = this.lastReconcileSig ?? this.loadPersistedReconcileSig();
-        if (!shouldReconcileSidecar(sig, prev, await this.indexIsEmpty())) return null;
+        if (!shouldReconcileSidecar(sig, prev, await this.indexIsEmpty())) {
+            // Signature unchanged → the (expensive) hydrate is skipped, but _peerAhead resets
+            // to false on every new orchestrator and ONLY hydrateSidecar refreshes it. Recover
+            // the bit with a cheap meta-only probe so the peer-ahead banner + mobile grind-stop
+            // survive an app relaunch on an unchanged vault (the common iOS case) instead of
+            // silently disengaging while falsely reading "healthy". No reChunk, no mutation —
+            // just a producer-meta read; mirrors hydrateFromSidecar's own peerAhead predicate.
+            this._peerAhead = await probePeerAhead(this.app.vault.adapter, this.coord.dir!, expectationFor());
+            return null;
+        }
         const result = await this.hydrateSidecar();
         this.persistReconcileSig(sig);
         return result;
@@ -1847,13 +1923,15 @@ export class SearchOrchestrator {
         // The live-id oracle runs INSIDE compactDevice's dir lock so the snapshot and the
         // on-disk scan exclude concurrent appends — the drop decision needs no clock.
         const result = await compactDevice(adapter, dir, dev, () => this.collectLiveIds(), { minDeadRatio: 0.5, minShardBytes: floor });
-        // Our own jsonl rewrite changes the dir signature; refresh the persisted reconcile
-        // sig so the NEXT poll doesn't mistake this self-write for a remote arrival and run
-        // a spurious whole-vault re-chunk + hydrate (the very work reconcileSidecarIfChanged
-        // gates away). Only after a real rewrite.
+        // Refresh the persisted reconcile sig after a self jsonl rewrite. With self now
+        // excluded from sidecarDirSignature (a device's own writes don't move its own
+        // signature), this compaction touches only our own jsonl so the signature is
+        // already unchanged — this re-persist is belt-and-suspenders, kept so the
+        // persisted sig is recomputed with the SAME selfDeviceId convention as the live
+        // gate, and to stay correct if compaction ever touches a non-self artifact.
         if (result.compacted) {
             try {
-                this.persistReconcileSig(await sidecarDirSignature(adapter, dir));
+                this.persistReconcileSig(await sidecarDirSignature(adapter, dir, dev));
             } catch (e) {
                 await this.logger.appendError('compact-sig-refresh', e);
             }
@@ -1865,6 +1943,14 @@ export class SearchOrchestrator {
     // `${device}:${reason}` so each distinct staleness is reported once — not on
     // every reconcile / delta flush.
     private warnedRefusals = new Set<string>();
+
+    // True when the last sidecar scan refused a producer at a HIGHER chunkerVersion than
+    // this build — another device holds a newer index this plugin is too old to read.
+    // Set/cleared per scan (so updating Seek clears it on the next reconcile). The plugin
+    // reads it to raise the "update Seek" banner AND, on mobile, to skip the futile local
+    // re-embed (a v7 device grinding out chunks it discards the moment it updates to v8).
+    private _peerAhead = false;
+    get peerAhead(): boolean { return this._peerAhead; }
 
     // A version-gate refusal is EXPECTED and self-healing — e.g. right after a
     // CHUNKER_VERSION bump the other device's sidecar is one version behind until
@@ -2016,6 +2102,7 @@ export class SearchOrchestrator {
         // (when the delta path supplies it) surfaces the hydrated chunks into the
         // change-set so applyDelta can apply them incrementally.
         const res = await hydrateFromSidecar(this.hydrateDeps(async () => notes, addsSink));
+        this._peerAhead = res.peerAhead; // refresh the "newer index exists" signal per scan
         const done = new Set(res.hydratedNotePaths);
         return files.filter(f => !done.has(f.path));
     }
@@ -2117,6 +2204,22 @@ export class SearchOrchestrator {
         await this.logger.append(entry);
     }
 
+    // Resolve the per-search FilterContext from live app + settings: the set of
+    // Number-typed properties (read from Obsidian's registry each search — a cheap
+    // dictionary lookup) and the date field the recency-gated `before:`/`after:`
+    // filters key off. dateField is null when Recency is OFF (recencyEpsilon ≤ 0),
+    // which is how the parser knows to leave a typed before:/after: as plain text.
+    // See [[Seek Typed-Value Filters Design]].
+    private buildFilterContext(): FilterContext {
+        const recencyOn = this.settings.recencyEpsilon > 0;
+        return {
+            dateField: recencyOn
+                ? { key: this.settings.recencyKey, createdProp: this.settings.createdProp }
+                : null,
+            numericKeys: enumerateNumberPropertyNames(this.app),
+        };
+    }
+
     // Search path (two-stage, v7+):
     //
     //   S0  resident frame (corpus + binary index, cached by dataGeneration —
@@ -2138,11 +2241,15 @@ export class SearchOrchestrator {
         const t0 = performance.now();
         const searchId = `${Date.now()}-${query.slice(0, 20)}`;
 
-        // Parse inline filter syntax (#tag / tag: / path: / [k:v] / dates).
-        // `cleanedQuery` is the residual text we embed + BM25; `filters` drives
-        // the candidate-selection match-mask below. A null `filters` means a
-        // plain query — the mask stays undefined and the path is unchanged.
-        const { cleanedQuery, filters } = parseQuery(query);
+        // Parse inline filter syntax (#tag / tag: / path: / [k:v] / numeric /
+        // dates). `cleanedQuery` is the residual text we embed + BM25; `filters`
+        // drives the candidate-selection match-mask below. A null `filters` means a
+        // plain query — the mask stays undefined and the path is unchanged. The
+        // FilterContext threads vault-specific facts (Number-typed props, the
+        // Recency date field) into the otherwise-pure parser/matcher; same object
+        // is reused by compileMatcher so parse and match agree on types/field.
+        const filterCtx = this.buildFilterContext();
+        const { cleanedQuery, filters } = parseQuery(query, filterCtx);
 
         // ---- S0: resident-tier read ------------------------------------
         // listAllChunks is unavoidable: BM25 needs all chunks to build its
@@ -2195,7 +2302,7 @@ export class SearchOrchestrator {
         // shrinking orderedChunks — that keeps the BM25 + binary indexes
         // (built over the full corpus) cache-valid across filtered queries.
         // null filters → undefined mask → byte-identical to a no-filter build.
-        const matcher = filters ? compileMatcher(filters) : null;
+        const matcher = filters ? compileMatcher(filters, filterCtx) : null;
         // buildSelectionMask folds frame liveness (validRows) AND the inline
         // filter into one mask, so a single downstream `mask` carries BOTH to
         // every consumer: the binary scan, the bm25/recency selection arms, the
@@ -2268,11 +2375,18 @@ export class SearchOrchestrator {
         }
 
         // ---- S0.5: query embedding ------------------------------------
-        // granite-r2 is symmetric (no query/doc prompt) — embed the raw cleaned
-        // query, matching the raw `${title}\n\n${content}` doc side used during
-        // indexing.
+        // granite-r2 is symmetric (no query/doc prompt), so the query takes the
+        // SAME pass as the doc side. As of v8 (2026-06-28) the doc side is no
+        // longer raw: cleanDenseBody/cleanDenseText run in the chunker (wikilinks
+        // → alias, URLs → readable words, HTML stripped), so the query must be
+        // dense-cleaned too or the two vectors drift on any query carrying [[…]],
+        // a URL, or markdown syntax. cleanDenseText is a no-op on a plain-text
+        // query, so ordinary queries are byte-identical to before. (BM25 below
+        // keeps the raw cleanedQuery: seekTokenize fragments that same syntax
+        // symmetrically on both index and query side, so the lexical channel
+        // needs no parallel cleaning pass.)
         const qStart = performance.now();
-        const embedded = await this.embedder.embed(cleanedQuery);
+        const embedded = await this.embedder.embed(cleanDenseText(cleanedQuery));
         const queryVec = embedded.vector;
         const iframeEmbedMs = embedded.iframeLatencyMs;
         const queryEmbedMs = performance.now() - qStart;
@@ -3207,8 +3321,8 @@ export class SearchOrchestrator {
     private bm25FieldBoosts(): Record<string, number> {
         if (!this.settings.boostedBm25) return DEFAULT_FIELD_BOOSTS;
         // "Boosted BM25" preset: lift the name/structure fields (aliases→9,
-        // headings→4) and trim noisy tags (→2); title/page_type/content/
-        // properties keep their defaults. aliases/tags take effect here at
+        // headings→4) and trim noisy tags (→2); title/content/properties keep
+        // their defaults. aliases/tags take effect here at
         // score time; headings needs its field indexed, which ensureBm25()
         // forces on whenever boostedBm25 is set.
         return { ...DEFAULT_FIELD_BOOSTS, aliases: 9.0, tags: 2.0, headings: 4.0 };

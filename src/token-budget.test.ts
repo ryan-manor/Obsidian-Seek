@@ -38,7 +38,7 @@ const isSubsequence = (sub: string[], sup: string[]) => {
 };
 
 const META: ChunkMetadata = {
-    tags: [], aliases: [], pageType: '', created: null, modified: null, properties: {},
+    tags: [], aliases: [], created: null, modified: null, properties: {},
 };
 
 function mkChunk(over: Partial<Chunk> & { content: string }): Chunk {

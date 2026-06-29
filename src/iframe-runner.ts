@@ -11,6 +11,7 @@
 //     embedder.ts header — the QAT workstream is killed).
 
 import type { Device, RequestedDevice, Dtype } from './types';
+import { ACTIVE_MODEL_SPEC } from './model-registry';
 
 declare const __BUILD_TS__: string;
 
@@ -309,7 +310,7 @@ export class IframeRunner {
             // fetch out of the iframe (e.g. parent requestUrl → resource URL).
             document.body.appendChild(this.iframe);
 
-            const childScript = buildChildScript(CDN_URL);
+            const childScript = buildChildScript(CDN_URL, ACTIVE_MODEL_SPEC.dim);
             this.iframe.srcdoc =
                 `<!DOCTYPE html><html><body><script type="module">${childScript}</script></body></html>`;
         });
@@ -430,12 +431,14 @@ export class IframeRunner {
     }
 }
 
-function buildChildScript(cdnUrl: string): string {
+function buildChildScript(cdnUrl: string, outputDim: number): string {
     // Script body runs INSIDE the iframe. It imports transformers.js from CDN,
     // owns pipeline state, and responds to postMessage RPCs from the parent.
-    // The two ${...} substitutions below pin the warmup grid to the parent's
-    // exported constants so the parent's localStorage fingerprint cache stays
-    // accurate by construction.
+    // The ${...} substitutions below pin the warmup grid AND the output dimension
+    // to the parent's exported constants so the localStorage fingerprint cache and
+    // the vector width stay accurate by construction. NOTE: the child body is a
+    // template literal in the parent — code inside it must NOT use backticks or
+    // ${} (single-quote concatenation only), or the parent will eval it.
     return `
 const CDN_URL = ${JSON.stringify(cdnUrl)};
 const WARMUP_BATCH_SIZES = ${JSON.stringify(WARMUP_BATCH_SIZES)};
@@ -540,12 +543,13 @@ if (navigator.gpu && typeof GPUAdapter !== 'undefined') {
     };
 }
 
-// granite-r2 outputs a 384-d CLS-pooled vector natively (NOT MRL — there is no
-// valid prefix-truncation here, unlike EmbeddingGemma's 768→512 slice). So
-// OUTPUT_DIM == the model's native width and sliceAndRenormalize is a pass-through
-// (vec.length <= targetDim returns it unchanged). 384-d is already 25% smaller
-// than Gemma's 512, cutting per-chunk IDB read latency on mobile.
-const OUTPUT_DIM = 384;
+// OUTPUT_DIM is INJECTED from the parent (ACTIVE_MODEL_SPEC.dim) so it can never
+// drift from embedder.EMBEDDING_DIM or the sidecar record stride. granite-r2
+// outputs a 384-d CLS-pooled vector natively (NOT MRL), so sliceAndRenormalize is
+// a pass-through; a Matryoshka model injects a smaller dim and the slice truncates
+// to it. The embed guards below fail loud if the model's real width < OUTPUT_DIM
+// (sliceAndRenormalize would otherwise silently emit a too-short vector).
+const OUTPUT_DIM = ${JSON.stringify(outputDim)};
 
 // Dtype ladder for WebGPU. tryWebgpu walks this in order and accepts the
 // first dtype whose shaders compile.
@@ -887,6 +891,11 @@ async function embedText(text) {
         padding: currentDevice === 'wasm' ? true : 'max_length',
         truncation: true, max_length: bucket,
     });
+    // Fail loud on a model/dim misconfig: if the model's real output width is
+    // SMALLER than OUTPUT_DIM, sliceAndRenormalize returns the short vector
+    // unchanged (vec.length <= targetDim), which would silently corrupt the index.
+    const outDim = output.dims[output.dims.length - 1];
+    if (outDim < OUTPUT_DIM) throw new Error('embed: model output dim ' + outDim + ' < OUTPUT_DIM ' + OUTPUT_DIM + ' - model/dim misconfig');
     const vector = sliceAndRenormalize(output.data, OUTPUT_DIM);
     // Release the tensor's backing buffer (incl. WebGPU readback) — sliceAndRenormalize
     // already returned a fresh Float32Array, so the output is detached from the tensor.
@@ -922,6 +931,9 @@ async function embedBatch(texts, explicitBucket) {
     });
     const dims = output.dims;
     const dim = dims[dims.length - 1];
+    // Fail loud on a model/dim misconfig (see embedText): a model narrower than
+    // OUTPUT_DIM would have sliceAndRenormalize emit short vectors per row.
+    if (dim < OUTPUT_DIM) throw new Error('embedBatch: model output dim ' + dim + ' < OUTPUT_DIM ' + OUTPUT_DIM + ' - model/dim misconfig');
     const data = output.data;
     const vectors = [];
     for (let i = 0; i < texts.length; i++) {
@@ -929,7 +941,7 @@ async function embedBatch(texts, explicitBucket) {
         vectors.push(sliceAndRenormalize(row, OUTPUT_DIM));
     }
     // Dispose AFTER the loop — each row above is a view into output.data.buffer,
-    // not a copy; sliceAndRenormalize materializes a fresh 384-d Float32Array per row,
+    // not a copy; sliceAndRenormalize materializes a fresh OUTPUT_DIM-wide Float32Array per row,
     // so by the time we get here the tensor's storage is no longer referenced.
     // Releases the WebGPU readback buffer that would otherwise stay alive until V8 GC.
     if (typeof output.dispose === 'function') output.dispose();

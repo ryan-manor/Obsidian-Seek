@@ -9,7 +9,7 @@ import type { Chunk } from './types';
 import type { QuantVec } from './quant';
 import { bulkAppend, shardPathFor, Q_BYTES, SIGN_BYTES, SIDECAR_FORMAT, type TierBytes } from './sidecar';
 import { writeDeviceMeta } from './sidecar-meta';
-import { hydrateFromSidecar, rankAcceptedProducers, type ReChunkedNote, type HydrateDeps } from './sidecar-sync';
+import { hydrateFromSidecar, rankAcceptedProducers, probePeerAhead, type ReChunkedNote, type HydrateDeps } from './sidecar-sync';
 
 // ---- in-memory adapter (same shape as sidecar.test.ts) ----
 
@@ -242,6 +242,24 @@ describe('hydrateFromSidecar', () => {
         expect(refusedMetaChunker).toBe(2);
         expect(refusedExpectChunker).toBe(3);
         expect(store.size).toBe(0);
+        // Producer is OLDER than us (v2 < v3) — we're ahead, not behind. No "update Seek".
+        expect(r.peerAhead).toBe(false);
+    });
+
+    it('flags peerAhead when a refused producer is NEWER than this build (the v8≠v7 bog-down)', async () => {
+        const a = new FakeAdapter();
+        const notes: NoteSpec[] = [{ path: 'a.md', mtime: 100, ids: ['a1'] }];
+        await seedSidecar(a, 'desktop-aaa', notes);
+        // Producer at a HIGHER chunkerVersion (v4) than this consumer can read (v3).
+        await writeDeviceMeta(a as unknown as DataAdapter, DIR, { format: SIDECAR_FORMAT, modelId: 'ml97', revision: null, chunkerVersion: 4, dim: 384, deviceId: 'desktop-aaa', lastFullReindex: null });
+
+        const { deps } = makeDeps(a, notes, {});
+        const r = await hydrateFromSidecar(deps);
+        expect(r.refusedProducers).toBe(1);
+        expect(r.hydrated).toBe(0);
+        // The peer holds an index this build is too old to use → surface "update Seek"
+        // (and gate the mobile re-embed) instead of silently grinding out throwaway chunks.
+        expect(r.peerAhead).toBe(true);
     });
 
     it('skips a note whose chunk bytes have not synced yet (all-or-nothing)', async () => {
@@ -440,5 +458,60 @@ describe('rankAcceptedProducers', () => {
         await setMeta(a, 'desktop-haz-gz', '2026-06-01T00:00:00.000Z');
         await setMeta(a, 'mobile-no-gz', '2026-06-20T00:00:00.000Z'); // newer
         expect(await rankAcceptedProducers(a as unknown as DataAdapter, DIR, EXPECT)).toEqual(['mobile-no-gz', 'desktop-haz-gz']);
+    });
+});
+
+describe('probePeerAhead', () => {
+    // Overwrite a seeded producer's meta with a specific chunkerVersion (seedSidecar
+    // registers the jsonl + a v3 meta; this re-points only the version).
+    const overMeta = (a: FakeAdapter, deviceId: string, chunkerVersion: number) =>
+        writeDeviceMeta(a as unknown as DataAdapter, DIR, { format: SIDECAR_FORMAT, modelId: EXPECT.modelId, revision: EXPECT.revision, chunkerVersion, dim: EXPECT.dim, deviceId, lastFullReindex: null });
+
+    it('returns false when the sidecar is empty', async () => {
+        const a = new FakeAdapter();
+        expect(await probePeerAhead(a as unknown as DataAdapter, DIR, EXPECT)).toBe(false);
+    });
+
+    it('returns false when the only producer is compatible (same version)', async () => {
+        const a = new FakeAdapter();
+        await seedSidecar(a, 'desktop-aaa', [{ path: 'a.md', mtime: 1, ids: ['a'] }]); // chunkerVersion = EXPECT (3)
+        expect(await probePeerAhead(a as unknown as DataAdapter, DIR, EXPECT)).toBe(false);
+    });
+
+    it('returns false when the only producer is OLDER (we are ahead, not behind)', async () => {
+        const a = new FakeAdapter();
+        await seedSidecar(a, 'desktop-aaa', [{ path: 'a.md', mtime: 1, ids: ['a'] }]);
+        await overMeta(a, 'desktop-aaa', EXPECT.chunkerVersion - 1); // v2 < v3
+        expect(await probePeerAhead(a as unknown as DataAdapter, DIR, EXPECT)).toBe(false);
+    });
+
+    it('returns true when a refused producer is NEWER than this build (durable peer-ahead signal)', async () => {
+        const a = new FakeAdapter();
+        await seedSidecar(a, 'desktop-aaa', [{ path: 'a.md', mtime: 1, ids: ['a'] }]);
+        await overMeta(a, 'desktop-aaa', EXPECT.chunkerVersion + 1); // v4 > v3 — too new for this build to read
+        expect(await probePeerAhead(a as unknown as DataAdapter, DIR, EXPECT)).toBe(true);
+    });
+
+    it('reports a single ahead peer even when another producer is accepted', async () => {
+        const a = new FakeAdapter();
+        await seedSidecar(a, 'desktop-compat', [{ path: 'a.md', mtime: 1, ids: ['a'] }]); // accepted (v3)
+        await seedSidecar(a, 'desktop-ahead', [{ path: 'b.md', mtime: 1, ids: ['b'] }]);
+        await overMeta(a, 'desktop-ahead', EXPECT.chunkerVersion + 1); // v4 — peer ahead
+        expect(await probePeerAhead(a as unknown as DataAdapter, DIR, EXPECT)).toBe(true);
+    });
+
+    it('agrees with hydrateFromSidecar.peerAhead on the same refused-newer producer (no drift)', async () => {
+        // Lock the cheap probe to the authoritative inline predicate: for an identical
+        // sidecar state, the meta-only probe must equal the full hydrate path's peerAhead,
+        // so the relaunch-recovered signal can never diverge from the scanned one.
+        const a = new FakeAdapter();
+        const notes: NoteSpec[] = [{ path: 'a.md', mtime: 100, ids: ['a1'] }];
+        await seedSidecar(a, 'desktop-aaa', notes);
+        await overMeta(a, 'desktop-aaa', EXPECT.chunkerVersion + 1);
+        const { deps } = makeDeps(a, notes, {});
+        const hydrate = await hydrateFromSidecar(deps);
+        const probe = await probePeerAhead(a as unknown as DataAdapter, DIR, EXPECT);
+        expect(probe).toBe(hydrate.peerAhead);
+        expect(probe).toBe(true);
     });
 });

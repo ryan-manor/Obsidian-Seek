@@ -385,6 +385,108 @@ describe('MarkdownChunker — dense frontmatter suffix (2026-06-18 frontmatter-i
         expect(chunk.denseSuffix).toBeDefined();
         expect(chunk.denseSuffix!.split(/\s+/)).toHaveLength(48);
     });
+
+    // ── name gate: shared MACHINERY_KEYS (audit 2026-06-29 #2) ──
+    it('name gate: drops text-valued machinery keys (icon/cssclasses/…) the value-shape gates miss', () => {
+        const machinery = [
+            '---',
+            'icon: lucide-book',          // text → would have leaked (not inert/shape)
+            'cssclasses:',
+            '  - wide-page',
+            '  - no-title',
+            'cssclass: callout',
+            'version: 1.2.0',             // two dots → not INERT, would have leaked
+            'banner: gradient-blue',
+            'pageType: reference',        // NOT machinery — stays in (fair game)
+            'topic: hydrology',           // real free text — stays in
+            '---',
+            'A body long enough to clear the minChunkChars gate and emit a real chunk.',
+        ].join('\n');
+        const [chunk] = chunker.chunkContent(machinery, 'Notes/Ref/Water.md');
+        expect(chunk.denseSuffix).toBeDefined();
+        // the name-list is surgical: real free text + pageType survive
+        expect(chunk.denseSuffix).toContain('hydrology');
+        expect(chunk.denseSuffix).toContain('reference');
+        // text-valued machinery the date/number/url shape gates do NOT catch
+        expect(chunk.denseSuffix).not.toContain('lucide');
+        expect(chunk.denseSuffix).not.toContain('wide-page');
+        expect(chunk.denseSuffix).not.toContain('callout');
+        expect(chunk.denseSuffix).not.toContain('1.2.0');
+        expect(chunk.denseSuffix).not.toContain('gradient');
+    });
+});
+
+describe('MarkdownChunker — v8 dense-channel hygiene (2026-06-28)', () => {
+    const longBody = 'A body long enough to clear the minChunkChars gate and emit a real chunk.';
+
+    // ── Issue 1: cross-surface dedup (suffix vs the note title) ──
+    it('drops a suffix value that repeats a TITLE word', () => {
+        const note = ['---', 'tags:', '  - rapha', 'kind: order', '---', longBody].join('\n');
+        const [chunk] = chunker.chunkContent(note, 'Notes/Rapha Order.md');
+        expect(chunk.title).toContain('Rapha Order');
+        // "rapha" and "order" are both already in the title -> not re-injected
+        expect(chunk.denseSuffix ?? '').not.toMatch(/\brapha\b/i);
+        expect(chunk.denseSuffix ?? '').not.toMatch(/\border\b/i);
+    });
+
+    it('collapses the meeting/meetings near-dup via depluralized tokens', () => {
+        const note = [
+            '---', 'pageType: meeting', 'tags:', '  - meetings', '  - standup', '---', longBody,
+        ].join('\n');
+        const [chunk] = chunker.chunkContent(note, 'Notes/Weekly Sync.md');
+        const toks = (chunk.denseSuffix ?? '').split(/\s+/).filter(Boolean);
+        expect(toks.filter((t) => /^meetings?$/i.test(t))).toHaveLength(1); // one, not two
+        expect(chunk.denseSuffix).toContain('standup');                     // novel token kept
+    });
+
+    it('keeps a multi-word value with any novel token (not over-zealous)', () => {
+        const note = ['---', 'project: "[[Project Apollo]]"', '---', longBody].join('\n');
+        const [chunk] = chunker.chunkContent(note, 'Notes/Apollo Notes.md');
+        // title has Apollo + Notes; "Project" is novel, so the whole phrase rides
+        expect(chunk.denseSuffix).toContain('Project Apollo');
+    });
+
+    // ── Issue 2: body cleaning at the chunk level ──
+    it('cleans link/embed/URL noise out of the indexed body', () => {
+        const note = [
+            'Read the [Verge review](https://www.theverge.com/2026/x) about [[Granite 4]].',
+            '',
+            '![[Pasted image 20260628.png]]',
+            '',
+            'See https://example.com/path/to/article for the rest of the writeup here.',
+        ].join('\n');
+        const [chunk] = chunker.chunkContent(note, 'Clippings/Verge.md');
+        expect(chunk.content).toContain('Verge review');     // markdown-link text kept
+        expect(chunk.content).toContain('Granite 4');        // wikilink basename
+        expect(chunk.content).not.toContain('https://');     // scheme gone
+        expect(chunk.content).not.toContain('theverge');     // md-link URL dropped whole
+        expect(chunk.content).toContain('example');          // bare-URL host label kept
+        expect(chunk.content).not.toContain('example.com');  // TLD stripped
+        expect(chunk.content).not.toContain('Pasted image'); // asset embed dropped
+    });
+
+    it('leaves fenced code in the body verbatim', () => {
+        const note = [
+            'Intro prose with a [[Wikilink]] to flatten.',
+            '',
+            '```js',
+            'fetch("https://api.example.com/v1?token=abc") // <keep this>',
+            '```',
+        ].join('\n');
+        const [chunk] = chunker.chunkContent(note, 'Notes/Code.md');
+        expect(chunk.content).toContain('https://api.example.com/v1?token=abc'); // untouched
+        expect(chunk.content).toContain('<keep this>');
+        expect(chunk.content).toContain('Wikilink');         // surrounding prose still cleaned
+    });
+
+    // ── Issue 3: heading flattening flows into BOTH title and heading_path ──
+    it('flattens a wikilink in a heading into the title and heading_path', () => {
+        const note = ['## Sync with [[Alex Goel|Alex]]', '', longBody].join('\n');
+        const [chunk] = chunker.chunkContent(note, 'Notes/Sync.md');
+        expect(chunk.title).toContain('Sync with Alex');
+        expect(chunk.title).not.toContain('[[');
+        expect(chunk.heading_path).toContain('Sync with Alex');
+    });
 });
 
 describe('MarkdownChunker — chunkBase (.base per-view chunks)', () => {
@@ -436,7 +538,7 @@ views:
 
     it('carries empty note metadata, modified set, one-line span, and no lexicalOnly', () => {
         for (const c of docsFor()) {
-            expect(c.metadata).toEqual({ tags: [], aliases: [], pageType: '', created: null, modified: '2026-06-23T00:00:00.000Z', properties: {} });
+            expect(c.metadata).toEqual({ tags: [], aliases: [], created: null, modified: '2026-06-23T00:00:00.000Z', properties: {} });
             expect(c.start_line).toBe(1);
             expect(c.end_line).toBe(1);
             expect(c.note_path).toBe(PATH);

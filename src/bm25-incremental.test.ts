@@ -22,7 +22,7 @@ function makeChunk(id: string, title: string, content: string, tags: string[] = 
         content,
         note_path: `${id}.md`,
         heading_path: [],
-        metadata: { tags, aliases, pageType: '', created: null, modified: null, properties: {} },
+        metadata: { tags, aliases, created: null, modified: null, properties: {} },
         start_line: 0,
         end_line: 0,
     };

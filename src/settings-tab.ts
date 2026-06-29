@@ -23,11 +23,18 @@ import {
     getBackendOverride, setBackendOverride, isWebgpuDemoted, clearWebgpuDemoted,
     type BackendChoice,
 } from './platform';
+import { enumerateDatePropertyNames } from './prop-types';
 
 // Real repo/social URLs for the About footer.
-const GITHUB_URL = 'https://github.com/ryan-manor/Obsidian-Seek';
-const DOCS_URL = 'https://publish.obsidian.md/rmm/Seek+Documentation/About+Seek';
+const GITHUB_URL = 'https://github.com/tooape/Obsidian-Seek-prototype';
 const X_URL = 'https://x.com/tooape';
+const DOCS_URL = 'https://publish.obsidian.md/rmm/Seek+Documentation/About+Seek';
+
+// The X (Twitter) logo as an inline SVG path. Obsidian's bundled Lucide no longer
+// ships a `twitter`/`x` brand icon, so setIcon('twitter') rendered an empty box —
+// we draw the glyph ourselves instead (see brandLink). Filled (fill=currentColor)
+// so it inherits the icon button's colour like the Lucide icons do.
+const X_LOGO_PATH = 'M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z';
 
 // ISO-8601 local stamp (YYYY-MM-DD HH:MM) for the status card — the vault's date
 // convention, replacing the locale "6/19/2026, 8:10:32 PM" the card showed before.
@@ -39,38 +46,8 @@ function fmtStamp(iso: string): string {
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-// ---- date-property picker (moved verbatim from main.ts; its only caller was this tab) -
-// Obsidian registers each frontmatter property's type in a registry that is NOT in the
-// public obsidian.d.ts. Feature-detect both known surfaces and fail soft to [] so the
-// recency-date picker only ever offers real Date/Datetime properties (+ the persisted
-// choice and mtime) — never a free-text path where a typo'd, non-date property leaks in.
-type PropertyTypeInfo = { name?: string; type?: string; widget?: string };
-function enumerateDatePropertyNames(app: App): string[] {
-    const a = app as unknown as {
-        metadataTypeManager?: {
-            getAllProperties?: () => Record<string, PropertyTypeInfo>;
-            types?: Record<string, PropertyTypeInfo>;
-        };
-        metadataCache?: { getAllPropertyInfos?: () => Record<string, PropertyTypeInfo> };
-    };
-    const sources: Array<() => Record<string, PropertyTypeInfo> | undefined> = [
-        () => a.metadataTypeManager?.getAllProperties?.(),
-        () => a.metadataTypeManager?.types,
-        () => a.metadataCache?.getAllPropertyInfos?.(),
-    ];
-    for (const src of sources) {
-        let rec: Record<string, PropertyTypeInfo> | undefined;
-        try { rec = src(); } catch { continue; }
-        if (!rec || Object.keys(rec).length === 0) continue;
-        const out = new Set<string>();
-        for (const [key, info] of Object.entries(rec)) {
-            const t = (info?.type ?? info?.widget ?? '').toLowerCase();
-            if (t === 'date' || t === 'datetime') out.add(info?.name ?? key);
-        }
-        return [...out].sort((x, y) => x.localeCompare(y));
-    }
-    return [];
-}
+// (The date-property picker enumerator moved to prop-types.ts, shared with the
+// typed-value inline filters — see enumerateDatePropertyNames import above.)
 
 // ---- segmented (pill) stages ------------------------------------------------------
 type Stage = 'Off' | 'Default' | 'High';
@@ -441,12 +418,12 @@ export class SeekSettingTab extends PluginSettingTab {
         const box = (text: string, cls = '') => pipe.createDiv({ cls: `seek-pipe-box ${cls}`.trim(), text });
         const arrow = () => pipe.createSpan({ cls: 'seek-pipe-arrow', text: '→' });
 
-        box('Query terms');
+        box('Notes');
         arrow();
         // In Balanced both branches are neutral; only Keyword-focused elevates Keyword.
         const branch = pipe.createDiv({ cls: 'seek-pipe-branch' });
         branch.createDiv({ cls: 'seek-pipe-box seek-pipe-dense', text: 'Conceptual meaning' });
-        branch.createDiv({ cls: `seek-pipe-box seek-pipe-kw${strategy === 'keyword' ? ' is-elevated' : ''}`, text: 'Keywords' });
+        branch.createDiv({ cls: `seek-pipe-box seek-pipe-kw${strategy === 'keyword' ? ' is-elevated' : ''}`, text: 'Keyword' });
         arrow();
         box('Fusion', 'seek-pipe-fuse');
         arrow();
@@ -701,24 +678,35 @@ export class SeekSettingTab extends PluginSettingTab {
         const left = about.createDiv({ cls: 'seek-about-left' });
         left.createSpan({ cls: 'seek-about-name', text: 'Seek' });
         left.createSpan({ cls: 'seek-about-ver', text: `v${this.plugin.manifest.version}` });
-        left.createSpan({ cls: 'seek-about-by', text: '© 2026 Ryan Manor' });
+        left.createSpan({ cls: 'seek-about-by', text: 'by Ryan Manor' });
 
         const links = about.createDiv({ cls: 'seek-about-links' });
-        const docsLink = links.createEl('a', { cls: 'seek-about-ic', href: DOCS_URL, attr: { 'aria-label': 'Seek Documentation', title: 'Seek Documentation' } });
-        setIcon(docsLink, 'book-open');
-        const ghLink = links.createEl('a', { cls: 'seek-about-ic', href: GITHUB_URL, attr: { 'aria-label': 'Repository on GitHub', title: 'Repository on GitHub' } });
-        setIcon(ghLink, 'github');
+        // Lucide-named icon button (GitHub, Docs).
+        const link = (href: string, icon: string, label: string) => {
+            const a = links.createEl('a', { cls: 'seek-about-ic', href, attr: { 'aria-label': label, title: label } });
+            setIcon(a, icon);
+        };
+        link(DOCS_URL, 'book-open', 'Seek Documentation');
+        link(GITHUB_URL, 'github', 'Repository on GitHub');
+        // X uses an inline-SVG button (no Lucide brand icon — see X_LOGO_PATH).
+        this.brandLink(links, X_URL, X_LOGO_PATH, '0 0 24 24', 'On X');
+    }
 
-        // X (formerly Twitter): Obsidian's bundled Lucide dropped the `twitter`
-        // brand glyph, so setIcon() would leave an empty box. Inline the official
-        // X logo as SVG instead — fill:currentColor inherits the same muted→accent
-        // color treatment as the Lucide github icon beside it.
-        const xLink = links.createEl('a', { cls: 'seek-about-ic', href: X_URL, attr: { 'aria-label': 'On X', title: 'On X' } });
-        const xSvg = xLink.createSvg('svg', { attr: { viewBox: '0 0 24 24', 'aria-hidden': 'true' } });
-        xSvg.createSvg('path', { attr: {
-            fill: 'currentColor',
-            d: 'M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z',
-        } });
+    // An icon-button link whose glyph is an inline SVG path rather than a Lucide
+    // icon — for brand logos Obsidian's bundled Lucide doesn't (any longer) ship.
+    // Built via createElementNS (SVG namespace) so it's a real <svg> the
+    // `.seek-about-ic svg` rule sizes, with fill=currentColor so it tints like the
+    // setIcon glyphs beside it.
+    private brandLink(parent: HTMLElement, href: string, pathD: string, viewBox: string, label: string): void {
+        const a = parent.createEl('a', { cls: 'seek-about-ic', href, attr: { 'aria-label': label, title: label } });
+        const ns = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(ns, 'svg');
+        svg.setAttribute('viewBox', viewBox);
+        svg.setAttribute('fill', 'currentColor');
+        const path = document.createElementNS(ns, 'path');
+        path.setAttribute('d', pathD);
+        svg.appendChild(path);
+        a.appendChild(svg);
     }
 
     // ---- shared: segmented (pill) control ------------------------------------------

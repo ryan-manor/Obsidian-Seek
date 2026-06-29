@@ -41,7 +41,7 @@ export function toBindForm(s: string): string {
 //
 //   [[Austin]]                     -> "Austin"
 //   [[Notes/.../Places/Zurich|Zurith]] -> "Zurich"   (alias + path gone)
-//   [[Jane Doe|Alex]]             -> "Jane Doe"     (alias dropped, name kept)
+//   [[Alex Goel|Alex]]             -> "Alex Goel"     (alias dropped, name kept)
 //   [[San Francisco|SF]]           -> "San Francisco" (abbrev alias dropped)
 //   restaurants                    -> "restaurants"   (plain value, unchanged)
 const WIKILINK_RE = /\[\[([^\]]+)\]\]/g;

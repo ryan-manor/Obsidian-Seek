@@ -5,7 +5,8 @@
 //   - Split on H1-H6 headings (fence-aware via scanHeadings — a "# comment"
 //     line inside fenced code is NOT a heading), build hierarchical title
 //     "Note Title > H1 > H2"
-//   - Frontmatter parsed for tags / aliases / pageType / created
+//   - Frontmatter parsed for tags / aliases / created (all other scalar keys,
+//     pageType included, are folded generically into metadata.properties)
 //   - Aliases are appended to the note title ("Note Title | Alias1 | Alias2 > H1")
 //   - Sub-min sections fold into neighbours (carry buffer); title-only notes
 //     get a fallback chunk
@@ -25,6 +26,9 @@
 import type { Chunk, ChunkMeta, ChunkMetadata, BaseView } from './types';
 import { scanHeadings } from './atoms';
 import { toDisplayForm } from './prop-normalize';
+import { cleanDenseText, cleanDenseBody } from './dense-clean';
+import { depluralize, MACHINERY_KEYS } from './bm25';
+import { seekTokenize } from './tokenize';
 export type { Chunk, ChunkMeta, ChunkMetadata };
 
 const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n/;
@@ -104,8 +108,18 @@ export function chunkIdFor(notePath: string, title: string, content: string, den
 // (token-budget.ts OVERLAP_FRACTION, 2026-06-23): a split super-section's later
 // parts now carry the prior part's trailing paragraph(s), so every multi-part
 // section's part content (and ids) changed and a pre-7 sidecar's vectors for
-// those notes are unreproducible.
-export const CHUNKER_VERSION = 7;
+// those notes are unreproducible. 8 = dense-channel hygiene (2026-06-28): the
+// section body and each heading are run through cleanDenseText/cleanDenseBody
+// (dense-clean.ts) at the chunker — wikilink/embed syntax flattened to rendered
+// display text, bare URLs stripped of scheme/TLD, HTML removed, fenced code left
+// verbatim — AND the dense suffix now dedups its values against the note title's
+// (depluralized) tokens (buildDenseSuffix). Both shift the embedded/indexed bytes
+// (and thus the ids), so a pre-8 sidecar's vectors are unreproducible here.
+// 9 = dense suffix name-excludes MACHINERY_KEYS (Relevance Quality Audit
+// 2026-06-29 #2): text-valued UI keys (icon/cssclasses/cssclass/banner/…) no
+// longer leak into the suffix, so a machinery-bearing note's suffix bytes (and
+// id) shift and a pre-9 sidecar's vectors for those notes are unreproducible.
+export const CHUNKER_VERSION = 9;
 
 export interface ChunkerOptions {
     minChunkChars?: number;
@@ -146,14 +160,16 @@ export class MarkdownChunker {
         // carried on every chunk of the note (via idFor + buildChunk below), the
         // same way aliases are hoisted into every chunk title. token-budget.ts
         // embedInput appends it to the embed string; BM25 never sees it.
-        const denseSuffix = buildDenseSuffix(metadata);
+        const denseSuffix = buildDenseSuffix(metadata, titleWithAliases);
 
         const normalizedMetadata: ChunkMetadata = {
             tags: extractTags(metadata),
             aliases,
-            pageType: String(metadata['pageType'] ?? ''),
             created: extractDate(metadata['created']),
             modified: modified ?? null,
+            // pageType is NOT a dedicated field — extractProperties folds it into
+            // `properties` like any other scalar key, so it reaches the searchable
+            // properties field and `[pageType:x]` filters via the same generic path.
             properties: extractProperties(metadata),
         };
 
@@ -211,7 +227,13 @@ export class MarkdownChunker {
             endLine: number,
             headingText = '',
         ) => {
-            const trimmed = sectionContent.trim();
+            // Dense/lexical body hygiene (v8): flatten link/embed syntax, strip
+            // URL/HTML noise, keep fenced code verbatim. Cleaning here (not at
+            // embedInput) means the min-chunk gate and chunk_id both see the
+            // cleaned bytes, and BOTH channels index them. The raw-file line span
+            // (start_line/end_line) is unaffected — it is recomputed from the
+            // on-disk note below, never from this string's length.
+            const trimmed = cleanDenseBody(sectionContent);
             if (trimmed.length === 0) return; // nothing to index or carry
 
             if (trimmed.length < this.minChunkChars) {
@@ -260,7 +282,14 @@ export class MarkdownChunker {
 
             const headingStack: Array<{ level: number; text: string }> = [];
             for (let idx = 0; idx < headings.length; idx++) {
-                const { lineNum, level, text: headingText } = headings[idx];
+                const { lineNum, level } = headings[idx];
+                // Heading hygiene (v8): a heading can carry wikilinks/URLs
+                // ("## Sync with [[Alex Goel|Alex]]"). Flatten to rendered
+                // display text so the dense title and the BM25 headings field
+                // both index "Alex", not "[[Alex Goel|Alex]]". Fall back to the
+                // raw text if cleaning empties it (e.g. a heading that is only an
+                // image embed), so the breadcrumb never gets a blank segment.
+                const headingText = cleanDenseText(headings[idx].text) || headings[idx].text;
                 const endLine = idx + 1 < headings.length ? headings[idx + 1].lineNum : lines.length;
 
                 while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= level) {
@@ -304,7 +333,7 @@ export class MarkdownChunker {
         // only rescues notes that would otherwise vanish. Verified to recover 22/25
         // structurally-dead known-item queries in the personal eval (2026-06-05).
         if (chunks.length === 0) {
-            const fallbackContent = body.trim();
+            const fallbackContent = cleanDenseBody(body);
             // A body-LESS note (empty fallbackContent) embeds as "<title>\n\n" —
             // a content-free vector (often just a bare date) that becomes a
             // universal near-neighbor for any OOV/ID query. Mark it lexical-only
@@ -371,7 +400,6 @@ export class MarkdownChunker {
         const metadata: ChunkMetadata = {
             tags: [],
             aliases: [],
-            pageType: '',
             created: null,
             modified: modified ?? null,
             properties: {},
@@ -481,13 +509,21 @@ function extractDate(value: unknown): string | null {
 
 // ---- dense frontmatter suffix (the 2026-06-18 frontmatter-into-dense ship) ----
 
-// Frontmatter keys whose values are NOT folded into the dense suffix: aliases
-// are already in the dense channel via titleWithAliases (chunkContent), so
-// re-injecting them would double their weight. Mirrors the eval harness's
-// ALIAS_KEYS exactly (ofm_fm_valuetype.py); everything else — tags, pageType,
-// place links, free-text props — is fair game (tags ride here AND in their own
-// BM25 field, but only this dense copy is the validated win).
-const SUFFIX_SKIP_KEYS = new Set(['aliases', 'alias']);
+// Frontmatter keys whose values are NOT folded into the dense suffix. Two
+// name-based reasons:
+//   • aliases/alias — already in the dense channel via titleWithAliases
+//     (chunkContent), so re-injecting them would double their weight.
+//   • MACHINERY_KEYS — identity/UI/plumbing junk, SHARED with bm25's properties
+//     field. The value-shape gates below already drop the date/number/boolean/
+//     url machinery, but TEXT-valued keys (`icon: lucide-book`, `cssclasses:
+//     [wide-page]`) slipped through because the suffix had no name-list — this
+//     closes that one gap (Relevance Quality Audit 2026-06-29 finding #2).
+// Everything else — tags, pageType, place links, free-text props — stays IN
+// (tags ride here AND in their own BM25 field, but only this dense copy is the
+// validated win). The alias half still mirrors the eval harness ALIAS_KEYS
+// (ofm_fm_valuetype.py); the machinery half is a NEW divergence the harness
+// arm must adopt to stay byte-parallel.
+const SUFFIX_SKIP_KEYS = new Set(['aliases', 'alias', ...MACHINERY_KEYS]);
 
 // Inert value TYPES, dropped AFTER link-flattening so the filter is by VALUE
 // shape not key name (no curation list to maintain): an ISO date (optionally
@@ -519,6 +555,16 @@ function isShapeJunk(t: string): boolean {
     return SUFFIX_URL_RE.test(t) || SUFFIX_ASSET_RE.test(t) || isNumberList(t);
 }
 
+// Canonical word tokens for cross-surface dedup: the shared lexical split
+// (CANONICAL stream only — derived:false drops the camelCase/glue recall forms
+// that would over-match), lowercased and depluralized. depluralize is the BM25
+// channel's own plural normalizer (bm25.ts), so both channels agree on what
+// "the same word" is — and it deliberately stops short of Porter stemming, which
+// that channel's own eval rejected (-0.0019 CQADupstack) for over-conflation.
+function suffixDedupTokens(s: string): string[] {
+    return seekTokenize(s, { derived: false }).map(w => depluralize(w.toLowerCase()));
+}
+
 // The per-note dense suffix: every frontmatter value (keys dropped), wikilinks
 // flattened to their target BASENAME via toDisplayForm — the blessed display-form
 // unwrap, deliberately NOT toBindForm, which keeps path + alias tokens and would
@@ -527,22 +573,28 @@ function isShapeJunk(t: string): boolean {
 // Three lightweight cleanliness gates then run, all pure functions of the note
 // (no corpus stats), validated in fm_cleanliness_arm.py (captures +0.0157 vs the
 // type-filtered ship, sub-resolution elsewhere, OOD-inert): SHAPE drops URL/asset/
-// coordinate values by form; DEDUP collapses repeated values case-insensitively
-// (the 65% context/tags doubling) at the whole-value level; CAP truncates the
-// joined suffix to SUFFIX_CAP_TOKENS. Dedup precedes cap so the budget is never
-// spent on duplicates. Returns '' when nothing qualifies (caller: '' = no suffix).
-function buildDenseSuffix(metadata: Record<string, unknown>): string {
+// coordinate values by form; DEDUP now runs on the depluralized TOKEN SET (not the
+// whole-value string) and is SEEDED with the note title+alias tokens — so a value
+// that merely repeats a title word ("Rapha" tag on a "Rapha Order" note) or the
+// pageType/tag "meeting"/"meetings" near-dup no longer re-enters the pooled
+// vector (v8 cross-surface dedup); CAP truncates the joined suffix to
+// SUFFIX_CAP_TOKENS. A value is skipped only when EVERY one of its tokens is
+// already seen, so a multi-word phrase with any novel token survives — the "not
+// over-zealous" guard (the body, which mentions these words in prose, is never
+// touched here). Dedup precedes cap so the budget is never spent on duplicates.
+// Returns '' when nothing qualifies (caller: '' = no suffix).
+function buildDenseSuffix(metadata: Record<string, unknown>, titleText = ''): string {
     const parts: string[] = [];
-    const seen = new Set<string>();
+    const seen = new Set<string>(suffixDedupTokens(titleText));   // cross-surface seed
     for (const [key, value] of Object.entries(metadata)) {
         if (SUFFIX_SKIP_KEYS.has(key.toLowerCase())) continue;
         const items = Array.isArray(value) ? value : [value];
         for (const item of items) {
             const t = toDisplayForm(String(item)).trim();
             if (!t || INERT_VALUE_RE.test(t) || isShapeJunk(t)) continue;
-            const k = t.toLowerCase();
-            if (seen.has(k)) continue;            // whole-value dedup, order-preserving
-            seen.add(k);
+            const toks = suffixDedupTokens(t);
+            if (toks.length > 0 && toks.every(tok => seen.has(tok))) continue; // fully-redundant
+            for (const tok of toks) seen.add(tok);
             parts.push(t);
         }
     }

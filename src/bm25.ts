@@ -49,14 +49,20 @@ import { toDisplayForm } from './prop-normalize';
 // marginal effect is small (~+0.004 nDCG@10), so the sliders were removed and
 // the swept values baked in here. 10/6/3 captures the gain (0.8714 vs the
 // 0.8727 all=10 max) while keeping `tags` modest (3×) so noisy-tag vaults
-// aren't over-weighted. `page_type` is left NEUTRAL (1×): it's not a universal
-// field, so a general default shouldn't boost it. See ~/eval.
+// aren't over-weighted. (No `page_type` entry: `pageType` is not a universal
+// field, so it gets no dedicated field — it rides the generic `properties`
+// field by name like any other scalar prop. See ~/seek-personal-eval.)
 export const DEFAULT_FIELD_BOOSTS: Record<string, number> = {
     title: 10.0,
     aliases: 6.0,
     tags: 3.0,
-    page_type: 1.0,
-    content: 1.0,
+    // Body text. Raised 1.0 → 3.0 (2026-06-27 field-weight re-eval): the 10:1
+    // title:content ratio was tuned on the pre-de-franken ("franken" double soft-AND)
+    // channel; after de-franken + WAND-bound normalization the body is under-weighted.
+    // Re-sweep over Example Vault + the enriched android/gaming BEIR sets (gbq4 dense held
+    // fixed, coverage_pow=2) showed content=3 a robust cross-corpus win (BEIR
+    // +0.005–0.012 nDCG@10, Example Vault neutral-to-+). See the re-eval note in the vault.
+    content: 3.0,
     // Frontmatter property VALUES (searchableProperties setting). The field is
     // only INDEXED when the toggle is on; a boost entry for an unindexed field
     // is inert everywhere (MiniSearch ignores it, getQueryBound sees df=0).
@@ -85,13 +91,13 @@ const BM25_PARAMS = { k: 1.2, b: 0.75, d: 0.5 } as const;
 // is `raw_bm25 · coverage^P` where coverage = (matched query terms / total) — see
 // search.ts where it's applied (getScoresWithCoverage returns the raw fraction; the
 // exponent is a RANKING decision, kept out of the measurement). P=1 is plain
-// coordination (Lucene's old `coord`); the de-franken left it at 1 and
+// coordination (Lucene's old `coord`); the de-franken (0749eac) left it at 1 and
 // regressed natural "[thing] in [place]" queries — a doc matching only the rare
 // place token ("sf", "austin") normalized to a near-max lexical score and out-ranked
 // real answers. P=2 restores the franken-era m²/T penalty magnitude as an EXPLICIT
 // knob (not the old accidental ×quality squaring), hardening the partial-match
-// discount so full-coverage docs win. Eval-validated 2026-06-27 (~/eval
-// cross-corpus sweep): personal vault bars nDCG@10 0.302→0.457, captures 0.445→0.496,
+// discount so full-coverage docs win. Eval-validated 2026-06-27 (~/seek-eval-pack
+// cross-corpus sweep): MyVault bars nDCG@10 0.302→0.457, captures 0.445→0.496,
 // personal-eval guardrail flat-to-up (place stratum pinned 1.000), and a slight gain
 // out-of-domain on BEIR android (+0.006). Rejected alternatives in the same sweep:
 // length-conditional exponent (no gain — queries are short) and conditional-%
@@ -104,7 +110,7 @@ export const BM25_COVERAGE_POW = 2 as const;
 // already dropped) and, when it returns true, derives every vocab term
 // extending it at weight 0.375·len(term)/len(derived), with the match
 // attributed back to the source term (coverage + the ×quality multiplier
-// see it). Eval-tuned 2026-06-10 (~/eval prefix_arm.py, WS2.3
+// see it). Eval-tuned 2026-06-10 (~/seek-eval-pack prefix_arm.py, WS2.3
 // token-exact cache, α=0.80):
 //   - last-only ≥3 (+syn layer pending): personal 0.8666→0.8730 bin nDCG@10;
 //     wins are literally truncated/typeahead queries ("amster"→Amsterdam,
@@ -394,10 +400,6 @@ function extractTagsText(chunk: ChunkMeta): string {
     return '';
 }
 
-function extractPageType(chunk: ChunkMeta): string {
-    return chunk.metadata?.pageType ?? '';
-}
-
 // Section heading path -> plain text for the `headings` field. The WS3
 // chunker is the only writer of heading_path, so this is the full ancestor
 // chain ("H1 H2 H3"), per chunk — the lexical mirror of what embedInput's
@@ -409,16 +411,30 @@ export function extractHeadingsText(chunk: ChunkMeta): string {
     return (chunk.heading_path ?? []).join(' ');
 }
 
-// Machinery keys excluded from the searchable-properties field: identity/UI/
-// plumbing, or values already carried by a dedicated field. Everything else
-// (placeLoc, placeType, context, status, …) is in — the harness gate measured
-// the generic everything-but-machinery posture, not a curated allowlist.
+// Pure machinery frontmatter keys — identity/UI/plumbing whose VALUES are junk
+// for ANY semantic surface. Exported and SHARED with chunker's buildDenseSuffix
+// so the two "leftover" surfaces (this properties field + the dense suffix) can
+// never drift on what counts as machinery. Relevance Quality Audit 2026-06-29
+// finding #2: text-valued keys like `icon`/`cssclasses` had been leaking into
+// the dense suffix because only THIS field name-excluded them.
+export const MACHINERY_KEYS = new Set([
+    'icon', 'coordinates', 'cssclasses', 'cssclass', 'protected',
+    'version', 'completed', 'completeddate', 'position', 'banner', 'banner_y',
+]);
+
+// Keys excluded from the searchable-properties field = machinery (above) PLUS
+// keys already carried by a dedicated field (tags/aliases → own fields;
+// created/modified/datelink → date filters) so they aren't double-indexed into
+// this catch-all. Everything else (placeLoc, placeType, context, status,
+// pageType, …) is in — the harness gate measured the generic
+// everything-but-machinery posture, not a curated allowlist. `pageType` used to
+// be excluded here (it had a dedicated `page_type` field); that field is gone,
+// so it now flows through this catch-all by name like any other scalar prop.
 // Compared lowercased; chunker's extractProperties stores SCALARS only, so
 // list-valued props (relatedPages-style) never reach this field at all.
 const PROPERTY_EXCLUDE_KEYS = new Set([
-    'tags', 'aliases', 'alias', 'pagetype', 'page_type', 'created', 'modified',
-    'datelink', 'icon', 'coordinates', 'cssclasses', 'cssclass', 'protected',
-    'version', 'completed', 'completeddate', 'position', 'banner', 'banner_y',
+    'tags', 'aliases', 'alias', 'created', 'modified', 'datelink',
+    ...MACHINERY_KEYS,
 ]);
 const PROPERTY_DATE_RE = /^\d{4}-\d{2}-\d{2}/;
 const PROPERTY_NUM_RE = /^-?[\d., ]+$/;
@@ -448,14 +464,13 @@ export function extractPropertiesText(chunk: ChunkMeta): string {
 
 // Shape of a single document handed to MiniSearch. Per-chunk granularity:
 // each chunk is one document, fields that are file-level metadata (title,
-// aliases, tags, page_type) are duplicated across chunks of the same note —
+// aliases, tags) are duplicated across chunks of the same note —
 // same shape as the v0.0.1 hand-rolled index, by design.
 interface IndexedDoc {
     chunk_id: string;
     title: string;
     aliases: string;
     tags: string;
-    page_type: string;
     content: string;
     // Only populated (and only listed in `fields`) when fit() runs with
     // searchableProperties on — see fit().
@@ -525,7 +540,6 @@ export class MultiFieldBM25 {
             title: extractNoteName(c),
             aliases: extractAliasesText(c),
             tags: extractTagsText(c),
-            page_type: extractPageType(c),
             content: body,
             ...(this.withProps && { properties: extractPropertiesText(c) }),
             ...(this.withHeadings && { headings: extractHeadingsText(c) }),
@@ -541,7 +555,7 @@ export class MultiFieldBM25 {
     private buildMiniOptions(withProps: boolean, withHeadings: boolean): Options<IndexedDoc> {
         return {
             fields: [
-                'title', 'aliases', 'tags', 'page_type', 'content',
+                'title', 'aliases', 'tags', 'content',
                 ...(withProps ? ['properties'] : []),
                 ...(withHeadings ? ['headings'] : []),
             ],

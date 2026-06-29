@@ -6,7 +6,7 @@ describe('titleMatchBoost — token coverage (precision-scaled)', () => {
     const B = 0.8;
 
     it('exact title => full boost (precision 1)', () => {
-        const out = titleMatchBoost('graphdb', [chunk('Clippings/GraphDB.md')], B);
+        const out = titleMatchBoost('memgraph', [chunk('Clippings/MemGraph.md')], B);
         expect(out[0]).toBeCloseTo(B, 10);
     });
 
@@ -23,13 +23,13 @@ describe('titleMatchBoost — token coverage (precision-scaled)', () => {
     });
 
     it('word order does not matter (set membership)', () => {
-        const out = titleMatchBoost('project atlas', [chunk('Notes/Atlas Project.md')], B);
-        expect(out[0]).toBeCloseTo(B, 10); // {project,atlas} == {atlas,project} => precision 1
+        const out = titleMatchBoost('project eames', [chunk('Notes/Eames Project.md')], B);
+        expect(out[0]).toBeCloseTo(B, 10); // {project,eames} == {eames,project} => precision 1
     });
 
     it('a longer title with the query as a subset earns less than an exact title', () => {
-        const exactNote = titleMatchBoost('atlas project', [chunk('Notes/Atlas Project.md')], B)[0];
-        const taskNote = titleMatchBoost('atlas project', [chunk('Notes/Atlas Project Design Review.md')], B)[0];
+        const exactNote = titleMatchBoost('eames project', [chunk('Notes/Eames Project.md')], B)[0];
+        const taskNote = titleMatchBoost('eames project', [chunk('Notes/Eames Project Design Review.md')], B)[0];
         expect(exactNote).toBeGreaterThan(taskNote); // precision 1 vs 2/4
         expect(taskNote).toBeCloseTo(B * (2 / 4), 10);
     });
@@ -41,7 +41,7 @@ describe('titleMatchBoost — token coverage (precision-scaled)', () => {
     });
 
     it('takes the best of basename and aliases', () => {
-        const out = titleMatchBoost('aca', [chunk('Notes/Creative Assistant.md', ['Acme Creative Assistant', 'ACA'])], B);
+        const out = titleMatchBoost('aca', [chunk('Notes/Creative Assistant.md', ['Example Creative Assistant', 'ACA'])], B);
         expect(out[0]).toBeCloseTo(B, 10); // exact alias "ACA" wins over the 3-token alias
     });
 
@@ -64,9 +64,9 @@ describe('titleMatchBoost — token coverage (precision-scaled)', () => {
 
     // audit 2026-06-09 §6.1 — a stopword the user typed must not kill the gate.
     it('ignores a leading query stopword the title omits (§6.1)', () => {
-        // q content={atlas,project} (drops "the"); title {atlas,project} => precision 1.
+        // q content={eames,project} (drops "the"); title {eames,project} => precision 1.
         // Before the fix this returned 0 because "the" wasn't in the title.
-        const out = titleMatchBoost('the atlas project', [chunk('Notes/Atlas Project.md')], B);
+        const out = titleMatchBoost('the eames project', [chunk('Notes/Eames Project.md')], B);
         expect(out[0]).toBeCloseTo(B, 10);
     });
 
@@ -104,6 +104,25 @@ describe('titleMatchBoost — token coverage (precision-scaled)', () => {
         // lock test that asserted no folding — this IS that deliberate change.)
         const out = titleMatchBoost('cafe gitane', [chunk('Places/Café Gitane.md')], B);
         expect(out[0]).toBeCloseTo(B, 10); // exact match after fold, precision 1
+    });
+
+    it("strips a possessive clitic — \"ryan's\" fires on a `Ryan` title (audit 2026-06-29 #4)", () => {
+        // tokenSet now tokenizes with seekTokenize(derived:false), so the
+        // possessive-strip BM25 applies runs here too. Before the fix the bare
+        // /[\p{L}\p{N}]+/ split left a stray "s" ("ryan","s") that failed the
+        // all-query-tokens-in-title gate while BM25 stripped it and matched.
+        const out = titleMatchBoost("ryan's", [chunk('People/Ryan.md')], B);
+        expect(out[0]).toBeCloseTo(B, 10); // precision 1 after the clitic drops
+    });
+
+    it('uses the CANONICAL stream (derived:false), so a glue/camel form does not fire — deliberate', () => {
+        // derived:false omits the additive glue-join, so "gpt4" does NOT cover a
+        // `GPT-4` title ({gpt4} ⊄ {gpt,4}). This is the eval-gated choice (audit
+        // #4): derived:true would fire it but inflates |t| on dated titles for a
+        // measured −0.0002 vs the strict no-op of derived:false. Pinned so a
+        // future "just use derived:true" change trips this test and re-reads why.
+        const out = titleMatchBoost('gpt4', [chunk('Notes/GPT-4.md')], B);
+        expect(out[0]).toBe(0);
     });
 });
 
