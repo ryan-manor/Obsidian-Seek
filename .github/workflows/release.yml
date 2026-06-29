@@ -29,6 +29,21 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Extract changelog section for this tag
+        # The repo's git history is promotion snapshots ("Promote …"), so
+        # --generate-notes would be noise. The user-facing notes live in the
+        # hand-curated CHANGELOG.md (Keep a Changelog). Pull the section for this
+        # version; fall back to a stub so a missing entry never blocks the release.
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          awk -v ver="$tag" '
+            $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+            grab && /^## \[/ { exit }
+            grab { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "See CHANGELOG.md for changes in $tag." > RELEASE_NOTES.md
+          fi
       - name: Create draft release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -38,5 +53,5 @@ jobs:
           gh release create "$tag" \
             --title "$tag" \
             --draft \
-            --generate-notes \
+            --notes-file RELEASE_NOTES.md \
             main.js manifest.json styles.css

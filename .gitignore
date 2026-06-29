@@ -16,3 +16,6 @@ captures/
 
 # Throwaway diagnostic probes / scratch HTML (e.g. lazyrelease-probe). Local-only.
 experiments/
+
+settings.json
+claude.md

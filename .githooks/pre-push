@@ -1,0 +1,14 @@
+#!/bin/sh
+# Pre-push gate: typecheck + tests must pass before code leaves the machine.
+# Mirrors the prototype's gate so the public repo can't publish a red build
+# (promotion runs these too, but a direct prod hotfix would otherwise skip them).
+# Bypass intentionally with:  git push --no-verify
+set -e
+
+echo "[pre-push] typecheck…"
+npm run --silent typecheck
+
+echo "[pre-push] tests…"
+npm test --silent
+
+echo "[pre-push] ok — pushing."
