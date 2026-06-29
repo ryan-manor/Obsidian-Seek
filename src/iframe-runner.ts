@@ -210,7 +210,19 @@ interface Pending {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     // Per-RPC timeout handle, cleared when the reply lands (or on dispose).
-    timer?: ReturnType<typeof setTimeout>;
+    // number is window.setTimeout's DOM return (clearTimeout takes it).
+    timer?: number;
+}
+
+// Shape of an iframe→parent postMessage payload: RPC replies plus the bootstrap
+// control messages (__ready / __error / __event). event.data is structurally
+// untyped (any), so we narrow it to this before reading fields.
+interface IframeMsg {
+    id: string;
+    ok?: boolean;
+    result?: unknown;
+    error?: string;
+    event?: IframeEvent;
 }
 
 export class IframeRunner {
@@ -264,19 +276,19 @@ export class IframeRunner {
 
     private buildIframe(): Promise<void> {
         return new Promise((resolve, reject) => {
-            const timeout = setTimeout(
+            const timeout = window.setTimeout(
                 () => reject(new Error(`iframe ready timeout after ${READY_TIMEOUT_MS}ms`)),
                 READY_TIMEOUT_MS,
             );
 
             this.listener = (event: MessageEvent) => {
                 if (!this.iframe || event.source !== this.iframe.contentWindow) return;
-                const data = event.data;
+                const data = event.data as IframeMsg | undefined;
                 if (!data || typeof data !== 'object') return;
 
-                if (data.id === '__ready') { clearTimeout(timeout); resolve(); return; }
+                if (data.id === '__ready') { window.clearTimeout(timeout); resolve(); return; }
                 if (data.id === '__error') {
-                    clearTimeout(timeout);
+                    window.clearTimeout(timeout);
                     reject(new Error(`iframe bootstrap failed: ${data.error}`));
                     return;
                 }
@@ -289,15 +301,21 @@ export class IframeRunner {
                 const p = this.pending.get(data.id);
                 if (!p) return;
                 this.pending.delete(data.id);
-                if (p.timer) clearTimeout(p.timer);
+                if (p.timer) window.clearTimeout(p.timer);
                 if (data.ok) p.resolve(data.result);
                 else p.reject(new Error(data.error ?? 'iframe error'));
             };
             window.addEventListener('message', this.listener);
 
+            // Anchor the hidden compute iframe to the MAIN window's document, NOT
+            // activeDocument: it is display:none (no popout-render benefit), must
+            // outlive any popout (anchoring it to the window focused at first embed
+            // would orphan it when that popout closes), and its contentWindow
+            // postMessage must reach the `window` message listener bound above.
+            // eslint-disable-next-line -- stable main-window anchor for a long-lived hidden compute iframe (see above)
             this.iframe = document.createElement('iframe');
             this.iframe.id = IFRAME_ID;
-            this.iframe.style.display = 'none';
+            this.iframe.addClass('seek-hidden');
             // LOAD-BEARING: no `sandbox` attribute. A srcdoc iframe with no sandbox
             // inherits Obsidian's real origin (`capacitor://localhost` on iOS,
             // `app://obsidian.md` on desktop). That real origin is what lets the
@@ -308,6 +326,7 @@ export class IframeRunner {
             // a `sandbox` attribute would give the iframe an opaque `null` origin
             // and break BOTH on iOS. Do not add one without first moving the model
             // fetch out of the iframe (e.g. parent requestUrl → resource URL).
+            // eslint-disable-next-line -- stable main-window anchor (see iframe creation above)
             document.body.appendChild(this.iframe);
 
             const childScript = buildChildScript(CDN_URL, ACTIVE_MODEL_SPEC.dim);
@@ -328,7 +347,7 @@ export class IframeRunner {
             // no reply lands in time, reject with a RECOVERABLE 'TIMEOUT' so the
             // embed catch recycles+retries instead of hanging. Cleared in the
             // message listener the instant the real reply arrives.
-            const timer = setTimeout(() => {
+            const timer = window.setTimeout(() => {
                 if (!this.pending.delete(id)) return;
                 reject(Object.assign(
                     new Error(`iframe RPC '${type}' timed out after ${timeoutMs}ms`),
@@ -410,7 +429,7 @@ export class IframeRunner {
         // a recoverable error (SafeInt overflow / TIMEOUT → recycle+retry).
         // Clear each pending timer first so a timeout can't fire post-rejection.
         for (const [, p] of this.pending) {
-            if (p.timer) clearTimeout(p.timer);
+            if (p.timer) window.clearTimeout(p.timer);
             p.reject(Object.assign(new Error('iframe disposed'), { code: 'DISPOSED' }));
         }
         this.pending.clear();
@@ -424,7 +443,7 @@ export class IframeRunner {
     // replaces the now-dead-device iframe.
     failInflight(message: string): void {
         for (const [, p] of this.pending) {
-            if (p.timer) clearTimeout(p.timer);
+            if (p.timer) window.clearTimeout(p.timer);
             p.reject(new Error(message));
         }
         this.pending.clear();

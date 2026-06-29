@@ -16,13 +16,13 @@
 //   - No model-cache management
 //   - No MCP wrapper
 
-import { Notice, Plugin, TFile } from 'obsidian';
+import { Modal, Notice, Plugin, TFile } from 'obsidian';
 import type { App } from 'obsidian';
 import { LocalEmbedder, LOCAL_MODEL, LEGACY_ENGLISH_MODEL_ID, EMBEDDING_DIM } from './embedder';
 import { activeModelSpec, resolveOverrideSpec, evictStaleModelCaches, deleteModelCaches, probeModelDownloaded } from './model-registry';
 import { pluginIdentity, identityMatches, identityFromMeta } from './identity';
 import { sweepOrphanTmpFiles } from './sidecar';
-import type { SeekSettings, SidecarIndexLocation, IndexCompleteEntry, ModelDeliveryEntry } from './types';
+import type { SeekSettings, IndexCompleteEntry, ModelDeliveryEntry } from './types';
 import { DEFAULT_SETTINGS, migrateSettings } from './types';
 import { IndexStore, indexDbPrefix } from './index-store';
 import { SeekLogger } from './logger';
@@ -31,12 +31,11 @@ import { SearchOrchestrator, driftRecoveryDecision } from './search';
 import { SeekSearchModal, type IndexBanner } from './search-modal';
 import { indexBannerSpec, INDEX_STALE_MSG, INDEX_SYNCING_MSG, INDEX_PEER_AHEAD_MSG, type DegradedReason } from './index-notice';
 import { SeekSettingTab } from './settings-tab';
-import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash, getBackendOverride, setBackendOverride, isWebgpuDemoted, clearWebgpuDemoted, type BackendChoice } from './platform';
+import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash } from './platform';
 import { CompositorPacer } from './pacer';
 import { shouldUnloadEmbedder, type UnloadGateState } from './embedder-lifecycle';
 import { drainCatchUp, CATCHUP_MAX_FILES_PER_BURST, CATCHUP_BURST_BUDGET_MS } from './catchup';
 import type { LongTaskEntry, MemoryPressureEntry, StorageSnapshotEntry, EvictionSuspectedEntry, AppLocalFetchEntry } from './types';
-import { TRANSFORMERS_VERSION } from './iframe-runner';
 
 // Long-task threshold. PerformanceObserver fires for any task ≥50 ms by spec,
 // but at that floor we'd flood the log. 250 ms is the rough threshold above
@@ -139,6 +138,11 @@ export default class SeekPlugin extends Plugin {
     private onUnhandledRejection: ((e: PromiseRejectionEvent) => void) | null = null;
     private onVisibilityChange: (() => void) | null = null;
     private onPageHide: (() => void) | null = null;
+    // The document the visibilitychange listener is bound to, captured at add-time.
+    // activeDocument tracks the focused window, which can change to a popout between
+    // load and unload — so removing against a fresh activeDocument would target the
+    // wrong document and leak the main-window listener. Bind + unbind via this ref.
+    private visibilityDoc: Document | null = null;
     // Crash forensics (see forensics.ts). Created in onload once the vault
     // scope (appId) is known; null only during the first lines of onload.
     private forensics: Forensics | null = null;
@@ -346,7 +350,7 @@ export default class SeekPlugin extends Plugin {
         // search assumes the binary index is loadable — but the actual work
         // is ~5 ms for an empty store and ~100 ms for a 5k-chunk vault.
         try {
-            const packed = await this.store.backfillBinaryIfMissing();
+            await this.store.backfillBinaryIfMissing();
         } catch (e) {
             // Backfill failure isn't fatal: the user can rebuild via "Full
             // reindex". Log it and continue plugin init.
@@ -515,7 +519,9 @@ export default class SeekPlugin extends Plugin {
         // ---- Commands ----
 
         this.addCommand({
-            id: 'seek-search',
+            // Obsidian auto-namespaces command ids with the plugin id, so the
+            // public id is already `<plugin-id>:search` — don't repeat the prefix.
+            id: 'search',
             name: 'Search',
             callback: () => this.openSearchModal(),
         });
@@ -688,7 +694,7 @@ export default class SeekPlugin extends Plugin {
         }
         if (this.onError) window.removeEventListener('error', this.onError);
         if (this.onUnhandledRejection) window.removeEventListener('unhandledrejection', this.onUnhandledRejection);
-        if (this.onVisibilityChange) document.removeEventListener('visibilitychange', this.onVisibilityChange);
+        if (this.onVisibilityChange && this.visibilityDoc) this.visibilityDoc.removeEventListener('visibilitychange', this.onVisibilityChange);
         if (this.onPageHide) window.removeEventListener('pagehide', this.onPageHide);
         if (this.idleTimer != null) window.clearTimeout(this.idleTimer);
         if (this.structTimer != null) window.clearTimeout(this.structTimer);
@@ -699,7 +705,10 @@ export default class SeekPlugin extends Plugin {
     // ── Sidecar index location ──────────────────────────────────────────────
     // The DEFAULT config-folder name. We pin to this LITERAL string rather than
     // vault.configDir (the per-device active override) so every device resolves
-    // the SAME sidecar path — the fix for the config-folder CRITICAL.
+    // the SAME sidecar path — the fix for the config-folder CRITICAL. This is also
+    // the baseline maybeSteerSidecarLocation compares vault.configDir AGAINST to
+    // detect a renamed config folder, so it MUST stay a literal.
+    // eslint-disable-next-line -- intentional literal; pinned synced sidecar path + rename-detection baseline (see above)
     private static readonly DEFAULT_CONFIG_DIR = '.obsidian';
     // Per-INSTANCE so a co-installed build (different manifest.id) gets its own
     // sidecar location and can't write into the public build's plugin folder. The
@@ -728,7 +737,6 @@ export default class SeekPlugin extends Plugin {
         const ls = await adapter.list(from).catch(() => null);
         if (!ls || ls.files.length === 0) return; // nothing written under the old path
         if (!(await adapter.exists(to).catch(() => false))) await adapter.mkdir(to).catch(() => {});
-        let moved = 0;
         for (const path of ls.files) {
             const dest = `${to}/${path.slice(path.lastIndexOf('/') + 1)}`;
             // Never clobber the new location (a prior partial migration, or this
@@ -736,7 +744,6 @@ export default class SeekPlugin extends Plugin {
             if (await adapter.exists(dest).catch(() => false)) continue;
             try {
                 await adapter.rename(path, dest);
-                moved++;
             } catch (e) {
                 await this.logger.appendError('sidecar-migrate-file', e).catch(() => {});
             }
@@ -1152,7 +1159,7 @@ export default class SeekPlugin extends Plugin {
             if (!this.orphanSweepDone && !this.orphanSweepRunning) {
                 this.orphanSweepRunning = true;
                 try {
-                    const { removed, completed } = await this.orchestrator.sweepOrphanChunks({ shouldContinue: () => !document.hidden });
+                    const { completed } = await this.orchestrator.sweepOrphanChunks({ shouldContinue: () => !activeDocument.hidden });
                     if (completed) this.orphanSweepDone = true;
                 } finally {
                     this.orphanSweepRunning = false;
@@ -1173,6 +1180,7 @@ export default class SeekPlugin extends Plugin {
                         // corruption breadcrumb (invisible on mobile without it).
                         if (r.shed > 0) await this.logger.appendError('sidecar-compaction-shed', new Error(`shed ${r.shed} corrupt/unreadable record(s)`)).catch(() => {});
                     } else if (r && r.reason === 'incomplete-rechunk') {
+                        /* intentionally empty: an incomplete re-chunk is transient — leave sidecarCompactDone unlatched below so the next poll retries */
                     }
                     // Latch on any definitive verdict; an incomplete re-chunk is transient,
                     // so leave it open to retry. null = sidecar off → don't latch (it may
@@ -1597,7 +1605,7 @@ export default class SeekPlugin extends Plugin {
     // unless something was deferred (catchUpPending) and we're in a safe window.
     private runCatchUp(): void {
         if (!this.catchUpPending || this.catchUpRunning || !this.embedder.loaded || !this.orchestrator) return;
-        if (document.hidden || this.indexingBlocked) return;  // never start in a bad window (typing OR a query in flight)
+        if (activeDocument.hidden || this.indexingBlocked) return;  // never start in a bad window (typing OR a query in flight)
         // Peer-ahead grind-stop: while a newer-version peer index exists, draining the
         // deferred backlog would re-embed (on the iOS main thread) chunks this build will
         // discard the moment it updates. Leave catchUpPending set so the drain resumes
@@ -1613,7 +1621,7 @@ export default class SeekPlugin extends Plugin {
                 const { pending } = await drainCatchUp({
                     computeDelta: () => orchestrator.computeDelta(),
                     reindexDelta: (d, del, opts) => orchestrator.reindexDelta(d, del, opts),
-                    isHidden: () => document.hidden,
+                    isHidden: () => activeDocument.hidden,
                     isSearchActive: () => this.indexingBlocked,
                     pace: () => pacer.pace(),
                     maxFiles: mobile ? CATCHUP_MAX_FILES_PER_BURST : undefined,
@@ -1660,7 +1668,7 @@ export default class SeekPlugin extends Plugin {
     // console.error (NO Notice on this path), surfaced on the settings page.
     private runDriftRecovery(): void {
         if (!this.driftRecoveryPending || this.driftRecoveryRunning || !this.orchestrator) return;
-        if (document.hidden || this.indexingBlocked) return;  // never start in a bad window (typing OR a query in flight)
+        if (activeDocument.hidden || this.indexingBlocked) return;  // never start in a bad window (typing OR a query in flight)
         this.driftRecoveryRunning = true;
         this.indexHealth = 'recovering';
         const orchestrator = this.orchestrator;
@@ -1695,6 +1703,7 @@ export default class SeekPlugin extends Plugin {
                 } else {
                     this.commitDriftHealth(ok ? 'healthy' : 'degraded', verifiedGen);
                     if (ok) {
+                        /* intentionally empty: the re-couple succeeded and is already committed as 'healthy' above — nothing further to do */
                     } else {
                         console.error('[seek] drift auto-recovery exhausted (embed-free warm + sidecar reconcile did not re-couple the frame/BM25 row space) — indexHealth=degraded; a full reindex recovers it');
                     }
@@ -1747,7 +1756,7 @@ export default class SeekPlugin extends Plugin {
     // recovery affordance). USER-INITIATED, so unlike the automatic drift-recovery
     // ladder it is allowed to embed — the embed-free guarantee covers only the auto path.
     // opts.skipConfirm: the caller already confirmed (the settings Index section has its
-    // own inline two-button confirm, so it suppresses the blocking window.confirm).
+    // own inline two-button confirm, so it suppresses the blocking confirm dialog).
     // opts.onProgress: a second progress sink (besides the Notice) — the settings status
     // card subscribes to drive its live "N / TOTAL notes" bar. Arg-less callers (command
     // palette main.ts:496, degraded-health button) keep the confirm + Notice unchanged.
@@ -1767,8 +1776,8 @@ export default class SeekPlugin extends Plugin {
             return false;
         }
         if (!opts?.skipConfirm) {
-            const confirm = `This will delete the existing Seek index and re-embed every markdown file in this vault.\nProceed?`;
-            if (!window.confirm(confirm)) return false;
+            const message = 'This will delete the existing Seek index and re-embed every markdown file in this vault.\nProceed?';
+            if (!(await new ConfirmModal(this.app, message).openAndConfirm())) return false;
         }
 
         const notice = new Notice('Seek: full reindex starting…', 0);
@@ -2032,7 +2041,7 @@ export default class SeekPlugin extends Plugin {
             await this.logger.append(entry);
         };
         this.onVisibilityChange = () => {
-            if (document.visibilityState === 'hidden') {
+            if (this.visibilityDoc?.visibilityState === 'hidden') {
                 // Forensics beat FIRST and synchronously — the async emit below
                 // can be lost to a background kill; the breadcrumb can't.
                 this.forensics?.beat('visibility-hidden');
@@ -2042,7 +2051,7 @@ export default class SeekPlugin extends Plugin {
                 // now, bypassing the 5-min idle debounce.
                 this.flushOnBackground();
             }
-            else if (document.visibilityState === 'visible') {
+            else if (this.visibilityDoc?.visibilityState === 'visible') {
                 this.forensics?.beat('visibility-visible');
                 emit('visibility-visible').catch(() => {});
             }
@@ -2052,7 +2061,10 @@ export default class SeekPlugin extends Plugin {
             emit('pagehide').catch(() => {});
             this.flushOnBackground();
         };
-        document.addEventListener('visibilitychange', this.onVisibilityChange);
+        // Bind to the active document and remember it, so unload removes against the
+        // SAME document (see visibilityDoc field).
+        this.visibilityDoc = activeDocument;
+        this.visibilityDoc.addEventListener('visibilitychange', this.onVisibilityChange);
         window.addEventListener('pagehide', this.onPageHide);
     }
 
@@ -2182,6 +2194,48 @@ export default class SeekPlugin extends Plugin {
             heapMB,
         };
         await this.logger.append(entry);
+    }
+}
+
+// Minimal confirm dialog. Replaces the native window.confirm(), which is
+// unreliable on mobile (the WebView can suppress it). Resolves true when the
+// user confirms, false on Cancel or any dismissal (Esc / click-outside).
+class ConfirmModal extends Modal {
+    private settled = false;
+    private resolve: ((value: boolean) => void) | null = null;
+
+    constructor(app: App, private readonly message: string) {
+        super(app);
+    }
+
+    openAndConfirm(): Promise<boolean> {
+        return new Promise<boolean>((resolve) => {
+            this.resolve = resolve;
+            this.open();
+        });
+    }
+
+    onOpen(): void {
+        for (const line of this.message.split('\n')) {
+            this.contentEl.createEl('p', { text: line });
+        }
+        const buttons = this.contentEl.createDiv({ cls: 'modal-button-container' });
+        const proceed = buttons.createEl('button', { text: 'Proceed', cls: 'mod-cta' });
+        proceed.addEventListener('click', () => this.settle(true));
+        const cancel = buttons.createEl('button', { text: 'Cancel' });
+        cancel.addEventListener('click', () => this.settle(false));
+    }
+
+    onClose(): void {
+        // Dismissed without a button (Esc / click-outside) → treat as Cancel.
+        this.settle(false);
+    }
+
+    private settle(value: boolean): void {
+        if (this.settled) return;
+        this.settled = true;
+        this.resolve?.(value);
+        this.close();
     }
 }
 

@@ -5,6 +5,12 @@
  * theme-proof requirement). No hard-coded colours; accent tints use color-mix
  * over --interactive-accent so they stay legible in light and dark. */
 
+/* Utility: hide an element off-layout. Replaces an inline `display:none` set
+   from iframe-runner.ts (community review forbids inline styles). */
+.seek-hidden {
+    display: none;
+}
+
 /* ---- modal shell: narrow, pinned high (quick-switcher feel) ---- */
 
 .modal-container.seek-modal-container {

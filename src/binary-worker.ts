@@ -30,12 +30,29 @@ let loadedGen = -1;
 let n = 0;
 let bytesPerVec = 0;
 
+// Inbound message from the main thread: a 'load' (install the packed sign-bit
+// index for a generation) or a 'score' (run one query). Fields are the union
+// across both. Structured clone hands us `any`, so we narrow e.data to this.
+interface WorkerInMsg {
+    type: string;
+    generation: number;
+    // 'load'
+    packed?: Uint8Array;
+    n?: number;
+    bytesPerVec?: number;
+    // 'score'
+    queryId?: number;
+    queryVec?: Float32Array;
+    topN?: number;
+    mask?: Uint8Array | null;
+}
+
 ctx.onmessage = (e: MessageEvent) => {
-    const msg = e.data;
+    const msg = e.data as WorkerInMsg | undefined;
     if (!msg) return;
     if (msg.type === 'load') {
         packed = msg.packed as Uint8Array;
-        loadedGen = msg.generation as number;
+        loadedGen = msg.generation;
         n = msg.n as number;
         bytesPerVec = msg.bytesPerVec as number;
         return;

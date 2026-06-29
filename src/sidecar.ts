@@ -440,7 +440,7 @@ export async function scanJsonl(adapter: DataAdapter, paths: string[]): Promise<
         let winner: VectorRecord | null = null;
         for (const rec of byDev.values()) {
             if (isTombstone(rec)) continue; // this device's latest is a delete → no contribution
-            const v = rec as VectorRecord;
+            const v = rec;
             if (!winner || crossDeviceWins(v, winner)) winner = v;
         }
         if (winner) {

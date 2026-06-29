@@ -7,7 +7,7 @@
 // three v0 commands.
 
 import type { App } from 'obsidian';
-import { TFile, Notice } from 'obsidian'; // value imports: reindexDelta uses `instanceof TFile`; the coherence-drift guard surfaces a Notice
+import { TFile } from 'obsidian'; // value import: reindexDelta uses `instanceof TFile`
 import type { Chunk, ChunkMeta, ScoredChunk, SearchEntry, IndexCompleteEntry, IndexProgressEntry, ResetEntry, QueryFilters, FilterContext, SeekSettings, MemorySnapshot } from './types';
 import { snapshotMemory, memoryDelta, distributionStats } from './types';
 import { MarkdownChunker, cyrb53Hex } from './chunker';
@@ -270,6 +270,8 @@ export class SearchOrchestrator {
             return include;
         });
         if (skipped.length > 0) {
+            /* intentionally empty: skipped paths are collected above for the
+               filter's side effect; no per-run action is taken on them here */
         }
         // Progressive ordering: index most-recently-modified files first. Since
         // search rebuilds BM25 in-memory and dense reads commit per file, the
@@ -398,7 +400,7 @@ export class SearchOrchestrator {
             // updates (self-resolving). Stops fleet-wide version drift from piling up.
             // Best-effort: never fail the reindex on a reap error.
             try {
-                const reaped = await this.reapDeadIdentitySidecars();
+                await this.reapDeadIdentitySidecars();
             } catch (e) {
                 await this.logger.appendError('sidecar-reap', e);
             }
@@ -680,7 +682,7 @@ export class SearchOrchestrator {
 
             const fs: FileState = {
                 file, chunks: fileChunks,
-                vectors: new Array(fileChunks.length).fill(null),
+                vectors: new Array<Float32Array | null>(fileChunks.length).fill(null),
                 remaining: fileChunks.length, hadError: false, fileStart,
                 mtimeMs, contentHash,
             };
@@ -1747,21 +1749,25 @@ export class SearchOrchestrator {
     // this to null every rebirth and re-chunked the entire vault on each onload.
     private lastReconcileSig: string | null = null;
 
-    // localStorage key for the persisted reconcile signature. Scoped by dbName
-    // (which carries the vault's appId) so two vaults sharing the iOS origin
-    // (capacitor://localhost) don't clobber each other's gate.
+    // Reconcile-signature storage key. App#saveLocalStorage vault-scopes by the
+    // vault's appId, so cross-VAULT clobber is handled automatically; we KEEP
+    // dbName in the key so two co-installed Seek builds (id 'seek' + 'seek-prototype')
+    // in the SAME vault still don't clobber each other's gate (same appId namespace).
     private reconcileSigKey(): string {
         return `seek:reconcile-sig:${this.store.dbName}`;
     }
 
     private loadPersistedReconcileSig(): string | null {
-        try { return localStorage.getItem(this.reconcileSigKey()); }
+        try {
+            const v: unknown = this.app.loadLocalStorage(this.reconcileSigKey());
+            return typeof v === 'string' ? v : null;
+        }
         catch { return null; }   // unavailable (private mode/quota) → fall back to in-memory gating
     }
 
     private persistReconcileSig(sig: string): void {
         this.lastReconcileSig = sig;
-        try { localStorage.setItem(this.reconcileSigKey(), sig); }
+        try { this.app.saveLocalStorage(this.reconcileSigKey(), sig); }
         catch { /* best-effort; in-memory cache still gates this session */ }
     }
 
@@ -2153,7 +2159,6 @@ export class SearchOrchestrator {
         // makes the chunk_id-reproduction dependency explicit (as in dedupViaSidecar).
         await this.embedder.ensureTokenizer();
         const done = new Set<string>();
-        let reusedChunks = 0;
         for (const f of files) {
             let content: string;
             try { content = await this.app.vault.cachedRead(f); } catch { continue; }
@@ -2171,7 +2176,6 @@ export class SearchOrchestrator {
             await this.store.putBatchQuantized(chunks, tiers.map(t => ({ q: t!.q, bin: t!.sign })));
             await this.store.putFileRecord({ note_path: f.path, mtimeMs: f.stat.mtime, chunk_ids: chunks.map(c => c.chunk_id), contentHash: cyrb53Hex(content) });
             done.add(f.path);
-            reusedChunks += chunks.length;
         }
         return files.filter(f => !done.has(f.path));
     }
@@ -2890,6 +2894,8 @@ export class SearchOrchestrator {
             for (let i = 0; i < embIds.length; i++) embById.set(embIds[i], embVecs[i]);
             resident = buildResidentRerankBlock(orderedIds, embById);
         } else {
+            /* intentionally empty: resident stays null (declared above), so
+               stage-2 falls back to the per-id IDB read — see comment above */
         }
 
         // The index advanced while we were assembling (a full reindex completed):
@@ -3193,7 +3199,6 @@ export class SearchOrchestrator {
             // scheduler, so this converges in 1–2 passes under real editing.
             let warmedChunks: ChunkMeta[] | null = null;
             do {
-                const t0 = performance.now();
                 const frame = await this.ensureFrame();
                 if (!frame) break;
                 await this.ensureBm25(frame.orderedChunks);

@@ -220,13 +220,19 @@ export class SeekSettingTab extends PluginSettingTab {
         const locList = indexLoc.descEl.createEl('ul', { cls: 'seek-desc-list' });
         const locHidden = locList.createEl('li');
         locHidden.createEl('strong', { text: 'Hidden (default): ' });
-        locHidden.createSpan({ text: 'inside the hidden .obsidian config folder.' });
+        // Literal '.obsidian', NOT vault.configDir: the sidecar index is pinned to
+        // the default config folder so every device resolves the SAME synced path
+        // (see main.ts sidecarConfigDir). Showing vault.configDir would misreport
+        // the index location to a renamed-config user, whose index still lives here.
+        // eslint-disable-next-line -- intentional literal; pinned synced sidecar path, see above
+        locHidden.createSpan({ text: `inside the hidden .obsidian config folder.` });
         const locRoot = locList.createEl('li');
         locRoot.createEl('strong', { text: 'Vault root: ' });
         locRoot.createSpan({ text: 'a visible "Seek Index" folder will appear in your vault. Choose this only if you use Obsidian Sync with a mobile or tablet override config folder.' });
         indexLoc.descEl.createDiv({ text: 'Takes effect after reloading Seek.' });
         indexLoc.addDropdown(dd => dd
-            .addOption('config', 'Hidden (.obsidian, recommended)')
+            // eslint-disable-next-line -- intentional literal; pinned synced sidecar path (see above)
+            .addOption('config', `Hidden (.obsidian, recommended)`)
             .addOption('visible', 'Vault root (Seek Index/)')
             .setValue(this.s.sidecarIndexLocation)
             .onChange(async v => {
@@ -451,10 +457,12 @@ export class SeekSettingTab extends PluginSettingTab {
             .setDesc('Balanced suits nearly everyone. Only switch to Keyword focused if you have exact terms which Balanced mode does not rank appropriately.');
         this.addSegmented(strat, ['Balanced', 'Keyword focused'],
             strategyOf(this.s.denseWeight) === 'keyword' ? 'Keyword focused' : 'Balanced',
-            async (pick) => {
-                this.s.denseWeight = STRATEGY_VALUE[pick === 'Keyword focused' ? 'keyword' : 'balanced'];
-                await this.save();
-                this.rerender(); // re-weight the pipeline diagram
+            (pick) => {
+                void (async () => {
+                    this.s.denseWeight = STRATEGY_VALUE[pick === 'Keyword focused' ? 'keyword' : 'balanced'];
+                    await this.save();
+                    this.rerender(); // re-weight the pipeline diagram
+                })();
             });
 
         // Fuzzy matching
@@ -468,12 +476,14 @@ export class SeekSettingTab extends PluginSettingTab {
         const rec = new Setting(adv)
             .setName('Recency bonus')
             .setDesc('Gives a score bonus to newer notes based on a selected date type property, or file modified date. This is recommended if you have episodic notes which occur regularly around the same topics, like meetings or classes.');
-        this.addSegmented(rec, ['Off', 'Default', 'High'], recStage, async (pick) => {
-            const v = RECENCY_VALUE[pick as Stage];
-            this.s.recencyEpsilon = v.eps;
-            this.s.recencyHalfLifeDays = v.hl;
-            await this.save();
-            this.rerender(); // re-bold the pipeline "recency" sub-label + enable/disable the date picker
+        this.addSegmented(rec, ['Off', 'Default', 'High'], recStage, (pick) => {
+            void (async () => {
+                const v = RECENCY_VALUE[pick as Stage];
+                this.s.recencyEpsilon = v.eps;
+                this.s.recencyHalfLifeDays = v.hl;
+                await this.save();
+                this.rerender(); // re-bold the pipeline "recency" sub-label + enable/disable the date picker
+            })();
         });
         // Date-property picker, dimmed/disabled until a stage other than Off is chosen.
         const dateProps = enumerateDatePropertyNames(this.app);
@@ -495,10 +505,12 @@ export class SeekSettingTab extends PluginSettingTab {
         const title = new Setting(adv)
             .setName('Title bonus')
             .setDesc("Gives a score bonus to notes which have matching terms in their title. This can help a note that represents an entity or topic outrank pages that merely mention it.");
-        this.addSegmented(title, ['Off', 'Default', 'High'], titleStageOf(this.s.navTitleBoost), async (pick) => {
-            this.s.navTitleBoost = TITLE_VALUE[pick as Stage];
-            await this.save();
-            this.rerender(); // re-bold the pipeline "title" sub-label
+        this.addSegmented(title, ['Off', 'Default', 'High'], titleStageOf(this.s.navTitleBoost), (pick) => {
+            void (async () => {
+                this.s.navTitleBoost = TITLE_VALUE[pick as Stage];
+                await this.save();
+                this.rerender(); // re-bold the pipeline "title" sub-label
+            })();
         });
     }
 
@@ -582,7 +594,7 @@ export class SeekSettingTab extends PluginSettingTab {
         const downloaded = ms?.downloaded ?? false;
         const desc = row.descEl;
         const dot = desc.createSpan({ cls: `seek-dot seek-dot-${downloaded ? 'good' : 'mid'}` });
-        dot.style.marginRight = '6px';
+        dot.setCssStyles({ marginRight: '6px' });
         if (downloaded) {
             // Model on-disk size (Cache API bytes), relocated here from the index status card.
             // null on platforms that don't expose the usageDetails split (e.g. iOS) — omit it
@@ -700,10 +712,10 @@ export class SeekSettingTab extends PluginSettingTab {
     private brandLink(parent: HTMLElement, href: string, pathD: string, viewBox: string, label: string): void {
         const a = parent.createEl('a', { cls: 'seek-about-ic', href, attr: { 'aria-label': label, title: label } });
         const ns = 'http://www.w3.org/2000/svg';
-        const svg = document.createElementNS(ns, 'svg');
+        const svg = activeDocument.createElementNS(ns, 'svg');
         svg.setAttribute('viewBox', viewBox);
         svg.setAttribute('fill', 'currentColor');
-        const path = document.createElementNS(ns, 'path');
+        const path = activeDocument.createElementNS(ns, 'path');
         path.setAttribute('d', pathD);
         svg.appendChild(path);
         a.appendChild(svg);

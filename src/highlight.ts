@@ -30,9 +30,9 @@ export function maskNonBodyText(content: string): string {
     };
     const fm = /^---\n[\s\S]*?\n---/.exec(content);
     if (fm) blank(0, fm[0].length);
-    for (const m of content.matchAll(/!\[\[[^\]]*\]\]/g)) blank(m.index!, m.index! + m[0].length);
+    for (const m of content.matchAll(/!\[\[[^\]]*\]\]/g)) blank(m.index, m.index + m[0].length);
     for (const m of content.matchAll(/\[\[([^\]]*)\]\]/g)) {
-        const open = m.index!;
+        const open = m.index;
         if (open > 0 && content[open - 1] === '!') continue; // already blanked as an embed
         const inner = m[1];
         const pipe = inner.indexOf('|');
@@ -44,7 +44,7 @@ export function maskNonBodyText(content: string): string {
             blank(open + 2 + inner.length, open + m[0].length); // trailing ]]
         }
     }
-    for (const m of content.matchAll(/`[^`]*`/g)) blank(m.index!, m.index! + m[0].length);
+    for (const m of content.matchAll(/`[^`]*`/g)) blank(m.index, m.index + m[0].length);
     return ch.join('');
 }
 

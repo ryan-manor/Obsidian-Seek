@@ -30,7 +30,7 @@
 // from the same source and can never drift. The byte-identity between them is
 // load-bearing (coverage denominator + theoretical bound in bm25.ts enumerate
 // the SAME tokens search() scores with) — and is preserved by construction
-// because SCAN and SPACE_OR_PUNCT both rebuild from this constant.
+// because the SCAN regex below rebuilds from this constant.
 //
 // MATH SYMBOLS \p{Sm} (= + ~ < > | …) are delimiters (2026-06-25, URL cleanup).
 // Originally this class mirrored MiniSearch's default SPACE_OR_PUNCTUATION
@@ -47,7 +47,6 @@
 // Cost: `C++`→`C`, standalone math operators drop — symbols are not search
 // terms, and `C#` already collapsed to `C` (# is \p{Po}), so this is consistent.
 const DELIM_CLASS = '\\n\\r\\p{Z}\\p{P}\\p{Sm}';
-const SPACE_OR_PUNCT = new RegExp(`[${DELIM_CLASS}]+`, 'u');
 
 // Possessive 's, stripped from the RAW text BEFORE tokenizing (must be here, not
 // in processTerm: the split shatters "ryan's" into ["ryan","s"], leaving a junk
@@ -96,7 +95,19 @@ const GLUE_RUN = /^[\p{Pd}._/\p{Pc}'’]+$/u;
 // still be present (the load-bearing ordering caveat: a post-lowercase split
 // rule is dead on arrival). seekTokenize already preserves case, so this holds
 // by construction.
-const CAMEL_SPLIT = /(?<=\p{Ll}|\p{N})(?=\p{Lu})|(?<=\p{Lu})(?=\p{Lu}\p{Ll})/u;
+// Implemented WITHOUT lookbehind: `(?<=…)` throws at parse time on iOS WKWebView
+// before 16.4 and would take this whole module (hence the plugin) down on an
+// older iPhone/iPad. Instead, insert a SPACE sentinel at each zero-width boundary
+// via two ADDITIVE replace passes — matching the exact char-pairs the old
+// /(?<=\p{Ll}|\p{N})(?=\p{Lu})|(?<=\p{Lu})(?=\p{Lu}\p{Ll})/u matched — then split
+// on it. The two boundary classes are disjoint (the first's left side is
+// \p{Ll}|\p{N}, the second's is \p{Lu}), so a sentinel from one pass never lands
+// inside the other's match; splitting on a zero-width char-pair this way keeps
+// every original character. A space is a safe sentinel because the fragment is
+// already delimiter-split upstream (DELIM_CLASS includes \p{Z}), so it can never
+// itself contain whitespace.
+const CAMEL_LOWER_UPPER = /([\p{Ll}\p{N}])(\p{Lu})/gu;   // "theVerge" → the·Verge
+const CAMEL_ACRONYM_WORD = /(\p{Lu})(\p{Lu}\p{Ll})/gu;   // "XMLParser" → XML·Parser
 
 // Single-pass scan capturing each token (group 1 = the DELIM_CLASS complement)
 // together with the delimiter run that follows it (group 2), so we can tell a
@@ -152,8 +163,11 @@ export function segmentCjkToken(token: string): string[] {
 // to the canonical fragment only, never to the glue-joined form, so the added-
 // token count stays bounded (≤ parts per compound, no combinatorial fan-out).
 export function splitCamel(frag: string): string[] {
-    const parts = frag.split(CAMEL_SPLIT);
-    return parts.length >= 2 ? parts : [];
+    const marked = frag
+        .replace(CAMEL_LOWER_UPPER, '$1 $2')
+        .replace(CAMEL_ACRONYM_WORD, '$1 $2');
+    if (!marked.includes(' ')) return [];   // no boundary → no split (was parts.length < 2)
+    return marked.split(' ');
 }
 
 // The plugin-wide tokenizer: strip possessive 's, MiniSearch-default split, then

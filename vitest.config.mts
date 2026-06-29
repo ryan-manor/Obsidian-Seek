@@ -7,6 +7,12 @@ import { fileURLToPath } from 'node:url';
 // platform.ts → Platform). Alias it to a tiny test stub. Inert for the rest of
 // the suite, which imports nothing from obsidian.
 export default defineConfig({
+    // Provide `window`/`activeWindow` in the Node env so the plugin's
+    // popout-window-safe `window.setTimeout`/`activeWindow` calls resolve under
+    // test (see test-stubs/test-setup.ts). Patchable by vi.useFakeTimers().
+    test: {
+        setupFiles: [fileURLToPath(new URL('./src/test-stubs/test-setup.ts', import.meta.url))],
+    },
     resolve: {
         alias: {
             obsidian: fileURLToPath(new URL('./src/test-stubs/obsidian.ts', import.meta.url)),

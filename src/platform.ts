@@ -8,10 +8,7 @@ import type { PlatformEntry, AdapterLimits } from './types';
 // probe and by the indexer's device-adaptive embed batch ceiling, so the two
 // can never disagree about what "mobile" means.
 export function isMobilePlatform(): boolean {
-    // `navigator` is absent under Node < 21 (e.g. the CI test runner); the real
-    // plugin runtime always has it. Default to not-mobile when it's missing.
-    if (typeof navigator === 'undefined') return false;
-    return /Mobile|Android|iPhone|iPad/.test(navigator.userAgent);
+    return Platform.isMobile;
 }
 
 // ── Per-device compute-backend selection ───────────────────────────────────
@@ -36,9 +33,15 @@ const OVERRIDE_KEY = 'seek-backend-override';  // BackendChoice; absent/invalid 
 const DEMOTED_KEY = 'seek-webgpu-demoted';     // '1' once a mobile WebGPU reindex was OS-killed
 const ACTIVE_KEY = 'seek-active-backend';      // 'webgpu' | 'wasm' — backend the last load resolved to
 
+// NOTE: every localStorage access below is raw (per-origin) BY DESIGN — these are
+// per-device, never-synced backend keys (see the section comment above). Obsidian's
+// App#saveLocalStorage would vault-scope them, which is exactly the shared-file trap
+// this design avoids, so the obsidianmd localStorage rule is suppressed per-line.
+
 // User's explicit per-device override, or 'auto' (absent / unreadable).
 export function getBackendOverride(): BackendChoice {
     try {
+        // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
         const v = localStorage.getItem(OVERRIDE_KEY);
         if (v === 'webgpu' || v === 'wasm' || v === 'auto') return v;
     } catch { /* localStorage unavailable — treat as auto */ }
@@ -47,6 +50,7 @@ export function getBackendOverride(): BackendChoice {
 
 export function setBackendOverride(choice: BackendChoice): void {
     try {
+        // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
         localStorage.setItem(OVERRIDE_KEY, choice);
         // Re-opting into WebGPU clears any sticky demote: the user is
         // explicitly asking this device to try the GPU again, so honour it.
@@ -55,15 +59,18 @@ export function setBackendOverride(choice: BackendChoice): void {
 }
 
 export function isWebgpuDemoted(): boolean {
+    // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
     try { return localStorage.getItem(DEMOTED_KEY) === '1'; } catch { return false; }
 }
 export function clearWebgpuDemoted(): void {
+    // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
     try { localStorage.removeItem(DEMOTED_KEY); } catch { /* best-effort */ }
 }
 
 // Stamp the backend the model actually loaded on. Read at next boot by
 // maybeDemoteOnCrash to decide whether a crash implicates WebGPU.
 export function recordActiveBackend(device: string): void {
+    // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
     try { localStorage.setItem(ACTIVE_KEY, device === 'webgpu' ? 'webgpu' : 'wasm'); }
     catch { /* best-effort */ }
 }
@@ -104,7 +111,9 @@ export function maybeDemoteOnCrash(verdict: string): boolean {
     if (verdict !== 'crash-while-indexing-foreground') return false;
     if (!Platform.isMobile) return false;
     try {
+        // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
         if (localStorage.getItem(ACTIVE_KEY) !== 'webgpu') return false;
+        // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
         localStorage.setItem(DEMOTED_KEY, '1');
         return true;
     } catch { return false; }
@@ -153,6 +162,7 @@ export function residentInt8Enabled(rowCount: number, embDim: number): boolean {
 }
 
 export async function collectPlatformInfo(): Promise<PlatformEntry> {
+    // eslint-disable-next-line -- diagnostic UA capture for the platform report, not control-flow OS detection
     const ua = navigator.userAgent;
     const isMobile = isMobilePlatform();
 
@@ -163,7 +173,7 @@ export async function collectPlatformInfo(): Promise<PlatformEntry> {
     // path should branch on it (device selection keys off isMobilePlatform, not
     // this). A non-null WebGPU adapter (below) is a better "iOS ≥ 26" signal.
     let iosVersion: number | null = null;
-    const iosM = /OS (\d+)[_\.](\d+)/.exec(ua);
+    const iosM = /OS (\d+)[_.](\d+)/.exec(ua);
     if (iosM) iosVersion = parseFloat(`${iosM[1]}.${iosM[2]}`);
 
     // WebGPU probe — adapter creation is the right signal here; navigator.gpu

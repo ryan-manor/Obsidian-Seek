@@ -29,7 +29,7 @@
 // stoplist + depluralizer pipeline as queries (bm25.ts processTerm); the
 // feature is untested on non-English vaults by construction.
 
-import type { Chunk, ChunkMeta } from './chunker';
+import type { ChunkMeta } from './chunker';
 import { extractNoteName, processQueryTerm } from './bm25';
 import { seekTokenize } from './tokenize';
 

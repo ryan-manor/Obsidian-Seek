@@ -166,44 +166,36 @@ describe('demote gating — never blame WASM or a non-indexing crash', () => {
     });
 });
 
-// residentInt8Enabled keys off isMobilePlatform() (a navigator.userAgent regex),
-// NOT Platform.isMobile — so these pose as a device by stubbing the UA, not the
-// obsidian Platform object the tests above mutate.
-function setUA(mobile: boolean): void {
-    vi.stubGlobal('navigator', {
-        userAgent: mobile
-            ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15'
-            : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-    });
-}
-
+// residentInt8Enabled keys off isMobilePlatform(), which now reads
+// Platform.isMobile — so these pose as a device with setDevice(), exactly like
+// the resolveDevice tests above.
 describe('residentInt8Enabled — B2 resident-block memory gate', () => {
     it('mobile → always disabled, regardless of size', () => {
-        setUA(true);
+        setDevice('iphone');
         expect(residentInt8Enabled(10, 384)).toBe(false);
         expect(residentInt8Enabled(1, 8)).toBe(false);
     });
 
     it('desktop well under the byte budget → enabled', () => {
-        setUA(false);
+        setDevice('desktop');
         expect(residentInt8Enabled(1000, 384)).toBe(true); // 1000*392 ≈ 392 KB
     });
 
     it('desktop over the byte budget → disabled', () => {
-        setUA(false);
+        setDevice('desktop');
         const overBudget = Math.ceil(RESIDENT_INT8_MAX_BYTES / (384 + 8)) + 1;
         expect(residentInt8Enabled(overBudget, 384)).toBe(false);
     });
 
     it('budget tracks embDim: same row count flips with a larger model dim', () => {
-        setUA(false);
+        setDevice('desktop');
         const rows = 40000;
         expect(residentInt8Enabled(rows, 384)).toBe(true);  // 40000*392 = 15.68 MB ≤ 16 MB
         expect(residentInt8Enabled(rows, 512)).toBe(false); // 40000*520 = 20.8 MB > 16 MB
     });
 
     it('budget boundary is inclusive (≤, not <)', () => {
-        setUA(false);
+        setDevice('desktop');
         const embDim = 8;
         const rows = RESIDENT_INT8_MAX_BYTES / (embDim + 8); // 16 MB / 16 = 1048576, exact
         expect(Number.isInteger(rows)).toBe(true);

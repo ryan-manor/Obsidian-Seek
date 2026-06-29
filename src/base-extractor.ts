@@ -90,7 +90,7 @@ export function extractBaseDocs(raw: string, path: string): BaseView[] {
 
     let config: BasesConfigFile;
     try {
-        const parsed = parseYaml(raw);
+        const parsed: unknown = parseYaml(raw);
         config = parsed && typeof parsed === 'object' ? (parsed as BasesConfigFile) : {};
     } catch {
         config = {};

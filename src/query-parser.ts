@@ -140,11 +140,15 @@ function filterDate(
 const DEFAULT_DATE_FIELD = { key: 'created' as RecencyKeyChoice, createdProp: 'created' };
 
 // Bare-word negation: a `-` that STARTS a token (preceded by start-of-string or
-// whitespace) and is followed by a non-space run. The lookbehind keeps mid-word
-// hyphens inert ("covid-19", "well-known" never match), so only a leading dash
-// is an exclusion — matching Obsidian's `-term`. Operator-like negations
-// (`-#x`, `-[k:v]`, `-path:…`, `-tag:…`) are left as text in v1 (see header).
-const NEGATION_RE = /(?<=^|\s)-(\S+)/g;
+// whitespace) and is followed by a non-space run. The leading `(?:^|\s)` boundary
+// keeps mid-word hyphens inert ("covid-19", "well-known" never match), so only a
+// leading dash is an exclusion — matching Obsidian's `-term`. Operator-like
+// negations (`-#x`, `-[k:v]`, `-path:…`, `-tag:…`) are left as text in v1 (see
+// header). NON-capturing on the boundary (not a lookbehind): `(?<=…)` throws at
+// parse time on iOS WKWebView before 16.4 and would take the whole module down.
+// `(?:^|\s)` consumes one leading whitespace, which the callback replaces with a
+// single space anyway, so behaviour is identical and the term stays group 1.
+const NEGATION_RE = /(?:^|\s)-(\S+)/g;
 
 // Lucene/Elasticsearch `_english_` 33-word stoplist — kept in sync with
 // bm25.ts ENGLISH_STOPWORDS (duplicated, not imported, to keep this module

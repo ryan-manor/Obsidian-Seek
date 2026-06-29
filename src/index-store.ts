@@ -270,25 +270,25 @@ export interface MetaConfig {
 
 // Delete an IndexedDB database, resolving when it is gone. Extracted verbatim from
 // nukeDatabase so the VersionError-recovery branch in openDb can reuse the exact
-// same block-guard semantics. Bare setTimeout/clearTimeout (NOT window.*) so it also
-// runs under the node test env, which has no `window`.
+// same block-guard semantics. window.setTimeout/clearTimeout (popout-window safe);
+// the node test env gets `window` from the vitest setup shim (test-setup.ts).
 function deleteDbWithBlockGuard(dbName: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
         const req = indexedDB.deleteDatabase(dbName);
-        let blockedTimer: ReturnType<typeof setTimeout> | null = null;
+        let blockedTimer: number | null = null;
         req.onsuccess = () => {
-            if (blockedTimer != null) clearTimeout(blockedTimer);
+            if (blockedTimer != null) window.clearTimeout(blockedTimer);
             resolve();
         };
         req.onerror = () => {
-            if (blockedTimer != null) clearTimeout(blockedTimer);
-            reject(req.error);
+            if (blockedTimer != null) window.clearTimeout(blockedTimer);
+            reject(req.error ?? new Error(`deleteDatabase(${dbName}) failed`));
         };
         req.onblocked = () => {
             // Don't reject immediately — another tab/instance may close shortly.
             // Wait a generous interval, then fail with an actionable message.
             console.warn('[seek] deleteDatabase blocked — waiting up to 10 s for other connections to close');
-            blockedTimer = setTimeout(() => {
+            blockedTimer = window.setTimeout(() => {
                 reject(new Error(
                     `deleteDatabase blocked: another Obsidian window/tab is holding the ${dbName} ` +
                     'IndexedDB open. Close other Obsidian windows for this vault and retry.',
@@ -322,7 +322,7 @@ export function openDb(dbName: string, allowRecovery = true): Promise<IDBDatabas
                 );
                 return;
             }
-            reject(err);
+            reject(err ?? new Error(`indexedDB.open(${dbName}) failed`));
         };
         req.onsuccess = () => {
             const db = req.result;
@@ -337,7 +337,7 @@ export function openDb(dbName: string, allowRecovery = true): Promise<IDBDatabas
         };
         req.onupgradeneeded = (event) => {
             const db = req.result;
-            const oldVersion = (event as IDBVersionChangeEvent).oldVersion;
+            const oldVersion = event.oldVersion;
 
             // v1 -> v2: vector format changed (768d Q8 -> 512d Q4). Existing
             // chunks + embeddings + files records are incompatible with the
@@ -433,7 +433,7 @@ export function openDb(dbName: string, allowRecovery = true): Promise<IDBDatabas
 function awaitTx(tx: IDBTransaction): Promise<void> {
     return new Promise((resolve, reject) => {
         tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
+        tx.onerror = () => reject(tx.error ?? new Error('transaction failed'));
         tx.onabort = () => reject(tx.error ?? new Error('transaction aborted'));
     });
 }
@@ -441,7 +441,7 @@ function awaitTx(tx: IDBTransaction): Promise<void> {
 function awaitRequest<T>(req: IDBRequest<T>): Promise<T> {
     return new Promise((resolve, reject) => {
         req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+        req.onerror = () => reject(req.error ?? new Error('IndexedDB request failed'));
     });
 }
 
@@ -477,7 +477,7 @@ function collectByKeyJump<T>(
             }
             c.continue(sorted[i]);   // jump straight to the next wanted key
         };
-        cursor.onerror = () => reject(cursor.error);
+        cursor.onerror = () => reject(cursor.error ?? new Error('cursor read failed'));
     });
 }
 
@@ -541,8 +541,8 @@ export class IndexStore {
         const db = this.requireDb();
         const tx = db.transaction(STORE_META, 'readonly');
         const store = tx.objectStore(STORE_META);
-        const existing = await awaitRequest(store.get(META_KEY));
-        if (existing) return existing as MetaConfig;
+        const existing = await awaitRequest(store.get(META_KEY)) as MetaConfig | undefined;
+        if (existing) return existing;
         return { embeddingDim: ACTIVE_MODEL_SPEC.dim, lastIndexedAt: null, schemaVersion: DB_VERSION };
     }
 
@@ -568,8 +568,8 @@ export class IndexStore {
     async getBm25(): Promise<Bm25Record | null> {
         const db = this.requireDb();
         const tx = db.transaction(STORE_BM25, 'readonly');
-        const rec = await awaitRequest(tx.objectStore(STORE_BM25).get(BM25_KEY));
-        return rec ? (rec as Bm25Record) : null;
+        const rec = await awaitRequest(tx.objectStore(STORE_BM25).get(BM25_KEY)) as Bm25Record | undefined;
+        return rec ?? null;
     }
 
     // Bulk write: one transaction per call (matches design-doc guidance —
@@ -764,7 +764,7 @@ export class IndexStore {
                 packed.push(c.value as Uint8Array);
                 c.continue();
             };
-            cursor.onerror = () => reject(cursor.error);
+            cursor.onerror = () => reject(cursor.error ?? new Error('cursor read failed'));
         });
         return { ids, packed };
     }
@@ -791,7 +791,7 @@ export class IndexStore {
                 vecs.push(c.value as QuantVec);
                 c.continue();
             };
-            cursor.onerror = () => reject(cursor.error);
+            cursor.onerror = () => reject(cursor.error ?? new Error('cursor read failed'));
         });
         return { ids, vecs };
     }
@@ -833,7 +833,7 @@ export class IndexStore {
                     bytes += sizeOfRow(p.rule, c.value);
                     c.continue();
                 };
-                cursor.onerror = () => reject(cursor.error);
+                cursor.onerror = () => reject(cursor.error ?? new Error('cursor read failed'));
             });
             stores.push({ store: p.store, label: p.label, rows, bytes });
             logicalBytes += bytes;
@@ -887,7 +887,7 @@ export class IndexStore {
                     records.push({ key: c.primaryKey, value: c.value });
                     c.continue();
                 };
-                cursor.onerror = () => reject(cursor.error);
+                cursor.onerror = () => reject(cursor.error ?? new Error('cursor read failed'));
             });
             snapshot.push({ store: spec.store, inlineKey: spec.inlineKey, records });
         }
@@ -1061,7 +1061,7 @@ export class IndexStore {
                 });
                 c.continue();
             };
-            cursor.onerror = () => reject(cursor.error);
+            cursor.onerror = () => reject(cursor.error ?? new Error('cursor read failed'));
         });
 
         // Phase 2: chunked writeback. Each batch is one transaction so a mid-

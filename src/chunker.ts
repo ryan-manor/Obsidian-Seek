@@ -432,7 +432,7 @@ function parseFrontmatter(yaml: string): Record<string, unknown> {
     let i = 0;
     while (i < lines.length) {
         const line = lines[i];
-        const m = /^([A-Za-z0-9_\-]+):\s*(.*)$/.exec(line);
+        const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
         if (!m) { i++; continue; }
         const key = m[1];
         const valueStr = m[2].trim();

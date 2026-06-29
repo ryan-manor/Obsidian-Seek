@@ -29,6 +29,14 @@ const WORKER_SRC: string =
 // hangs, in which case we fall back synchronously for that query.
 const WORKER_TIMEOUT_MS = 1000;
 
+// Worker → main reply (see binary-worker.ts): 'result' carries indices, 'stale'
+// carries only the queryId. Structured clone hands us `any`, so we narrow.
+interface WorkerReply {
+    type?: string;
+    queryId?: number;
+    indices?: number[];
+}
+
 export class BinaryScorerWorker {
     private worker: Worker | null = null;
     private dead = false;
@@ -50,10 +58,10 @@ export class BinaryScorerWorker {
             const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'application/javascript' }));
             this.worker = new Worker(url);
             URL.revokeObjectURL(url);
-            this.worker.onmessage = (e: MessageEvent) => this.onMessage(e.data);
+            this.worker.onmessage = (e: MessageEvent) => this.onMessage(e.data as WorkerReply);
             this.worker.onerror = () => this.kill();
             this.worker.onmessageerror = () => this.kill();
-        } catch (e) {
+        } catch {
             // e.g. renderer CSP blocking blob: workers → synchronous fallback.
             this.kill();
         }
@@ -61,7 +69,7 @@ export class BinaryScorerWorker {
 
     get enabled(): boolean { return !this.dead && !!this.worker; }
 
-    private onMessage(msg: { type?: string; queryId?: number; indices?: number[] }): void {
+    private onMessage(msg: WorkerReply): void {
         if (!msg || typeof msg.queryId !== 'number') return;
         const resolve = this.pending.get(msg.queryId);
         if (!resolve) return;
@@ -99,7 +107,7 @@ export class BinaryScorerWorker {
             const maskU8 = mask ? Uint8Array.from(mask, b => (b ? 1 : 0)) : null;
             const p = new Promise<number[] | null>(resolve => {
                 this.pending.set(queryId, resolve);
-                setTimeout(() => {
+                window.setTimeout(() => {
                     if (this.pending.delete(queryId)) resolve(null);
                 }, WORKER_TIMEOUT_MS);
             });

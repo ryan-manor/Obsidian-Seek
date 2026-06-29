@@ -39,7 +39,7 @@ import MiniSearch, { type Options } from 'minisearch';
 declare const __SEEK_ANALYZER_VERSION__: string;
 export const ANALYZER_VERSION: string =
     typeof __SEEK_ANALYZER_VERSION__ !== 'undefined' ? __SEEK_ANALYZER_VERSION__ : 'dev';
-import type { Chunk, ChunkMeta } from './chunker';
+import type { ChunkMeta } from './chunker';
 import { seekTokenize, hasCjk } from './tokenize';
 import { toDisplayForm } from './prop-normalize';
 

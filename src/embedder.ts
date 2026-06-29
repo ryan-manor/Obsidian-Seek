@@ -57,10 +57,12 @@ function warmupFingerprint(modelId: string, dtype: Dtype, revision: string | nul
 // Wrapped because private-browsing modes and CSP can disable it; the failure
 // mode is "warmup runs every time" which is exactly today's behavior.
 function readWarmupFingerprint(): string | null {
+    // eslint-disable-next-line -- per-device warmup cache; raw per-origin localStorage by design (see above)
     try { return localStorage.getItem(WARMUP_FP_KEY); }
     catch { return null; }
 }
 function writeWarmupFingerprint(fp: string): void {
+    // eslint-disable-next-line -- per-device warmup cache; raw per-origin localStorage by design (see above)
     try { localStorage.setItem(WARMUP_FP_KEY, fp); }
     catch { /* swallow — storage unavailable; skip-cache is best-effort */ }
 }
@@ -391,7 +393,7 @@ export class LocalEmbedder {
         const r = await this.runner.embed(text);
         this.queryEmbedCache.set(text, r.vector);
         if (this.queryEmbedCache.size > LocalEmbedder.QUERY_EMBED_CACHE_MAX) {
-            this.queryEmbedCache.delete(this.queryEmbedCache.keys().next().value!);  // evict LRU head
+            this.queryEmbedCache.delete(this.queryEmbedCache.keys().next().value as string);  // evict LRU head
         }
         return { vector: r.vector, iframeLatencyMs: r.latencyMs, cacheHit: false };
     }

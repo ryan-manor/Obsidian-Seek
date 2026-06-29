@@ -36,7 +36,7 @@ const IDLE_TIMEOUT_MS = 1000;
 // behind a minimal structural type rather than widening to `any`.
 type YieldScheduler = { yield: () => Promise<void> };
 function schedulerYield(): Promise<void> | null {
-    const s = (globalThis as { scheduler?: Partial<YieldScheduler> }).scheduler;
+    const s = (activeWindow as { scheduler?: Partial<YieldScheduler> }).scheduler;
     return typeof s?.yield === 'function' ? s.yield() : null;
 }
 
@@ -68,6 +68,6 @@ export class CompositorPacer {
         }
         const yielded = schedulerYield();
         if (yielded) return yielded.then(() => null);
-        return new Promise<IdleDeadline | null>(resolve => setTimeout(() => resolve(null), 0));
+        return new Promise<IdleDeadline | null>(resolve => window.setTimeout(() => resolve(null), 0));
     }
 }

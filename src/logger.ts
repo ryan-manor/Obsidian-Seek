@@ -31,10 +31,8 @@
 
 import type { App } from 'obsidian';
 import type {
-    LogEntry, LogMeta, InitEntry, PlatformEntry, LoadEntry,
-    IndexCompleteEntry, IndexProgressEntry, SearchEntry, ResetEntry, ErrorEntry,
-    LongTaskEntry, MemoryPressureEntry, StorageSnapshotEntry, DistributionStats,
-    ClickEntry, EvictionSuspectedEntry, AppLocalFetchEntry, EmbedProfileEntry,
+    LogEntry, LogMeta, InitEntry, PlatformEntry,
+    IndexCompleteEntry, SearchEntry, ErrorEntry,
     CrashDetectedEntry,
 } from './types';
 import { LOG_SCHEMA_VERSION } from './types';
@@ -130,11 +128,17 @@ function randId(): string {
 // The platform prefix makes log filenames + report attribution human-readable
 // at a glance ("which file is the phone?") without parsing a UA.
 function resolveDeviceId(): string {
+    // deviceId is a per-DEVICE (cross-vault) identifier, so raw per-origin
+    // localStorage is the CORRECT scope. App#saveLocalStorage would vault-scope it
+    // (one physical device → a different id per vault) and churn the per-device
+    // sidecar filenames keyed off it, so it is deliberately NOT migrated.
     try {
+        // eslint-disable-next-line -- intentional per-device, cross-vault id (see above)
         const existing = localStorage.getItem(DEVICE_ID_KEY);
         if (existing) return existing;
     } catch { /* localStorage unavailable — fall through to ephemeral id */ }
     const id = `${isMobilePlatform() ? 'mobile' : 'desktop'}-${randId().replace(/-/g, '').slice(0, 8)}`;
+    // eslint-disable-next-line -- intentional per-device, cross-vault id (see above)
     try { localStorage.setItem(DEVICE_ID_KEY, id); } catch { /* best-effort */ }
     return id;
 }
@@ -237,7 +241,6 @@ export class SeekLogger {
         const message = e instanceof Error ? e.message : String(e);
         const stack = e instanceof Error ? (e.stack ?? null) : null;
         const ts = new Date().toISOString();
-        const now = Date.now();
         // Console always fires — live dev visibility is never throttled; only the on-disk
         // NDJSON is deduped.
         console.error(`[seek] error in "${context}":`, e);
@@ -250,7 +253,7 @@ export class SeekLogger {
         const agg = this.errAgg.get(key);
         if (!agg) {
             if (this.errAgg.size >= ERROR_KEYS_MAX) {
-                const oldest = this.errAgg.keys().next().value;   // evict oldest (insertion order)
+                const oldest: string | undefined = this.errAgg.keys().next().value;   // evict oldest (insertion order)
                 if (oldest !== undefined) this.errAgg.delete(oldest);
             }
             this.errAgg.set(key, { count: 1, lastWritten: 1, firstTs: ts, lastTs: ts, lastContext: context });
@@ -583,19 +586,4 @@ function filterByType<T extends LogEntry>(entries: LogEntry[], type: T['type']):
     return entries.filter((e): e is T => e.type === type);
 }
 
-function fmtTs(iso: string): string { return iso.replace('T', ' ').slice(0, 19); }
 function fmtMB(v: number | null): string { return v == null ? 'unknown' : `${v.toFixed(0)} MB`; }
-function fmtBytes(v: number | null): string {
-    if (v == null) return '—';
-    if (v >= 1024 * 1024 * 1024) return `${(v / (1024 ** 3)).toFixed(1)} GB`;
-    if (v >= 1024 * 1024) return `${(v / (1024 ** 2)).toFixed(0)} MB`;
-    return `${v}`;
-}
-function distRow(d: DistributionStats): string {
-    return `${d.n} | ${d.min.toFixed(1)} | ${d.p50.toFixed(1)} | ${d.mean.toFixed(1)} | ${d.p95.toFixed(1)} | ${d.max.toFixed(1)}`;
-}
-function pctCacheHit(searches: SearchEntry[]): string {
-    if (searches.length === 0) return '—';
-    const hits = searches.filter(s => s.bm25CacheHit).length;
-    return ((hits / searches.length) * 100).toFixed(0);
-}

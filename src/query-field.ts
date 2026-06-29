@@ -101,10 +101,10 @@ function datePresets(): Array<{ value: string; label: string }> {
 }
 
 function caretToEnd(el: HTMLElement): void {
-    const r = document.createRange();
+    const r = activeDocument.createRange();
     r.selectNodeContents(el);
     r.collapse(false);
-    const s = window.getSelection();
+    const s = activeWindow.getSelection();
     if (!s) return;
     s.removeAllRanges();
     s.addRange(r);
@@ -115,10 +115,10 @@ function caretToEnd(el: HTMLElement): void {
 // from the left edge, so the natural landing spot is before the first typed
 // character, not at the end (where caretToEnd would wrongly jump if text exists).
 function caretToStart(el: HTMLElement): void {
-    const r = document.createRange();
+    const r = activeDocument.createRange();
     r.selectNodeContents(el);
     r.collapse(true);
-    const s = window.getSelection();
+    const s = activeWindow.getSelection();
     if (!s) return;
     s.removeAllRanges();
     s.addRange(r);
@@ -134,7 +134,7 @@ function isModifierKey(key: string): boolean {
 // True when the caret is collapsed at offset 0 of the editable (nothing typed
 // before it) — the condition under which Backspace deletes the last pill.
 function caretAtStart(el: HTMLElement): boolean {
-    const s = window.getSelection();
+    const s = activeWindow.getSelection();
     if (!s || !s.rangeCount) return false;
     const r = s.getRangeAt(0);
     if (!r.collapsed) return false;
@@ -522,7 +522,7 @@ export class PillQueryField {
         // alone — including mid-IME composition, whose buffer is never empty.
         if (this.editEl.firstChild && this.readText().trim() === '') {
             this.editEl.textContent = '';
-            if (document.activeElement === this.editEl) caretToEnd(this.editEl);
+            if (activeDocument.activeElement === this.editEl) caretToEnd(this.editEl);
         }
         const text = this.readText();
         const d = this.derive(text);
@@ -657,7 +657,7 @@ export class PillQueryField {
         // Guard against an upstream blur having dropped focus, so subsequent
         // keystrokes still reach onKeyDown. Only re-focus if needed — a redundant
         // focus() could nudge the caret.
-        if (document.activeElement !== this.editEl) this.editEl.focus();
+        if (activeDocument.activeElement !== this.editEl) this.editEl.focus();
     }
 
     // Drop the pill highlight and return to plain text-editing state. The caret

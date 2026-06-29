@@ -509,7 +509,7 @@ export class SeekSearchModal extends Modal {
             this.renderEmpty();
             return;
         }
-        const run = () => this.runSearch(query.trim());
+        const run = () => { void this.runSearch(query.trim()); };
         if (immediate) run();
         else this.timer = window.setTimeout(run, DEBOUNCE_MS);
     }
@@ -860,7 +860,7 @@ export class SeekSearchModal extends Modal {
         };
         el.addEventListener('click', e => {
             if ((e.target as HTMLElement).closest('a')) return;
-            this.openResult(row.data, this.rows.indexOf(row) + 1, e.metaKey || e.ctrlKey);
+            void this.openResult(row.data, this.rows.indexOf(row) + 1, e.metaKey || e.ctrlKey);
         });
         el.addEventListener('mousemove', () => {
             const idx = this.rows.indexOf(row);
@@ -1008,7 +1008,7 @@ export class SeekSearchModal extends Modal {
 
     private openSelected(newTab: boolean): void {
         const r = this.currentResults[this.selectedIndex];
-        if (r) this.openResult(r, this.selectedIndex + 1, newTab);
+        if (r) void this.openResult(r, this.selectedIndex + 1, newTab);
     }
 
     private async openResult(r: ScoredChunk, rank: number, newTab: boolean): Promise<void> {
