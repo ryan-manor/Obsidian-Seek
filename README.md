@@ -1,6 +1,14 @@
 # Seek
 
-Seek is an Obsidian native hybrid search for Obsidian vaults, built to find buried information in large and complex vaults. It combines dense semantic embeddings with lexical (BM25) search and ranks the fused results, all running within Obsidian. No APIs, or local servers needed. 
+Seek is an Obsidian native hybrid search for Obsidian vaults, built to find buried information in large and complex vaults. It combines dense semantic embeddings with lexical (keyword) search to find exactly what you're looking for, all running within Obsidian. No APIs, or local servers needed. 
+
+## Features
+- Support for 52 languages (plus code)
+- Inline filtering with autosuggestions
+- Blazing fast even on vaults with tens of thousands of notes
+- Support for mobile with a cross device, synced index
+- Highly tuned and evaluated for relevance on Obsidian vaults 
+
 
 Documentation for seek can be found [here](https://publish.obsidian.md/rmm/Seek+Documentation/About+Seek).
 
