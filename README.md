@@ -7,8 +7,7 @@ Seek is an Obsidian native hybrid search for Obsidian vaults, built to find buri
 
 Relevance has been tested and evaluated on hundreds of thousands of queries and notes, and offers easy customization to best suit your vault.
 
-<img width="735" height="595" alt="Screenshot 2026-06-30 at 09 25 33" src="https://github.com/user-attachments/assets/db538c74-6a07-433a-9fd7-b7c6a598f7f3" />
-
+<img width="735" height="595" alt="Screenshot 2026-06-30 at 09 25 33" src="https://github.com/user-attachments/assets/ab5bf543-8d57-4f79-b912-bede11bac059" />
 
 
 
