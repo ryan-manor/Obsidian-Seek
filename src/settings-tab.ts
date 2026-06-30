@@ -224,14 +224,12 @@ export class SeekSettingTab extends PluginSettingTab {
         // the default config folder so every device resolves the SAME synced path
         // (see main.ts sidecarConfigDir). Showing vault.configDir would misreport
         // the index location to a renamed-config user, whose index still lives here.
-        // eslint-disable-next-line -- intentional literal; pinned synced sidecar path, see above
         locHidden.createSpan({ text: `inside the hidden .obsidian config folder.` });
         const locRoot = locList.createEl('li');
         locRoot.createEl('strong', { text: 'Vault root: ' });
         locRoot.createSpan({ text: 'a visible "Seek Index" folder will appear in your vault. Choose this only if you use Obsidian Sync with a mobile or tablet override config folder.' });
         indexLoc.descEl.createDiv({ text: 'Takes effect after reloading Seek.' });
         indexLoc.addDropdown(dd => dd
-            // eslint-disable-next-line -- intentional literal; pinned synced sidecar path (see above)
             .addOption('config', `Hidden (.obsidian, recommended)`)
             .addOption('visible', 'Vault root (Seek Index/)')
             .setValue(this.s.sidecarIndexLocation)

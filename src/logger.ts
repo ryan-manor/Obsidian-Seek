@@ -133,13 +133,11 @@ function resolveDeviceId(): string {
     // (one physical device → a different id per vault) and churn the per-device
     // sidecar filenames keyed off it, so it is deliberately NOT migrated.
     try {
-        // eslint-disable-next-line -- intentional per-device, cross-vault id (see above)
-        const existing = localStorage.getItem(DEVICE_ID_KEY);
+        const existing = window.localStorage.getItem(DEVICE_ID_KEY);
         if (existing) return existing;
     } catch { /* localStorage unavailable — fall through to ephemeral id */ }
     const id = `${isMobilePlatform() ? 'mobile' : 'desktop'}-${randId().replace(/-/g, '').slice(0, 8)}`;
-    // eslint-disable-next-line -- intentional per-device, cross-vault id (see above)
-    try { localStorage.setItem(DEVICE_ID_KEY, id); } catch { /* best-effort */ }
+    try { window.localStorage.setItem(DEVICE_ID_KEY, id); } catch { /* best-effort */ }
     return id;
 }
 
@@ -253,7 +251,7 @@ export class SeekLogger {
         const agg = this.errAgg.get(key);
         if (!agg) {
             if (this.errAgg.size >= ERROR_KEYS_MAX) {
-                const oldest: string | undefined = this.errAgg.keys().next().value;   // evict oldest (insertion order)
+                const oldest = [...this.errAgg.keys()][0];   // evict oldest (insertion order)
                 if (oldest !== undefined) this.errAgg.delete(oldest);
             }
             this.errAgg.set(key, { count: 1, lastWritten: 1, firstTs: ts, lastTs: ts, lastContext: context });

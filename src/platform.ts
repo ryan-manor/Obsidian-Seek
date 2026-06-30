@@ -33,16 +33,16 @@ const OVERRIDE_KEY = 'seek-backend-override';  // BackendChoice; absent/invalid 
 const DEMOTED_KEY = 'seek-webgpu-demoted';     // '1' once a mobile WebGPU reindex was OS-killed
 const ACTIVE_KEY = 'seek-active-backend';      // 'webgpu' | 'wasm' — backend the last load resolved to
 
-// NOTE: every localStorage access below is raw (per-origin) BY DESIGN — these are
-// per-device, never-synced backend keys (see the section comment above). Obsidian's
-// App#saveLocalStorage would vault-scope them, which is exactly the shared-file trap
-// this design avoids, so the obsidianmd localStorage rule is suppressed per-line.
+// Every localStorage access below is raw per-origin (`window.localStorage`) BY
+// DESIGN — these are per-device, never-synced backend keys (see the section
+// comment above). We deliberately do NOT use Obsidian's `App#saveLocalStorage`,
+// which vault-scopes the value; that is exactly the shared-file trap this design
+// avoids.
 
 // User's explicit per-device override, or 'auto' (absent / unreadable).
 export function getBackendOverride(): BackendChoice {
     try {
-        // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
-        const v = localStorage.getItem(OVERRIDE_KEY);
+        const v = window.localStorage.getItem(OVERRIDE_KEY);
         if (v === 'webgpu' || v === 'wasm' || v === 'auto') return v;
     } catch { /* localStorage unavailable — treat as auto */ }
     return 'auto';
@@ -50,8 +50,7 @@ export function getBackendOverride(): BackendChoice {
 
 export function setBackendOverride(choice: BackendChoice): void {
     try {
-        // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
-        localStorage.setItem(OVERRIDE_KEY, choice);
+        window.localStorage.setItem(OVERRIDE_KEY, choice);
         // Re-opting into WebGPU clears any sticky demote: the user is
         // explicitly asking this device to try the GPU again, so honour it.
         if (choice === 'webgpu') clearWebgpuDemoted();
@@ -59,19 +58,16 @@ export function setBackendOverride(choice: BackendChoice): void {
 }
 
 export function isWebgpuDemoted(): boolean {
-    // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
-    try { return localStorage.getItem(DEMOTED_KEY) === '1'; } catch { return false; }
+    try { return window.localStorage.getItem(DEMOTED_KEY) === '1'; } catch { return false; }
 }
 export function clearWebgpuDemoted(): void {
-    // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
-    try { localStorage.removeItem(DEMOTED_KEY); } catch { /* best-effort */ }
+    try { window.localStorage.removeItem(DEMOTED_KEY); } catch { /* best-effort */ }
 }
 
 // Stamp the backend the model actually loaded on. Read at next boot by
 // maybeDemoteOnCrash to decide whether a crash implicates WebGPU.
 export function recordActiveBackend(device: string): void {
-    // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
-    try { localStorage.setItem(ACTIVE_KEY, device === 'webgpu' ? 'webgpu' : 'wasm'); }
+    try { window.localStorage.setItem(ACTIVE_KEY, device === 'webgpu' ? 'webgpu' : 'wasm'); }
     catch { /* best-effort */ }
 }
 
@@ -111,10 +107,8 @@ export function maybeDemoteOnCrash(verdict: string): boolean {
     if (verdict !== 'crash-while-indexing-foreground') return false;
     if (!Platform.isMobile) return false;
     try {
-        // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
-        if (localStorage.getItem(ACTIVE_KEY) !== 'webgpu') return false;
-        // eslint-disable-next-line -- intentional per-device, never-synced storage (see note above)
-        localStorage.setItem(DEMOTED_KEY, '1');
+        if (window.localStorage.getItem(ACTIVE_KEY) !== 'webgpu') return false;
+        window.localStorage.setItem(DEMOTED_KEY, '1');
         return true;
     } catch { return false; }
 }
@@ -162,8 +156,8 @@ export function residentInt8Enabled(rowCount: number, embDim: number): boolean {
 }
 
 export async function collectPlatformInfo(): Promise<PlatformEntry> {
-    // eslint-disable-next-line -- diagnostic UA capture for the platform report, not control-flow OS detection
-    const ua = navigator.userAgent;
+    const nav = window.navigator;
+    const ua = nav.userAgent;
     const isMobile = isMobilePlatform();
 
     // iOS version: best-effort parse of "OS X_Y_Z" from the UA. CAVEAT: WKWebView

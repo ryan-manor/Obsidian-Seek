@@ -424,8 +424,8 @@ export class MarkdownChunker {
 
 // ---- frontmatter helpers ----
 
-// Intentionally minimal: we only need a handful of fields, and pulling in
-// js-yaml would balloon the bundle by ~50 KB.
+// Intentionally minimal: we only need a handful of fields, and bundling a full
+// YAML parser would balloon the bundle by ~50 KB.
 function parseFrontmatter(yaml: string): Record<string, unknown> {
     const result: Record<string, unknown> = {};
     const lines = yaml.split('\n');

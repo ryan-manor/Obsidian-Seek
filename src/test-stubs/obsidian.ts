@@ -35,11 +35,12 @@ export class Notice {
 }
 export function setIcon(_el: HTMLElement, _iconId: string): void {}
 
-// Obsidian's real `parseYaml` is a thin wrapper over js-yaml's `load`, so the
-// dev-only js-yaml dependency is a faithful runtime stand-in for tests (base-
+// Obsidian's real `parseYaml` is a thin wrapper over a YAML parser, so the
+// dev-only `yaml` dependency is a faithful runtime stand-in for tests (base-
 // extractor.ts is the only consumer). The real build uses Obsidian's export at
-// zero bundle cost; js-yaml never ships.
-import { load as loadYaml } from 'js-yaml';
+// zero bundle cost; `yaml` never ships. (`yaml.parse` returns `any`, so the
+// result is widened to `unknown` to match Obsidian's typed signature.)
+import { parse as parseYamlImpl } from 'yaml';
 export function parseYaml(yaml: string): unknown {
-    return loadYaml(yaml);
+    return parseYamlImpl(yaml) as unknown;
 }

@@ -90,15 +90,13 @@ export class Forensics {
     bootInspect(): CrashDetectedEntry | null {
         let prior: ForensicRecord | null = null;
         try {
-            // eslint-disable-next-line -- per-device crash-forensics record; raw per-origin localStorage by design
-            const raw = localStorage.getItem(this.key);
+            const raw = window.localStorage.getItem(this.key);
             if (raw) prior = JSON.parse(raw) as ForensicRecord;
         } catch {
             // Corrupt record: clear it so forensics recovers next session
             // instead of being dead forever; only an unwritable localStorage
             // disables the layer.
-            // eslint-disable-next-line -- per-device crash-forensics record (see above)
-            try { localStorage.removeItem(this.key); } catch { this.usable = false; }
+            try { window.localStorage.removeItem(this.key); } catch { this.usable = false; }
         }
         this.beat('session-start');
         if (!prior || prior.cleanEnd) return null;
@@ -144,8 +142,7 @@ export class Forensics {
     private persist(): void {
         if (!this.usable) return;
         try {
-            // eslint-disable-next-line -- per-device crash-forensics record; raw per-origin localStorage by design
-            localStorage.setItem(this.key, JSON.stringify(this.record));
+            window.localStorage.setItem(this.key, JSON.stringify(this.record));
         } catch {
             this.usable = false;
         }

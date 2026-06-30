@@ -731,15 +731,20 @@
     line-height: 1.4;
     color: var(--text-normal);
     border: 1px solid var(--text-warning);
-    background: rgba(224, 160, 48, 0.12);                        /* fallback for older WebKit */
-    background: color-mix(in srgb, var(--text-warning) 12%, transparent);
+    background: rgba(224, 160, 48, 0.12);                        /* older-WebKit fallback; upgraded to color-mix below */
 }
 /* Calm variant for the "syncing from another device" state: reassuring (accent), not the
    warning amber. This banner carries no button — it heals itself, nothing for the user to do. */
 .seek-index-banner.is-info {
     border-color: var(--text-accent);
-    background: rgba(82, 139, 255, 0.10);                       /* fallback for older WebKit */
-    background: color-mix(in srgb, var(--text-accent) 10%, transparent);
+    background: rgba(82, 139, 255, 0.10);                       /* older-WebKit fallback */
+}
+/* color-mix upgrade (WebKit 16.2+, Chromium 111+). Older WebKit — the iOS < 16.4 devices this
+   release also targets — keeps the rgba fallbacks above. Split into @supports so each rule
+   declares `background` once (no duplicate-property) while preserving the progressive fallback. */
+@supports (background: color-mix(in srgb, red 50%, transparent)) {
+    .seek-index-banner { background: color-mix(in srgb, var(--text-warning) 12%, transparent); }
+    .seek-index-banner.is-info { background: color-mix(in srgb, var(--text-accent) 10%, transparent); }
 }
 .seek-index-banner-msg { flex: 1 1 auto; overflow-wrap: anywhere; }
 .seek-index-banner-btn {

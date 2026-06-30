@@ -11,7 +11,7 @@ export default defineConfig({
     // popout-window-safe `window.setTimeout`/`activeWindow` calls resolve under
     // test (see test-stubs/test-setup.ts). Patchable by vi.useFakeTimers().
     test: {
-        setupFiles: [fileURLToPath(new URL('./src/test-stubs/test-setup.ts', import.meta.url))],
+        setupFiles: [fileURLToPath(new URL('./src/test-stubs/test-setup.mts', import.meta.url))],
     },
     resolve: {
         alias: {

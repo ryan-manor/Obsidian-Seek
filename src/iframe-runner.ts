@@ -307,13 +307,13 @@ export class IframeRunner {
             };
             window.addEventListener('message', this.listener);
 
-            // Anchor the hidden compute iframe to the MAIN window's document, NOT
-            // activeDocument: it is display:none (no popout-render benefit), must
-            // outlive any popout (anchoring it to the window focused at first embed
-            // would orphan it when that popout closes), and its contentWindow
-            // postMessage must reach the `window` message listener bound above.
-            // eslint-disable-next-line -- stable main-window anchor for a long-lived hidden compute iframe (see above)
-            this.iframe = document.createElement('iframe');
+            // Anchor the hidden compute iframe to `window.document` (the main
+            // window's document), NOT activeDocument: it is display:none (no
+            // popout-render benefit), must outlive any popout (anchoring it to the
+            // window focused at first embed would orphan it when that popout
+            // closes), and its contentWindow postMessage must reach the `window`
+            // message listener bound above.
+            this.iframe = window.document.createElement('iframe');
             this.iframe.id = IFRAME_ID;
             this.iframe.addClass('seek-hidden');
             // LOAD-BEARING: no `sandbox` attribute. A srcdoc iframe with no sandbox
@@ -326,8 +326,7 @@ export class IframeRunner {
             // a `sandbox` attribute would give the iframe an opaque `null` origin
             // and break BOTH on iOS. Do not add one without first moving the model
             // fetch out of the iframe (e.g. parent requestUrl → resource URL).
-            // eslint-disable-next-line -- stable main-window anchor (see iframe creation above)
-            document.body.appendChild(this.iframe);
+            window.document.body.appendChild(this.iframe);
 
             const childScript = buildChildScript(CDN_URL, ACTIVE_MODEL_SPEC.dim);
             this.iframe.srcdoc =

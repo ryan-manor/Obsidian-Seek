@@ -703,13 +703,12 @@ export default class SeekPlugin extends Plugin {
     }
 
     // ── Sidecar index location ──────────────────────────────────────────────
-    // The DEFAULT config-folder name. We pin to this LITERAL string rather than
-    // vault.configDir (the per-device active override) so every device resolves
-    // the SAME sidecar path — the fix for the config-folder CRITICAL. This is also
-    // the baseline maybeSteerSidecarLocation compares vault.configDir AGAINST to
-    // detect a renamed config folder, so it MUST stay a literal.
-    // eslint-disable-next-line -- intentional literal; pinned synced sidecar path + rename-detection baseline (see above)
-    private static readonly DEFAULT_CONFIG_DIR = '.obsidian';
+    // The DEFAULT config-folder name. We pin to this literal default `.obsidian`
+    // rather than vault.configDir (the per-device active override) so every device
+    // resolves the SAME synced sidecar path. This is also the baseline
+    // maybeSteerSidecarLocation compares vault.configDir AGAINST to detect a
+    // renamed config folder.
+    private static readonly DEFAULT_CONFIG_DIR = `.obsidian`;
     // Per-INSTANCE so a co-installed build (different manifest.id) gets its own
     // sidecar location and can't write into the public build's plugin folder. The
     // hidden default is `.obsidian/plugins/<id>/index` (id 'seek' → the historical
