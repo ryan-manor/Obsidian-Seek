@@ -1,6 +1,15 @@
 # Seek
 
+<img width="1402" height="1165" alt="Screenshot 2026-06-29 at 14 33 54" src="https://github.com/user-attachments/assets/de8d157b-9246-401c-aadc-3fd3757da3a4" />
+
 Seek is an Obsidian native hybrid search for Obsidian vaults, built to find buried information in large and complex vaults. It combines dense semantic embeddings with lexical (keyword) search to find exactly what you're looking for, all running within Obsidian. No APIs, or local servers needed. 
+
+It has been highly optimized for running in large vaults.
+<img width="1402" height="1165" alt="Screenshot 2026-06-29 at 14 35 52" src="https://github.com/user-attachments/assets/ac42da75-aa3c-4769-b324-858c346137de" />
+
+Relevance has been tested and evaluated on hundreds of thousands of queries and notes, and offers easy customization to best suit your needs and vault 
+<img width="1358" height="1121" alt="Screenshot 2026-06-29 at 14 36 20" src="https://github.com/user-attachments/assets/f48634d6-2b9e-4422-b116-f5879b9c2251" />
+
 
 ## Features
 - Support for 52 languages (plus code)
