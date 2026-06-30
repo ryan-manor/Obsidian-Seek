@@ -15,7 +15,7 @@ Relevance has been tested and evaluated on hundreds of thousands of queries and 
 - Highly tuned and evaluated for relevance on any size of Obsidian vault, even up to tens of thousands of notes. 
 
 
-The user guide for seek can be found [here](https://publish.obsidian.md/rmm/Seek+Documentation/About+Seek), and more information about Seek's relevance tuning and evaluation is [here](https://publish.obsidian.md/rmm/Seek+Documentation/Seek+Evaluation+%26+Development)
+The user guide for seek can be found [here](https://publish.obsidian.md/rmm/Seek+Documentation/About+Seek), and more information about Seek's relevance tuning and evaluation is [here](https://publish.obsidian.md/rmm/Seek+Documentation/Seek+Evaluation+%26+Development).
 
 ## Installation
 
