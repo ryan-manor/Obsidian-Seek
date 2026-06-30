@@ -15,6 +15,11 @@ on:
 
 permissions:
   contents: write
+  # Provenance attestation: id-token mints the OIDC token Sigstore signs the
+  # build with; attestations lets the run record it against the repo. Users can
+  # then `gh attestation verify main.js --repo ryan-manor/Obsidian-Seek`.
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -29,6 +34,15 @@ jobs:
         run: |
           npm ci
           npm run build
+      # Attest the assets actually built in THIS run, so the provenance binds to
+      # the published bytes. Requires the release to ship the CI build (push the
+      # tag, let this draft, then publish it) — not a locally-built upload.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            main.js
+            styles.css
       - name: Create draft release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
