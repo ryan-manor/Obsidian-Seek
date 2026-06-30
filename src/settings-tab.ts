@@ -94,6 +94,8 @@ export class SeekSettingTab extends PluginSettingTab {
     // UI state that must survive the synchronous display() re-renders triggered by
     // segmented picks and the reindex state machine.
     private advancedOpen = false;
+    // Independent of advancedOpen (Relevance) so the Index disclosure toggles on its own.
+    private indexAdvancedOpen = false;
     private reindexPhase: 'idle' | 'confirm' | 'running' = 'idle';
     private reindexDone = 0;
     private reindexTotal = 0;
@@ -202,12 +204,30 @@ export class SeekSettingTab extends PluginSettingTab {
             warn.setText('Index degraded — search still works but ranking may be off. A full reindex is recommended.');
         }
 
-        new Setting(containerEl)
+        // The reindex button + live progress bar stay outside the disclosure: it's the
+        // primary action and must be visible regardless of the advanced toggle.
+        this.renderReindexRow(containerEl);
+
+        // Advanced disclosure — what to index (Bases / excluded folders) and where the
+        // index lives are set-once knobs, so tuck them away like Relevance's advanced
+        // section. Mirrors renderRelevance's disclosure, with its own open-state flag.
+        const disc = containerEl.createDiv({ cls: 'seek-disclosure' });
+        disc.createSpan({ cls: 'seek-disclosure-chev', text: this.indexAdvancedOpen ? '▾' : '▸' });
+        disc.createSpan({ text: 'Advanced settings' });
+        disc.onclick = () => { this.indexAdvancedOpen = !this.indexAdvancedOpen; this.rerender(); };
+
+        if (this.indexAdvancedOpen) this.renderIndexAdvanced(containerEl);
+    }
+
+    private renderIndexAdvanced(containerEl: HTMLElement): void {
+        const adv = containerEl.createDiv({ cls: 'seek-adv' });
+
+        new Setting(adv)
             .setName('Index Base files')
             .setDesc('Include your Obsidian Bases (.base files) in the search index, so a Base shows up by its name and filters. Takes effect on the next full reindex.')
             .addToggle(t => t.setValue(this.s.indexBases).onChange(async v => { this.s.indexBases = v; await this.save(); }));
 
-        new Setting(containerEl)
+        new Setting(adv)
             .setName('Honor excluded folders')
             .setDesc("Skip files in Obsidian's Settings → Files & Links → Excluded files (e.g. Archive). Takes effect on the next full reindex.")
             .addToggle(t => t.setValue(this.s.honorIgnoredFolders).onChange(async v => { this.s.honorIgnoredFolders = v; await this.save(); }));
@@ -215,7 +235,7 @@ export class SeekSettingTab extends PluginSettingTab {
         // Built as DOM (intro line · two bullets · footer) rather than a setDesc() string,
         // which renders flat with no line breaks — the two location options read far more
         // clearly as a short list.
-        const indexLoc = new Setting(containerEl).setName('Index location');
+        const indexLoc = new Setting(adv).setName('Index location');
         indexLoc.descEl.createDiv({ text: 'This is where the synced index folder lives.' });
         const locList = indexLoc.descEl.createEl('ul', { cls: 'seek-desc-list' });
         const locHidden = locList.createEl('li');
@@ -238,8 +258,6 @@ export class SeekSettingTab extends PluginSettingTab {
                 await this.save();
                 new Notice('Seek: index location changed — reload Seek (or restart Obsidian) for it to take effect.', 8000);
             }));
-
-        this.renderReindexRow(containerEl);
     }
 
     private renderStatusCard(containerEl: HTMLElement): void {
@@ -348,7 +366,7 @@ export class SeekSettingTab extends PluginSettingTab {
     private renderReindexNote(containerEl: HTMLElement): void {
         containerEl.createDiv({
             cls: 'seek-hint',
-            text: 'Building the index re-embeds every note and isn’t recommended on a mobile phone — run it on a computer, and your phone will sync the finished index automatically.',
+            text: 'Building the index re-embeds every note and isn’t recommended on a mobile phone. Run it on a computer, and your phone will sync the finished index automatically.',
         });
     }
 
