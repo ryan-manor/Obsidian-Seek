@@ -1,6 +1,6 @@
 {
     "name": "seek",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "Obsidian plugin for on-device hybrid semantic and lexical vault search.",
     "main": "main.js",
     "scripts": {
