@@ -6,7 +6,9 @@
 //     line inside fenced code is NOT a heading), build hierarchical title
 //     "Note Title > H1 > H2"
 //   - Frontmatter parsed for tags / aliases / created (all other scalar keys,
-//     pageType included, are folded generically into metadata.properties)
+//     pageType included, are folded generically into metadata.properties);
+//     metadata.tags also unions inline body #tags (tag-grammar.ts, audit R2 #2)
+//     and aliases accepts the legacy singular `alias:` key (audit R2 #5)
 //   - Aliases are appended to the note title ("Note Title | Alias1 | Alias2 > H1")
 //   - Sub-min sections fold into neighbours (carry buffer); title-only notes
 //     get a fallback chunk
@@ -26,9 +28,10 @@
 import type { Chunk, ChunkMeta, ChunkMetadata, BaseView } from './types';
 import { scanHeadings } from './atoms';
 import { toDisplayForm } from './prop-normalize';
-import { cleanDenseText, cleanDenseBody } from './dense-clean';
+import { cleanDenseText, cleanDenseBody, extractLinkTerms, extractLinkTermsBody, ASSET_EXT_RE as SUFFIX_ASSET_RE } from './dense-clean';
 import { depluralize, MACHINERY_KEYS } from './bm25';
 import { seekTokenize } from './tokenize';
+import { extractInlineTags } from './tag-grammar';
 export type { Chunk, ChunkMeta, ChunkMetadata };
 
 const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n/;
@@ -119,7 +122,40 @@ export function chunkIdFor(notePath: string, title: string, content: string, den
 // 2026-06-29 #2): text-valued UI keys (icon/cssclasses/cssclass/banner/…) no
 // longer leak into the suffix, so a machinery-bearing note's suffix bytes (and
 // id) shift and a pre-9 sidecar's vectors for those notes are unreproducible.
-export const CHUNKER_VERSION = 9;
+// 10 = lexical reclamation (2026-07-02, audit R2 #1): chunks gain link_terms —
+// the raw substrings v8's dense-clean DROPPED (aliased wikilink targets,
+// markdown-link/autolink URLs), BM25-folded into the content field at doc
+// build. UNLIKE every bump above, the embedded bytes and chunk_ids are
+// UNCHANGED (link_terms is deliberately outside chunkIdFor); the bump exists
+// because stored ChunkMeta records need the new field backfilled, and a
+// version mismatch is the one fleet-converging "re-run the chunker" trigger:
+// desktop full-reindexes, mobile re-chunks live embed-free on hydrate. A v9
+// sidecar's VECTORS would technically still be reproducible here, but the
+// conservative reject costs only one desktop re-seed.
+//
+// PENDING (would be 11, NOT bumped yet): three fixes landed after v10 shipped
+// that also move buildDenseSuffix's output or the parsed frontmatter/body —
+// and thus chunkIdFor's tail or content — for affected notes: (a)
+// INERT_VALUE_RE narrowed to stop swallowing free text trailing a date
+// property value (audit R2 batch2 #3, chunker.ts); (b) SUFFIX_ASSET_RE
+// unified onto dense-clean.ts's $-anchored ASSET_EXT_RE instead of its own
+// drifted \b-bounded copy, so a property value that merely CONTAINS an asset
+// extension (e.g. "trip.pdf notes") no longer gets misclassified as
+// shape-junk and dropped (audit R2 batch2 #5, chunker.ts + dense-clean.ts);
+// and (c) a leading BOM (U+FEFF) is now stripped before frontmatter parsing
+// (audit R2 batch2 #4, chunkContent) — previously FRONTMATTER_RE's `^---`
+// anchor never matched a BOM-prefixed file, so metadata stayed `{}` and body
+// was the whole raw file including the frontmatter block text; for any
+// BOM-prefixed note this changes metadata, body, denseSuffix, and hence
+// chunk_id. All three are eval-gate-before-ship the same way v10 itself was —
+// DELIBERATELY left off the live CHUNKER_VERSION until that eval runs, not an
+// oversight. In the meantime this means a producer and consumer can each
+// self-report chunkerVersion=10 while actually running different
+// id-affecting code (a staggered-rollout risk on IDENTITY, not data safety —
+// hydrateFromSidecar's id-lookup path just falls through to a normal local
+// re-embed on a miss, same as any other unmatched id). Fold all three into
+// this comment block when the eval runs and the version finally bumps to 11.
+export const CHUNKER_VERSION = 10;
 
 export interface ChunkerOptions {
     minChunkChars?: number;
@@ -133,6 +169,12 @@ export class MarkdownChunker {
     }
 
     chunkContent(content: string, notePath: string, noteTitle?: string, modified?: string | null): Chunk[] {
+        // Strip a leading BOM (U+FEFF) before frontmatter parsing (audit R2
+        // batch2 #4): FRONTMATTER_RE is anchored at the very start of the
+        // string (^---), so a BOM-prefixed file (common from Windows editors
+        // and some web clippers) never matched it and lost its frontmatter
+        // entirely — tags, aliases, and every property silently vanished.
+        if (content.charCodeAt(0) === 0xfeff) content = content.slice(1);
         const baseTitle = noteTitle ?? notePath.split('/').pop()!.replace(/\.md$/, '');
 
         // ---- Frontmatter ----
@@ -163,7 +205,14 @@ export class MarkdownChunker {
         const denseSuffix = buildDenseSuffix(metadata, titleWithAliases);
 
         const normalizedMetadata: ChunkMetadata = {
-            tags: extractTags(metadata),
+            // Frontmatter tags + inline body `#tags` (audit R2 #2): Obsidian's
+            // own metadataCache indexes both, so the suggester offers inline
+            // tags — the store has to carry them or those pills match nothing.
+            // NOTE-level union (a tag anywhere tags the whole note, Obsidian
+            // semantics), shared by every chunk via this one object. Metadata
+            // only — not hashed by chunkIdFor, so ids/vectors are untouched;
+            // the v10 bump backfills stored records exactly as for link_terms.
+            tags: mergeTags(extractTags(metadata), extractInlineTags(body)),
             aliases,
             created: extractDate(metadata['created']),
             modified: modified ?? null,
@@ -194,8 +243,9 @@ export class MarkdownChunker {
             headingPath: string[],
             startLine: number,
             endLine: number,
+            linkTerms = '',
         ): Chunk => ({
-            chunk_id: idFor(title, content),
+            chunk_id: idFor(title, content),   // link_terms deliberately NOT hashed — ids/vectors stay stable
             title,
             content,
             note_path: notePath,
@@ -204,6 +254,7 @@ export class MarkdownChunker {
             start_line: startLine,
             end_line: endLine,
             ...(denseSuffix && { denseSuffix }),
+            ...(linkTerms && { link_terms: linkTerms }),
         });
 
         // Carry buffer for sub-minChunkChars sections. Dropping them is the §7
@@ -218,6 +269,8 @@ export class MarkdownChunker {
         let carryTitle = '';
         let carryHeadingPath: string[] = [];
         let carryStart = -1;
+        let carryLinkTerms = '';
+        const joinLt = (a: string, b: string) => (a && b ? `${a} ${b}` : a || b);
 
         const emit = (
             sectionContent: string,
@@ -226,6 +279,7 @@ export class MarkdownChunker {
             startLine: number,
             endLine: number,
             headingText = '',
+            rawHeading = '',
         ) => {
             // Dense/lexical body hygiene (v8): flatten link/embed syntax, strip
             // URL/HTML noise, keep fenced code verbatim. Cleaning here (not at
@@ -234,7 +288,21 @@ export class MarkdownChunker {
             // (start_line/end_line) is unaffected — it is recomputed from the
             // on-disk note below, never from this string's length.
             const trimmed = cleanDenseBody(sectionContent);
-            if (trimmed.length === 0) return; // nothing to index or carry
+
+            // Lexical reclamation (v10): what the clean DROPPED from this section
+            // (and its raw heading line) — persisted BM25-only via link_terms so
+            // `theverge.com` / `[[Alex Goel|Alex]]`-target queries still match.
+            const linkTerms = joinLt(extractLinkTermsBody(sectionContent), extractLinkTerms(rawHeading));
+
+            if (trimmed.length === 0) {
+                // Nothing to index or carry as TEXT — but an image/link-only
+                // section (e.g. a lone `![[Rapha Jersey.png]]`) still dropped
+                // lexical material; ride it on the carry so it lands on the
+                // neighbouring chunk instead of vanishing (pre-v8 the raw
+                // section text was indexed).
+                carryLinkTerms = joinLt(carryLinkTerms, linkTerms);
+                return;
+            }
 
             if (trimmed.length < this.minChunkChars) {
                 // Hold it instead of dropping. Prepend the heading word so a
@@ -250,6 +318,7 @@ export class MarkdownChunker {
                     carryHeadingPath = headingPath;
                     carryStart = startLine;
                 }
+                carryLinkTerms = joinLt(carryLinkTerms, linkTerms);
                 return;
             }
 
@@ -258,6 +327,10 @@ export class MarkdownChunker {
             // smudge we accept to keep it out of a tiny standalone chunk (§8).
             let content = trimmed;
             let start = startLine;
+            // Fold pending carry link-terms in unconditionally — they can exist
+            // WITHOUT carry text (the image/link-only-section case above).
+            const lt = joinLt(carryLinkTerms, linkTerms);
+            carryLinkTerms = '';
             if (carry) {
                 content = `${carry}\n\n${trimmed}`;
                 start = carryStart;
@@ -268,7 +341,7 @@ export class MarkdownChunker {
             // boundaries by enforceTokenBudget (token-budget.ts), the single
             // home for splitting since WS3. `(part N)` numbering happens there
             // too (display-only, never in the embedded/hashed `title`).
-            chunks.push(buildChunk(content, title, headingPath, start, endLine));
+            chunks.push(buildChunk(content, title, headingPath, start, endLine, lt));
         };
 
         if (headings.length === 0) {
@@ -300,7 +373,7 @@ export class MarkdownChunker {
                 const headingPath = headingStack.map(h => h.text);
                 const title = `${titleWithAliases} > ${headingPath.join(' > ')}`;
                 const sectionContent = lines.slice(lineNum + 1, endLine).join('\n');
-                emit(sectionContent, title, headingPath, lineNum + 1, endLine, headingText);
+                emit(sectionContent, title, headingPath, lineNum + 1, endLine, headingText, headings[idx].text);
             }
         }
 
@@ -314,13 +387,23 @@ export class MarkdownChunker {
                 last.content = `${last.content}\n\n${carry}`;
                 last.chunk_id = idFor(last.title, last.content);
                 last.end_line = lines.length;
+                if (carryLinkTerms) last.link_terms = joinLt(last.link_terms ?? '', carryLinkTerms);
             } else {
                 // The whole note is sub-min sections — emit it as ONE real,
                 // body-bearing chunk (NOT the lexical-only title stub below: it
                 // carries searchable text). This is the napkin-note case.
-                chunks.push(buildChunk(carry, carryTitle, carryHeadingPath, carryStart, lines.length));
+                chunks.push(buildChunk(carry, carryTitle, carryHeadingPath, carryStart, lines.length, carryLinkTerms));
             }
             carry = '';
+            carryLinkTerms = '';
+        } else if (carryLinkTerms && chunks.length > 0) {
+            // Trailing image/link-only section: no carried text, but its dropped
+            // lexical material still needs a home — the preceding chunk. (With
+            // zero chunks the title-only fallback below re-derives from the whole
+            // body, so nothing is lost there either.)
+            const last = chunks[chunks.length - 1];
+            last.link_terms = joinLt(last.link_terms ?? '', carryLinkTerms);
+            carryLinkTerms = '';
         }
 
         // Fallback: a note whose body never clears minChunkChars (e.g. a title-only
@@ -344,6 +427,7 @@ export class MarkdownChunker {
             // fallback exists at all, and the dense-floor in ranker.ts for the
             // other half of this fix.
             const lexicalOnly = fallbackContent.length === 0 ? true : undefined;
+            const fallbackLinkTerms = extractLinkTermsBody(body);
             chunks.push({
                 chunk_id: idFor(titleWithAliases, fallbackContent),
                 title: titleWithAliases,
@@ -355,6 +439,7 @@ export class MarkdownChunker {
                 end_line: lines.length,
                 ...(lexicalOnly && { lexicalOnly }),
                 ...(denseSuffix && { denseSuffix }),
+                ...(fallbackLinkTerms && { link_terms: fallbackLinkTerms }),
             });
         }
 
@@ -471,31 +556,91 @@ function stripQuotes(s: string): string {
     return s;
 }
 
+// Case-insensitive frontmatter KEY lookup. parseFrontmatter preserves the
+// author's key casing while every downstream skip-list compares
+// key.toLowerCase() — so an exact-case read here silently dropped `Alias:` /
+// `Tags:` values from EVERY channel (skipped from properties/suffix by the
+// ci skip-lists, never read as alias/tags: the same all-channels-assume-the-
+// other bug class as audit R2 #5 itself, reproduced for casing — 2026-07-02
+// adversarial review). Exact-case fast path first.
+function lookupKeyCI(metadata: Record<string, unknown>, name: string): unknown {
+    if (name in metadata) return metadata[name];
+    for (const [k, v] of Object.entries(metadata)) {
+        if (k.toLowerCase() === name) return v;
+    }
+    return undefined;
+}
+
+// Obsidian accepts BOTH the modern plural key and the legacy singular
+// (audit R2 #5: `alias:` reached no ranking channel — this extractor read
+// only `aliases` while every downstream skip-list excluded `alias` assuming
+// this side carried it). The plural list rides VERBATIM — dupes and all,
+// byte-identical to the pre-fix read, so no aliases-only note's title (and
+// therefore chunk_id) moves; only the legacy singular entries dedup against
+// it (case-insensitive). A note carrying `alias:` (or a case-variant key)
+// gains alias tokens in titleWithAliases → its title/denseSuffix/chunk_id
+// change BY DESIGN, which the pending v10 reindex absorbs.
 function extractAliases(metadata: Record<string, unknown>): string[] {
-    const raw = metadata['aliases'];
-    if (Array.isArray(raw)) return raw.map(v => String(v).trim()).filter(Boolean);
-    if (typeof raw === 'string') return raw.split(',').map(s => s.trim()).filter(Boolean);
-    return [];
+    const listOf = (raw: unknown): string[] =>
+        Array.isArray(raw) ? raw.map(v => String(v).trim()).filter(Boolean)
+        : typeof raw === 'string' ? raw.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
+    const out = listOf(lookupKeyCI(metadata, 'aliases'));
+    const seen = new Set(out.map(a => a.toLowerCase()));
+    for (const a of listOf(lookupKeyCI(metadata, 'alias'))) {
+        const k = a.toLowerCase();
+        if (!seen.has(k)) {
+            seen.add(k);
+            out.push(a);
+        }
+    }
+    return out;
 }
 
 function extractTags(metadata: Record<string, unknown>): string[] {
-    const raw = metadata['tags'];
+    const raw = lookupKeyCI(metadata, 'tags');
     if (Array.isArray(raw)) return raw.map(v => String(v).trim()).filter(Boolean);
     if (typeof raw === 'string') return raw.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
     return [];
 }
 
-// Generic backing store for `[key:value]` inline filters: every SCALAR
-// frontmatter value, string-coerced, keyed by frontmatter key. Array values
-// (tags/aliases and any other list-valued props) are skipped — they have
-// dedicated handling and don't participate in exact-match property filters.
-// parseFrontmatter only ever emits string | string[], so the typeof guard is
-// sufficient; the number/boolean arms are defensive.
-function extractProperties(metadata: Record<string, unknown>): Record<string, string> {
-    const props: Record<string, string> = {};
+// Union frontmatter tags with inline body tags, case-insensitive first-wins
+// (frontmatter casing is the author's canonical form). Keyed with the leading
+// `#` stripped — frontmatter tags occasionally carry it — matching how the
+// query-parser matcher normalizes both sides before comparing.
+function mergeTags(frontmatter: string[], inline: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const t of [...frontmatter, ...inline]) {
+        const k = t.replace(/^#/, '').toLowerCase();
+        if (k && !seen.has(k)) {
+            seen.add(k);
+            out.push(t);
+        }
+    }
+    return out;
+}
+
+// Generic backing store for `[key:value]` inline filters: every frontmatter
+// value keyed by frontmatter key — scalars string-coerced, LIST values kept as
+// string[] (v10, audit R2 #3: the suggester offers list-prop pills from the
+// metadata cache, and the old scalar-only store made every one of them match
+// nothing). tags/aliases stay skipped — they have dedicated fields and
+// operators. The matcher (query-parser lookupProp) treats a list as
+// any-element-matches; the BM25 properties field also folds each list item in
+// (extractPropertiesText, audit R2 batch2 #3 — list values used to be
+// dense-suffix-only and BM25-invisible).
+const PROPERTY_SKIP_KEYS = new Set(['tags', 'aliases', 'alias']);
+function extractProperties(metadata: Record<string, unknown>): Record<string, string | string[]> {
+    const props: Record<string, string | string[]> = {};
     for (const [key, value] of Object.entries(metadata)) {
+        if (PROPERTY_SKIP_KEYS.has(key.toLowerCase())) continue;
         if (typeof value === 'string') props[key] = value;
         else if (typeof value === 'number' || typeof value === 'boolean') props[key] = String(value);
+        else if (Array.isArray(value)) {
+            const items = value.map(v => String(v).trim()).filter(Boolean);
+            if (items.length) props[key] = items;
+        }
     }
     return props;
 }
@@ -534,15 +679,25 @@ const SUFFIX_SKIP_KEYS = new Set(['aliases', 'alias', ...MACHINERY_KEYS]);
 // `[[YYYY-MM-DD]]` dateLink flatten to the same string). Tested against the
 // WHOLE flattened item, so "trip 2026" (real text) survives but a bare "2026"
 // does not. Byte-for-byte the validated harness INERT_RE (ofm_fm_valuetype.py).
-const INERT_VALUE_RE = /^(?:\d{4}-\d{2}-\d{2}(?:[ T].*)?|-?\d+(?:\.\d+)?|true|false|yes|no|on|off)$/i;
+// MODULO the date-time tail (audit R2 batch2 #1): the form above matched a
+// date plus ANY trailing text ([ T].*) as inert, so a value like
+// "2026-06-29 Milan departure" vanished whole — the date recognized, but the
+// free text after it silently swallowed along with it, in BOTH channels (see
+// bm25.ts PROPERTY_DATE_RE, same fix). Narrowed to only swallow an actual
+// ISO time-of-day tail (a bare date, or date+time, is still inert either
+// way — dates remain queryable via [key:value] filters); a date FOLLOWED BY
+// FREE TEXT no longer matches, so the whole value (date digits and all)
+// survives as ordinary searchable text instead of being dropped.
+const INERT_VALUE_RE = /^(?:\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?|-?\d+(?:\.\d+)?|true|false|yes|no|on|off)$/i;
 
 // Shape gate: by-FORM junk the type-filter misses (frontmatter census, 2026-06-18).
 // A number-list is >=2 all-numeric tokens — lat/long coordinate strings and value
 // lists; a lone number is already INERT, so this only adds the multi-number case
 // and never touches text ("trip 2026" keeps its word, "1.2.3" is one non-numeric
-// token). URLs are 13% of suffix notes (all clippings), assets are og:image paths.
+// token). URLs are 13% of suffix notes (all clippings), assets are og:image paths
+// (SUFFIX_ASSET_RE = dense-clean.ts's ASSET_EXT_RE, imported not copied — see
+// that file for why: the two independently-defined copies had drifted, $ vs \b).
 const SUFFIX_URL_RE = /https?:\/\//i;
-const SUFFIX_ASSET_RE = /\.(png|jpe?g|gif|webp|svg|bmp|tiff?|pdf|mp4|mov|webm|mkv|mp3|m4a|wav|zip)\b/i;
 const SUFFIX_NUM_TOK_RE = /^[+-]?\d+(?:\.\d+)?$/;
 const SUFFIX_CAP_TOKENS = 48;   // ~census p90; bounds the pooling-domination tail
 

@@ -17,7 +17,7 @@ import { MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGT
 import { buildSynonymMap, chunkDeclaresAlias, SYNONYM_WEIGHT, type SynonymMap } from './synonyms';
 import { rank, cosineScores, DEFAULT_RANKING_CONFIG } from './ranker';
 import { browseOrder, recencyDate } from './fusion';
-import { IndexStore, nukeDatabase, classifyFileDelta, findOrphanChunkIds, isStoreClosedError, type MetaConfig, type FileRecord } from './index-store';
+import { IndexStore, nukeDatabase, classifyFileDelta, findOrphanChunkIds, isStoreClosedError, META_SCHEMA_VERSION, type MetaConfig, type FileRecord } from './index-store';
 import { LocalEmbedder, EMBEDDING_DIM, LEGACY_ENGLISH_MODEL_ID, MODEL_ID } from './embedder';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
@@ -29,7 +29,7 @@ import { poolCaps, POOL_FLOORS } from './pool';
 import { BinaryScorerWorker, binaryCandidatesAsync } from './binary-scorer';
 import { quantizeInt8, dequantizeInt8, type QuantVec } from './quant';
 import { VecReservoir, denseBgStats, calibratedConfidence, BG_RESERVOIR, MIN_BG_SAMPLE } from './dense-stats';
-import { bulkAppend, clearDevice, sidecarDirSignature, shouldReconcileSidecar, SIDECAR_FORMAT, bm25PathFor, writeBytesAtomic, ensureDir, listSidecarDeviceIds, compactDevice, deviceShardBytes, type CompactResult, type TierBytes } from './sidecar';
+import { bulkAppend, clearDevice, sidecarDirSignature, shouldReconcileSidecar, staleSidecarFormat, SIDECAR_FORMAT, bm25PathFor, writeBytesAtomic, ensureDir, listSidecarDeviceIds, compactDevice, type CompactResult, type TierBytes } from './sidecar';
 import { writeDeviceMeta, readDeviceMeta, metaAccepts, expectationFor, type SidecarMeta, type MetaExpectation } from './sidecar-meta';
 import { hydrateFromSidecar, rankAcceptedProducers, probePeerAhead, type ReChunkedNote, type HydrateResult, type HydrateDeps } from './sidecar-sync';
 import { pluginIdentity, shouldStampLiveIdentity, identityHealEligibility } from './identity';
@@ -150,6 +150,33 @@ function isUserIgnored(app: App, path: string): boolean {
     });
 }
 
+// The single index-membership predicate, exported so any code that offers a
+// value SOURCED from the note (a filter pill, an autocomplete suggestion, …)
+// can check whether the note it came from actually reaches the index — a
+// pill built from Obsidian's raw metadataCache (which doesn't honor "Excluded
+// files") can otherwise promise a result that the matcher will never return.
+// SearchOrchestrator.shouldIndex delegates here so there is exactly one
+// implementation to keep in sync (see the audit note in suggest.ts).
+export function shouldIndexPath(app: App, settings: SeekSettings, path: string): boolean {
+    if (EXCLUDED_PATHS.has(path)) return false;
+    if (EXCLUDED_PREFIXES.some(p => path.startsWith(p))) return false;
+    if (settings.honorIgnoredFolders && isUserIgnored(app, path)) return false;
+    return true;
+}
+
+// Per-call recency override for search() — the seek:search CLI's
+// recencyWeight/recencyHalflife params (main.ts). Either field may be absent
+// (only one of the two CLI params given); absent means "use this.settings
+// for that field". Deliberately a plain call argument, never written into
+// SeekSettings: the settings object is shared by reference with the plugin
+// and read by every concurrent search caller, so mutating it for an
+// override's duration let a concurrent plain search transparently rank
+// against someone else's in-flight override (2026-07-02 review).
+export interface RecencyOverride {
+    epsilon?: number;
+    halfLifeDays?: number;
+}
+
 export class SearchOrchestrator {
     private app: App;
     private store: IndexStore;
@@ -180,6 +207,30 @@ export class SearchOrchestrator {
     // grinding through the rest of the vault against a dead connection. Sticky: the
     // orchestrator is being torn down, so a re-enable builds a fresh instance.
     private disposed = false;
+
+    // Paths that failed to read during an embed attempt (e.g. an undownloaded
+    // iCloud placeholder that throws on every read), mapped to the epoch ms their
+    // backoff expires. Without this, a persistently-unreadable file's stale
+    // record gets dropped as part of the failed re-embed, so every LATER
+    // computeDelta sees prev===undefined and reports it dirty again forever —
+    // which wedges reconcileIdentityInPlace in 'drained' permanently (see there).
+    // Quarantining it lets computeDelta skip it until the backoff elapses, and a
+    // full reindex (reindexAllInner) clears the map so it is always retried then.
+    private static readonly UNREADABLE_QUARANTINE_MS = 30 * 60 * 1000; // 30 min
+    private unreadableQuarantine = new Map<string, number>();
+
+    private isQuarantined(path: string): boolean {
+        const until = this.unreadableQuarantine.get(path);
+        return until !== undefined && Date.now() < until;
+    }
+
+    // Called wherever an indexable file's content could not be read. Logs once
+    // per quarantine spell (not on every retry) so a wedged file doesn't spam.
+    private quarantineUnreadable(path: string): void {
+        const isNew = !this.unreadableQuarantine.has(path);
+        this.unreadableQuarantine.set(path, Date.now() + SearchOrchestrator.UNREADABLE_QUARANTINE_MS);
+        if (isNew) console.warn(`[seek] quarantining persistently unreadable file (will retry on backoff / next full reindex): ${path}`);
+    }
 
     constructor(app: App, store: IndexStore, embedder: LocalEmbedder, logger: SeekLogger, settings: SeekSettings, forensics: Forensics | null = null, indexDir: string | null = null) {
         this.app = app;
@@ -232,6 +283,11 @@ export class SearchOrchestrator {
         const overallStart = performance.now();
         const memBefore = await snapshotMemory();
 
+        // A full reindex re-attempts every file regardless of quarantine — clear
+        // the backoff map so a file that has since become readable (e.g. an
+        // iCloud placeholder that finished downloading) isn't skipped here too.
+        this.unreadableQuarantine.clear();
+
         // Reset. Close our long-lived connection first so deleteDatabase
         // isn't blocked by us, then re-open the (fresh, empty) DB.
         const resetStart = performance.now();
@@ -241,7 +297,7 @@ export class SearchOrchestrator {
         await this.store.setMeta({
             embeddingDim: EMBEDDING_DIM,
             lastIndexedAt: null,
-            schemaVersion: 2,
+            schemaVersion: META_SCHEMA_VERSION,
             modelId: this.embedder.modelId,
         });
         const resetEntry: ResetEntry = {
@@ -644,15 +700,31 @@ export class SearchOrchestrator {
             const mtimeMs = file.stat.mtime;
             let fileChunks: Chunk[];
             let contentHash = '';
+            let content: string;
             try {
-                const content = await this.app.vault.cachedRead(file);
+                content = await this.app.vault.cachedRead(file);
+            } catch (e) {
+                // Read error (e.g. an undownloaded iCloud placeholder that throws
+                // on every attempt) — skip this file (it never entered a buffer).
+                // Quarantine it so the NEXT computeDelta doesn't immediately
+                // re-report it dirty forever (its record was already dropped by
+                // the caller before this pass ran) — see the quarantine field
+                // comment for why that would otherwise wedge reconcileIdentityInPlace.
+                filesSkippedError++;
+                await this.logger.appendError(`indexFile:${file.path}`, e);
+                this.quarantineUnreadable(file.path);
+                continue;
+            }
+            try {
                 contentHash = cyrb53Hex(content);
                 const modifiedIso = new Date(mtimeMs).toISOString();
                 const chunkStart = performance.now();
                 fileChunks = this.chunksFor(content, file.path, modifiedIso);
                 chunkMs += performance.now() - chunkStart;
             } catch (e) {
-                // Read/chunk error — skip this file (it never entered a buffer).
+                // Chunk error — skip this file (it never entered a buffer). Not
+                // quarantined: this is a content/chunker problem, not a read
+                // failure, so there is no reason to suppress future re-attempts.
                 filesSkippedError++;
                 await this.logger.appendError(`indexFile:${file.path}`, e);
                 continue;
@@ -784,6 +856,19 @@ export class SearchOrchestrator {
                 // until a full reindex, defeating the eviction-recovery the sidecar
                 // exists for.
                 const prior = await readDeviceMeta(adapter, this.coord.dir!, this.logger.deviceId);
+                // A SIDECAR_FORMAT bump alone (no chunker/model/dim change) never forces
+                // a full reindex — identityMatches deliberately excludes it (identity.ts).
+                // An ordinary INCREMENTAL commit landing here after such a bump would
+                // otherwise write the CURRENT format into meta below while every untouched
+                // note's shard bytes are still in the PRIOR record stride — a lie that
+                // later misleads this device's own compactOwnSidecar (and any peer
+                // hydrating from it) into decoding stale-stride bytes as corrupt. A full
+                // pass already clearDevice()'d above (prior reads null there), so this
+                // only fires for the incremental case: wipe first so the meta write below
+                // is never untrue relative to what's actually on disk.
+                if (staleSidecarFormat(prior, identity.sidecarFormat)) {
+                    await clearDevice(adapter, this.coord.dir!, this.logger.deviceId);
+                }
                 await writeDeviceMeta(adapter, this.coord.dir!, {
                     // Canonical version slice (modelId/revision/chunkerVersion/dim)
                     // from the single identity source — NOT embedder.modelId, which
@@ -813,7 +898,7 @@ export class SearchOrchestrator {
         await this.store.setMeta({
             embeddingDim: EMBEDDING_DIM,
             lastIndexedAt: new Date().toISOString(),
-            schemaVersion: 2,
+            schemaVersion: META_SCHEMA_VERSION,
             modelId: this.embedder.modelId,
             // Identity: a full reindex — or a cold first-build (sawWholeCorpus) —
             // stamps the live build; an ordinary incremental preserves prevMeta so a
@@ -954,10 +1039,7 @@ export class SearchOrchestrator {
     // ignored folders" — when on, Obsidian's "Excluded files" (e.g. Archive) are
     // out-of-index, so moving a note in is a soft-delete.
     private shouldIndex(path: string): boolean {
-        if (EXCLUDED_PATHS.has(path)) return false;
-        if (EXCLUDED_PREFIXES.some(p => path.startsWith(p))) return false;
-        if (this.settings.honorIgnoredFolders && isUserIgnored(this.app, path)) return false;
-        return true;
+        return shouldIndexPath(this.app, this.settings, path);
     }
 
     // The candidate set for every collection site (reindexAll, computeDelta, and
@@ -1014,6 +1096,11 @@ export class SearchOrchestrator {
         // can't itself jank the UI.
         const dirty: string[] = [];
         for (const f of live) {
+            // A persistently-unreadable file (quarantineUnreadable) is excluded
+            // from dirty entirely while its backoff is live — otherwise its
+            // dropped record makes classifyFileDelta report 'dirty' forever (see
+            // the quarantine field comment), wedging every computeDelta caller.
+            if (this.isQuarantined(f.path)) continue;
             const prev = stored.get(f.path);
             let decision = classifyFileDelta(prev, f.stat.mtime);
             if (decision === 'check-bytes') {
@@ -1021,6 +1108,7 @@ export class SearchOrchestrator {
                     decision = classifyFileDelta(prev, f.stat.mtime, cyrb53Hex(await this.app.vault.cachedRead(f)));
                 } catch {
                     decision = 'dirty';   // unreadable → let the embed path decide
+                    this.quarantineUnreadable(f.path); // give it this one attempt, then back off
                 }
             }
             if (decision === 'dirty') dirty.push(f.path);
@@ -1323,7 +1411,7 @@ export class SearchOrchestrator {
                     await this.store.setMeta({
                         embeddingDim: EMBEDDING_DIM,
                         lastIndexedAt: new Date().toISOString(),
-                        schemaVersion: 2,
+                        schemaVersion: META_SCHEMA_VERSION,
                         // Prefer the existing modelId (embed path set it); fall back to
                         // the live model only when the cold build wrote none (hydrate-only).
                         modelId: prevMeta.modelId ?? live?.modelId,
@@ -1630,7 +1718,7 @@ export class SearchOrchestrator {
             await nukeDatabase(this.store.dbName);
             await this.store.open();
             const id = pluginIdentity();
-            await this.store.setMeta({ embeddingDim: EMBEDDING_DIM, lastIndexedAt: null, schemaVersion: 2, modelId: MODEL_ID, chunkerVersion: id.chunkerVersion, analyzerVersion: id.analyzerVersion, revision: id.revision });
+            await this.store.setMeta({ embeddingDim: EMBEDDING_DIM, lastIndexedAt: null, schemaVersion: META_SCHEMA_VERSION, modelId: MODEL_ID, chunkerVersion: id.chunkerVersion, analyzerVersion: id.analyzerVersion, revision: id.revision });
         });
         // 2. Drop every resident cache that referenced the nuked index, then hydrate
         //    (its own write mutex; the now-empty store forces a full reconcile).
@@ -1918,14 +2006,39 @@ export class SearchOrchestrator {
         const adapter = this.app.vault.adapter;
         const dir = this.coord.dir!;
         const dev = this.logger.deviceId;
+
+        // A SIDECAR_FORMAT bump is deliberately excluded from identityMatches (it
+        // governs only the cross-device file protocol, not local IDB validity — see
+        // identity.ts), so this device can carry a stale-format sidecar on disk
+        // indefinitely: nothing forces a full reindex (the only path that clears it
+        // via clearDevice) just because the format constant moved. compactDevice()
+        // decodes every record with the CURRENT fixed stride unconditionally — run
+        // against a genuinely stale-format shard, every record misaligns, fails its
+        // CRC, and gets shed as "corrupt", permanently destroying this device's
+        // pre-upgrade vector history (and leaving a peer's later hydration attempt
+        // to hit the same misread). Detect the mismatch from this device's own last-
+        // written meta BEFORE compacting and, instead of misreading, explicitly wipe
+        // via the same primitive a full reindex uses — the sidecar self-heals from
+        // normal incremental commits afterward, same as any other reap.
+        const ownMeta = await readDeviceMeta(adapter, dir, dev);
+        if (staleSidecarFormat(ownMeta)) {
+            await clearDevice(adapter, dir, dev);
+            return { compacted: false, reason: 'format-mismatch', recordsBefore: 0, recordsAfter: 0, bytesBefore: 0, bytesAfter: 0, shed: 0 };
+        }
+
         // Off-grid means no iCloud re-upload now (it lands as a SMALLER upload on
         // reconnect), but the rewrite still costs IO — so a higher floor on mobile.
         const floor = isMobilePlatform() ? 4 * 1024 * 1024 : 2 * 1024 * 1024;
-        // Cheap stat-only pre-gate: skip even acquiring the lock / re-chunking for a small
-        // sidecar (compactDevice re-checks the floor for direct callers).
-        if (await deviceShardBytes(adapter, dir, dev) < floor) {
-            return { compacted: false, reason: 'below-floor', recordsBefore: 0, recordsAfter: 0, bytesBefore: 0, bytesAfter: 0, shed: 0 };
-        }
+        // NOTE: no stat-only pre-gate here on purpose. deviceShardBytes(...) < floor would
+        // sum ALL on-disk shard bytes, including crash-leaked orphans (shards referenced by
+        // zero jsonl lines — see compactDevice's header comment), and skip calling
+        // compactDevice entirely for any device whose live+orphan total stays under the
+        // floor. compactDevice's own orphan reclaim runs BEFORE its internal below-floor
+        // check (on live bytes only), so it must always be reachable — a caller-side
+        // pre-gate on the unfiltered total would make a small, quiet device's leaked
+        // shards unreclaimable forever. compactDevice is cheap to call here regardless:
+        // this path runs at most once per session (see main.ts), and its own below-floor
+        // check bails before the expensive live-id re-chunk.
         // The live-id oracle runs INSIDE compactDevice's dir lock so the snapshot and the
         // on-disk scan exclude concurrent appends — the drop decision needs no clock.
         const result = await compactDevice(adapter, dir, dev, () => this.collectLiveIds(), { minDeadRatio: 0.5, minShardBytes: floor });
@@ -2213,9 +2326,12 @@ export class SearchOrchestrator {
     // dictionary lookup) and the date field the recency-gated `before:`/`after:`
     // filters key off. dateField is null when Recency is OFF (recencyEpsilon ≤ 0),
     // which is how the parser knows to leave a typed before:/after: as plain text.
+    // recencyOverride (see search()) resolves the effective epsilon locally so a
+    // query-time override never has to touch this.settings to take effect here.
     // See [[Seek Typed-Value Filters Design]].
-    private buildFilterContext(): FilterContext {
-        const recencyOn = this.settings.recencyEpsilon > 0;
+    private buildFilterContext(recencyOverride?: RecencyOverride): FilterContext {
+        const epsilon = recencyOverride?.epsilon ?? this.settings.recencyEpsilon;
+        const recencyOn = epsilon > 0;
         return {
             dateField: recencyOn
                 ? { key: this.settings.recencyKey, createdProp: this.settings.createdProp }
@@ -2241,7 +2357,18 @@ export class SearchOrchestrator {
     // and recency arms exist precisely to recover the ~9% dense-unreachable
     // gold that exact dense itself caps at. Skipping them would regress
     // recall vs the old all-chunks scorer.
-    async search(query: string, topK = 10): Promise<{ results: ScoredChunk[]; entry: SearchEntry }> {
+    //
+    // recencyOverride: the seek:search CLI's per-query recencyWeight/
+    // recencyHalflife params (see main.ts). Resolved locally into filterCtx/
+    // rankConfig below — deliberately NEVER written into this.settings.
+    // this.settings is a single live object shared by every concurrent
+    // caller (other CLI calls, the search modal, openTopResult), so an
+    // earlier version that mutated it for the override's duration let a
+    // plain concurrent search silently rank against someone else's override
+    // (2026-07-02 review). Passing the override as a call-local argument
+    // instead makes overlapping searches independent by construction — no
+    // shared mutable state, so nothing to race or leak.
+    async search(query: string, topK = 10, recencyOverride?: RecencyOverride): Promise<{ results: ScoredChunk[]; entry: SearchEntry }> {
         const t0 = performance.now();
         const searchId = `${Date.now()}-${query.slice(0, 20)}`;
 
@@ -2252,7 +2379,7 @@ export class SearchOrchestrator {
         // FilterContext threads vault-specific facts (Number-typed props, the
         // Recency date field) into the otherwise-pure parser/matcher; same object
         // is reused by compileMatcher so parse and match agree on types/field.
-        const filterCtx = this.buildFilterContext();
+        const filterCtx = this.buildFilterContext(recencyOverride);
         const { cleanedQuery, filters } = parseQuery(query, filterCtx);
 
         // ---- S0: resident-tier read ------------------------------------
@@ -2394,6 +2521,22 @@ export class SearchOrchestrator {
         const queryVec = embedded.vector;
         const iframeEmbedMs = embedded.iframeLatencyMs;
         const queryEmbedMs = performance.now() - qStart;
+
+        // Vector sanity: a NaN/Inf query embedding (WASM numeric fault, torn
+        // model load) poisons every cosine downstream — comparisons all come
+        // back false and results render in frame order scored 0, which reads as
+        // silent ranking corruption rather than an error. Every dense score
+        // derives from this one vector, so this single gate closes the class;
+        // embed() declines to cache a non-finite vector, so a retry re-embeds.
+        if (!queryVec.every(Number.isFinite)) {
+            await this.logger.appendError(
+                'searchQueryVectorNonFinite',
+                new Error(`Query embedding contains non-finite values (dim ${queryVec.length}) — corrupt embedder output; retry the search.`),
+            );
+            const entry: SearchEntry = this.emptySearchEntry(query, cleanedQuery, filters, topK, searchId, idbReadMs, performance.now() - t0);
+            await this.logger.append(entry);
+            return { results: [], entry };
+        }
 
         // Dim sanity: the binary index was packed at the dim of whatever the
         // last reindex wrote. If the live model now emits a different dim, the
@@ -2539,11 +2682,11 @@ export class SearchOrchestrator {
         }
         const selectFetchMs = performance.now() - fetchStart;
 
-        // Drop any null rows (defensive — should never happen since binary
-        // and fp32 are written in the same transaction, but a half-migrated
-        // upgrade or storage corruption is the kind of thing that bites
-        // exactly here). Keep candidateChunks/scores parallel by filtering
-        // together.
+        // See alignCandidate: a missing/mismatched fp32 row degrades to the
+        // lexical-only floor instead of dropping the candidate. The zero vector's
+        // cosine is discarded — rank() floors denseScores for any lexicalOnly
+        // chunk to the real-candidate min before it's used.
+        const zeroFp32 = new Float32Array(queryVec.length);
         const alignStart = performance.now();
         const candidateChunks: ChunkMeta[] = [];
         const candidateFp32: Float32Array[] = [];
@@ -2551,11 +2694,10 @@ export class SearchOrchestrator {
         const applyCoverage = this.settings.bm25Coverage;
         for (let i = 0; i < candidateIndices.length; i++) {
             const idx = candidateIndices[i];
-            const ch = orderedChunks[idx];
-            const v = fp32Maybe[i];
-            if (!ch || !v || v.length !== queryVec.length) continue;
-            candidateChunks.push(ch);
-            candidateFp32.push(v);
+            const aligned = alignCandidate(orderedChunks[idx], fp32Maybe[i], queryVec.length);
+            if (!aligned) continue;
+            candidateChunks.push(aligned.chunk);
+            candidateFp32.push(aligned.missingFp32 ? zeroFp32 : (fp32Maybe[i] as Float32Array));
             // Soft-AND: discount a partial multi-term match by its coverage^P (the
             // coordination-level penalty; see BM25_COVERAGE_POW in bm25.ts). The weight
             // is 1 for single-term queries and full-coverage docs (no-op regardless of P),
@@ -2582,12 +2724,14 @@ export class SearchOrchestrator {
             titleBoost: this.settings.navTitleBoost,
             // Recency (2026-06-19): ε weight, half-life, AND the definition of
             // "recent" are all settings-driven now — read fresh from this.settings
-            // every query, so a UI change or a query-time override (the seek:search
-            // CLI params, or an `obsidian eval` mutation of this.settings) takes
-            // effect on the NEXT search with no reindex. ε defaults to the 0.02
-            // tiebreaker; raise it for a deliberate high-recency mode.
-            recencyEpsilon: this.settings.recencyEpsilon,
-            recencyHalfLifeDays: this.settings.recencyHalfLifeDays,
+            // every query, so a UI change takes effect on the NEXT search with no
+            // reindex. ε defaults to the 0.02 tiebreaker; raise it for a deliberate
+            // high-recency mode. A query-time override (recencyOverride, from the
+            // seek:search CLI params) is resolved here, per-call, falling back to
+            // this.settings when absent — see the search() doc comment for why
+            // it's a local argument and not a this.settings mutation.
+            recencyEpsilon: recencyOverride?.epsilon ?? this.settings.recencyEpsilon,
+            recencyHalfLifeDays: recencyOverride?.halfLifeDays ?? this.settings.recencyHalfLifeDays,
             recencyKey: this.settings.recencyKey,
             createdProp: this.settings.createdProp,
         };
@@ -3370,6 +3514,28 @@ export class SearchOrchestrator {
 // float64 precision makes that dequant bit-identical to the IDB path; a Float32
 // scale would round s and could shift a dequantized component, breaking the
 // relevance-identical guarantee.
+// Stage-2 candidate alignment decision: whether `v` (this candidate's fp32
+// row) is usable, and — if not — the degraded ChunkMeta to rank it with
+// instead of dropping it. A missing/mismatched row (no chunk sibling in the
+// embeddings store: a half-migrated upgrade, storage corruption, or, on
+// mobile — which ALWAYS takes the per-id getEmbeddingsByIds path, never the
+// resident RAM block — a chunk whose vector hasn't hydrated/embedded on this
+// device yet) degrades to the SAME lexical-only floor ranker.ts already
+// applies to body-less title-only chunks, rather than silently dropping a
+// candidate BM25 may have ranked first. Returns null only when there is no
+// chunk metadata at all (nothing to rank or render). The returned chunk is a
+// COPY when degraded — the caller's orderedChunks entry is shared across
+// queries and must never be mutated in place.
+export function alignCandidate(
+    ch: ChunkMeta | undefined | null,
+    v: Float32Array | null | undefined,
+    queryDim: number,
+): { chunk: ChunkMeta; missingFp32: boolean } | null {
+    if (!ch) return null;
+    const missingFp32 = !v || v.length !== queryDim;
+    return { chunk: missingFp32 ? { ...ch, lexicalOnly: true } : ch, missingFp32 };
+}
+
 export function buildResidentRerankBlock(
     orderedIds: string[],
     embById: Map<string, QuantVec>,

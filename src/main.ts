@@ -27,7 +27,7 @@ import { DEFAULT_SETTINGS, migrateSettings } from './types';
 import { IndexStore, indexDbPrefix } from './index-store';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
-import { SearchOrchestrator, driftRecoveryDecision } from './search';
+import { SearchOrchestrator, driftRecoveryDecision, type RecencyOverride } from './search';
 import { SeekSearchModal, type IndexBanner } from './search-modal';
 import { indexBannerSpec, INDEX_STALE_MSG, INDEX_SYNCING_MSG, INDEX_PEER_AHEAD_MSG, type DegradedReason } from './index-notice';
 import { SeekSettingTab } from './settings-tab';
@@ -133,7 +133,25 @@ export default class SeekPlugin extends Plugin {
     // next plugin reload and we end up with duplicate logging on every hot
     // reload during development.
     private longTaskObserver: PerformanceObserver | null = null;
-    private currentTaskContext: LongTaskEntry['context'] = 'idle';
+    // Task context as a STACK, not a scalar (audit R2 #9): contexts overlap —
+    // opening the search modal during a running reindex used to stomp the
+    // scalar back to 'idle' in openSearchModal's finally, and the mobile
+    // idle-unload gate (the only one covering reindexAll) would then tear the
+    // embedder down mid-build (DISPOSED rethrow aborts the pass). Writers
+    // push/pop their own context; the read is the top of the stack. Pop
+    // removes the LAST occurrence of the caller's context so interleaved
+    // async lifetimes (reindex outliving a modal open) unwind correctly.
+    private taskContextStack: Array<LongTaskEntry['context']> = [];
+    private get currentTaskContext(): LongTaskEntry['context'] {
+        return this.taskContextStack[this.taskContextStack.length - 1] ?? 'idle';
+    }
+    private pushTaskContext(c: LongTaskEntry['context']): void {
+        this.taskContextStack.push(c);
+    }
+    private popTaskContext(c: LongTaskEntry['context']): void {
+        const i = this.taskContextStack.lastIndexOf(c);
+        if (i !== -1) this.taskContextStack.splice(i, 1);
+    }
     private onError: ((e: ErrorEvent) => void) | null = null;
     private onUnhandledRejection: ((e: PromiseRejectionEvent) => void) | null = null;
     private onVisibilityChange: (() => void) | null = null;
@@ -398,7 +416,7 @@ export default class SeekPlugin extends Plugin {
                     && legacySidecarDir && legacySidecarDir !== sidecarIndexDir) {
                     await this.migrateSidecarFiles(legacySidecarDir, sidecarIndexDir);
                 }
-                if (this.settings.sidecarEnabled && sidecarIndexDir) await sweepOrphanTmpFiles(this.app.vault.adapter, sidecarIndexDir);
+                if (this.settings.sidecarEnabled && sidecarIndexDir) await sweepOrphanTmpFiles(this.app.vault.adapter, sidecarIndexDir, this.logger.deviceId);
                 // Version-identity gate BEFORE any catch-up: if the local index was
                 // built under a different chunker/model/revision/dim than this build,
                 // it is stale — hydrate from a matching peer (embed-free) / desktop-
@@ -607,25 +625,35 @@ export default class SeekPlugin extends Plugin {
                     const parsedLimit = typeof args.limit === 'string' ? parseInt(args.limit, 10) : NaN;
                     const topK = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 10;
 
-                    // Query-time recency overrides (scrobbling). rankConfig reads
-                    // this.settings fresh per search, so mutating the live ref here
-                    // takes effect for this call; restored in finally and never
-                    // saved (no saveSettings) → not persisted. Safe against the
-                    // shared modal/CLI settings ref because a headless call has no
-                    // concurrent modal search to race it. Same validation as the UI.
-                    const origRecencyEps = this.settings.recencyEpsilon;
-                    const origRecencyHl = this.settings.recencyHalfLifeDays;
+                    // Query-time recency overrides (scrobbling). Resolved into a
+                    // RecencyOverride and passed straight through to
+                    // orchestrator.search() as a call-local argument — NEVER written
+                    // into this.settings. search() reads this.settings fresh per
+                    // query, and that settings object is shared by reference with
+                    // every concurrent caller (another seek:search CLI call, the
+                    // search modal, openTopResult); mutating it for the override's
+                    // duration used to let a concurrent plain search silently rank
+                    // against this call's override. Passing it as an argument
+                    // instead means overlapping calls simply can't observe each
+                    // other's overrides — nothing shared, nothing to leak. Not
+                    // persisted (no saveSettings) either way. Same validation as
+                    // the UI.
                     const ovEps = typeof args.recencyWeight === 'string' ? parseFloat(args.recencyWeight) : NaN;
                     const ovHl = typeof args.recencyHalflife === 'string' ? parseFloat(args.recencyHalflife) : NaN;
-                    if (Number.isFinite(ovEps) && ovEps >= 0) this.settings.recencyEpsilon = ovEps;
-                    if (Number.isFinite(ovHl) && ovHl > 0) this.settings.recencyHalfLifeDays = ovHl;
+                    const recencyOverride: RecencyOverride | undefined =
+                        (Number.isFinite(ovEps) && ovEps >= 0) || (Number.isFinite(ovHl) && ovHl > 0)
+                            ? {
+                                  ...(Number.isFinite(ovEps) && ovEps >= 0 ? { epsilon: ovEps } : {}),
+                                  ...(Number.isFinite(ovHl) && ovHl > 0 ? { halfLifeDays: ovHl } : {}),
+                              }
+                            : undefined;
 
                     try {
                         // No modal here to overlap the cold-start, so block on the
                         // model load (3–10 s first call) before querying — otherwise
                         // the orchestrator embeds against an unloaded model.
                         await this.ensureModelLoaded();
-                        const { results } = await this.orchestrator.search(query, topK);
+                        const { results } = await this.orchestrator.search(query, topK, recencyOverride);
 
                         // ---- format=json: programmatic / piped callers ---------
                         if (asJson) {
@@ -665,11 +693,6 @@ export default class SeekPlugin extends Plugin {
                         return lines.join('\n').replace(/\n+$/, '');
                     } catch (err) {
                         return fail(err instanceof Error ? err.message : String(err));
-                    } finally {
-                        // Restore the live settings ref regardless of outcome so an
-                        // override never leaks into the next query or the modal.
-                        this.settings.recencyEpsilon = origRecencyEps;
-                        this.settings.recencyHalfLifeDays = origRecencyHl;
                     }
                 },
             );
@@ -1539,7 +1562,7 @@ export default class SeekPlugin extends Plugin {
     }
 
     private openSearchModal(initialQuery = ''): void {
-        this.currentTaskContext = 'search';
+        this.pushTaskContext('search');
         try {
             const wasLoaded = this.embedder.loaded;
             const loadPromise = this.ensureModelLoaded();
@@ -1561,8 +1584,8 @@ export default class SeekPlugin extends Plugin {
             this.logger.appendError('seek-search:open', e).catch(() => {});
             new Notice('Seek: search failed to open — see the developer console.');
         } finally {
-            // Modal lifecycle isn't observable from here; reset to idle after open().
-            this.currentTaskContext = 'idle';
+            // Modal lifecycle isn't observable from here; pop after open().
+            this.popTaskContext('search');
         }
     }
 
@@ -1575,7 +1598,7 @@ export default class SeekPlugin extends Plugin {
         if (!query.trim()) { this.openSearchModal(); return; }
         if (!this.orchestrator) { new Notice('Seek: still loading — try again in a moment'); return; }
         const notice = new Notice(`Seek: searching “${query}”…`, 0);
-        this.currentTaskContext = 'search';
+        this.pushTaskContext('search');
         try {
             // No modal to overlap the cold-start, so block on the model load
             // (3–10 s first call) before querying — same as the CLI handler.
@@ -1593,7 +1616,7 @@ export default class SeekPlugin extends Plugin {
             this.logger.appendError('seek:protocol-open', e).catch(() => {});
             new Notice('Seek: could not open the result — see the developer console.');
         } finally {
-            this.currentTaskContext = 'idle';
+            this.popTaskContext('search');
         }
     }
 
@@ -1777,10 +1800,17 @@ export default class SeekPlugin extends Plugin {
         if (!opts?.skipConfirm) {
             const message = 'This will delete the existing Seek index and re-embed every markdown file in this vault.\nProceed?';
             if (!(await new ConfirmModal(this.app, message).openAndConfirm())) return false;
+            // Re-check: the confirm dialog awaits user input, so a reindex (e.g. the
+            // identity heal, or another caller of this same method) could have started
+            // in that window. Without this, both would proceed past the mutex.
+            if (this.orchestrator.isWriting()) {
+                new Notice('Seek: a reindex is already running.', 4000);
+                return false;
+            }
         }
 
         const notice = new Notice('Seek: full reindex starting…', 0);
-        this.currentTaskContext = 'indexing';
+        this.pushTaskContext('indexing');
         try {
             await this.ensureModelLoaded();
             this.orchestrator.invalidateBm25Cache();
@@ -1819,7 +1849,7 @@ export default class SeekPlugin extends Plugin {
             new Notice('Seek reindex: ❌ failed — see the logging report (Settings → Seek).', 10000);
             return false;
         } finally {
-            this.currentTaskContext = 'idle';
+            this.popTaskContext('indexing');
         }
     }
 

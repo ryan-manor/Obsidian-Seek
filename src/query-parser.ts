@@ -43,18 +43,17 @@ import type { ChunkMeta, QueryFilters, FilterContext, RecencyKeyChoice } from '.
 import { parseDateMs } from './fusion';
 import { toBindForm } from './prop-normalize';
 
-// One character allowed inside an Obsidian tag or property key: any NON-delimiter.
-// Mirrors Obsidian's own tag grammar (https://obsidian.md/help/tags) — which is
-// defined by exclusion, not an allow-list, so it admits letters of every script,
-// digits, AND emoji/symbols in a single rule. Excluded: whitespace, the Unicode
-// General (U+2000–206F) + Supplemental (U+2E00–2E7F) Punctuation blocks, the
-// ASCII punctuation that terminates a tag, and `/` (the nesting separator, which
-// we match BETWEEN segments). `-` and `_` are deliberately kept. So #café,
-// #日本語, #🎉, kebab `#meeting-prep`, and [my-field:…] all bind. (Obsidian also
-// forbids purely-numeric tags like #1984; harmless to over-accept here — such a
-// filter just matches no real tag.)
-const TAG_CH = "[^\\s!-,./:-@\\[-\\^`{-~\\u2000-\\u206F\\u2E00-\\u2E7F]";
-const TAG_RUN = `${TAG_CH}+(?:/${TAG_CH}+)*`; // hierarchical: parent/child/...
+// Shared query-side tokenizer for `-term` negation (see tokenizeForMatch
+// below): the same seekTokenize + processQueryTerm pipeline BM25 itself uses
+// to process a query (bm25.ts distinctQueryTerms), not an ad-hoc duplicate.
+import { seekTokenize } from './tokenize';
+import { processQueryTerm } from './bm25';
+
+// Tag/property-key character grammar — SHARED with the doc-side inline-tag
+// scanner (tag-grammar.ts, where the full derivation comment lives): both
+// sides binding the same characters is what keeps a suggested/typed `#tag`
+// filter able to match what the chunker extracted (audit R2 #2).
+import { TAG_CH, TAG_RUN } from './tag-grammar';
 
 // Ported from search.py:25-30, then widened to Obsidian's full grammar.
 // Alternatives are tried left-to-right at each position, so the bracket and
@@ -73,14 +72,41 @@ const TAG_RUN = `${TAG_CH}+(?:/${TAG_CH}+)*`; // hierarchical: parent/child/...
 //     `[note:a>b]` (operator not adjacent) stay substring.
 // after:/before: are bare prefixed date operators (like path:/tag:); a quoted form
 // is accepted for symmetry though dates carry no spaces.
+//
+// Leading token boundary `(?:^|\s)` (audit R2 #9, same fix shape as
+// NEGATION_RE below) guards only the BARE-PREFIX alternatives — `tag:`,
+// `path:`, `after:`, `before:`, `#tag` — because those are the ones a
+// mid-word substring can spoof: without it, a pasted URL's trailing
+// `#fragment` parsed as a `#tag` filter, and typing "montag:meeting" bound a
+// `tag:` filter on "meeting". Non-capturing so the named groups'
+// indices/positions are untouched; `\s` (not `\s*`) consumes exactly one
+// boundary char, mirrored by the callback returning a single space for a
+// real match, or the untouched `args[0]` (the full match, boundary included)
+// for a no-op fallthrough — either way behavior is identical to before the
+// boundary was added.
+//   The two `[key:value]`/`[key>n]` bracket alternatives deliberately stay
+// OUTSIDE the boundary group: the leading `[` is already a self-delimiting
+// signal (no mid-word-substring risk the way `tag:` or `#` have), so they
+// never needed it. Originally (audit R2 #9) the boundary wrapped the WHOLE
+// alternation, including the brackets — that over-application is what broke
+// two filter tokens placed with zero separating whitespace (e.g.
+// `[a:b][c:d]`, `#tag[key:value]`): the FIRST match consumed its boundary
+// (or matched at `^` with none to give back), so the very next `[`/`#`/etc.
+// sat at a position with no whitespace before it and the shared boundary
+// rejected it, silently dropping every filter after the first (audit R2
+// review-2 #1, verified via `parseQuery('[context:work][pageType:task]')`
+// returning only the first filter). Scoping the boundary to just the
+// literal-prefix alternatives restores pre-R2-#9 bracket-to-bracket (and
+// prefix-to-bracket) adjacency while keeping the mid-word guard where it's
+// actually needed.
 const INLINE_FILTER_RE = new RegExp(
     `\\[(?<ckey>${TAG_CH}+)\\s*(?::\\s*)?(?<cop>[<>=])\\s*(?<cval>[^\\]]+?)\\s*\\]` +
     `|\\[(?<skey>${TAG_CH}+)\\s*:\\s*(?<sval>[^\\]]+?)\\s*\\]` +
-    `|tag:(?<texp>#?${TAG_RUN})` +
+    `|(?:^|\\s)(?:tag:(?<texp>#?${TAG_RUN})` +
     `|path:(?<ipath>"[^"]+"|\\S+)` +
     `|after:(?<dafter>"[^"]+"|\\S+)` +
     `|before:(?<dbefore>"[^"]+"|\\S+)` +
-    `|#(?<thash>${TAG_RUN})`,
+    `|#(?<thash>${TAG_RUN}))`,
     'gu',
 );
 
@@ -89,7 +115,11 @@ const INLINE_FILTER_RE = new RegExp(
 // malformed "197, 344, 218"). A non-number yields null, which the matcher treats
 // as "does not match" — so a numeric comparison is robust even if a value slips
 // past type detection. Mirrors parseDateMs's quote-stripping posture.
-function parseNum(raw: string | null | undefined): number | null {
+// Exported so the pill UI (query-field.ts) can validate a numeric-comparison
+// value with the SAME parser this module's own comparison branch (below) and
+// compileMatcher's numeric clause use — a single source of truth, so a value
+// that fails to parse here also renders as the red error-pill (audit R2 #10).
+export function parseNum(raw: string | null | undefined): number | null {
     const cleaned = String(raw ?? '').trim().replace(/^["']+|["']+$/g, '').trim();
     if (!cleaned) return null;
     const n = Number(cleaned);          // strict: "197, 344, 218" → NaN
@@ -101,21 +131,33 @@ const ONE_DAY_MS = 86_400_000;
 // Inclusive upper bound for `before:D`: the first instant AFTER the whole period
 // D names, so everything up to and including that period is kept. Granularity
 // follows what the user typed — a bare year covers the year, YYYY-MM the month,
-// YYYY-MM-DD the day. UTC-anchored to match parseDateMs (which Date.parses ISO
-// dates as UTC midnight), so both sides of the comparison live in one frame.
-// Returns null when D doesn't parse.
+// YYYY-MM-DD the day. LOCAL-anchored (via the Date constructor's local
+// year/month/day fields, which also normalizes overflow — e.g. day 32 or
+// month 12 rolls into the next period for free) to match parseDateMs's
+// local-midnight treatment of bare dates, so both sides of the comparison
+// live in one frame — a UTC anchor here would roll boundary-day evening
+// events out of range for anyone west of UTC. Returns null when D doesn't
+// parse.
 function endBoundMs(d: string): number | null {
     const cleaned = String(d).trim().replace(/^["'{]+|["'}]+$/g, '').trim();
     let m = /^(\d{4})$/.exec(cleaned);
-    if (m) return Date.parse(`${+m[1] + 1}-01-01T00:00:00Z`);
+    if (m) return new Date(+m[1] + 1, 0, 1).getTime();
     m = /^(\d{4})-(\d{2})$/.exec(cleaned);
-    if (m) {
-        let y = +m[1], mo = +m[2] + 1;
-        if (mo > 12) { mo = 1; y++; }
-        return Date.parse(`${y}-${String(mo).padStart(2, '0')}-01T00:00:00Z`);
-    }
+    if (m) return new Date(+m[1], +m[2], 1).getTime();
     m = /^(\d{4})-(\d{2})-(\d{2})/.exec(cleaned);
-    if (m) return Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) + ONE_DAY_MS;
+    if (m) {
+        // Validate the SYNTACTIC range (month 1-12, day 1-31) before handing
+        // off to the numeric-args Date constructor, which normalizes rather
+        // than rejects out-of-range fields (month 13 silently rolls into next
+        // January) — unlike the old Date.parse-based code this replaced. The
+        // `+1` below is the deliberate exclusive-bound arithmetic (day 31 + 1
+        // = 32, which legitimately rolls into next month "for free" per the
+        // doc comment above) and stays untouched — only the raw typed-in
+        // month/day get validated.
+        const mo = +m[2], day = +m[3];
+        if (mo < 1 || mo > 12 || day < 1 || day > 31) return null;
+        return new Date(+m[1], mo - 1, day + 1).getTime();
+    }
     const base = parseDateMs(cleaned); // a parseable datetime → +1 day from its instant
     return base === null ? null : base + ONE_DAY_MS;
 }
@@ -129,9 +171,10 @@ function filterDate(
     meta: ChunkMeta['metadata'] | undefined,
     dateField: { key: RecencyKeyChoice; createdProp: string },
 ): number | null {
+    const rawProp = dateField.createdProp === 'created' ? meta?.created : meta?.properties?.[dateField.createdProp];
     const prop = dateField.key === 'modified'
         ? meta?.modified
-        : (dateField.createdProp === 'created' ? meta?.created : meta?.properties?.[dateField.createdProp]);
+        : (Array.isArray(rawProp) ? rawProp[0] : rawProp);
     return parseDateMs(prop ?? meta?.modified);
 }
 
@@ -150,25 +193,25 @@ const DEFAULT_DATE_FIELD = { key: 'created' as RecencyKeyChoice, createdProp: 'c
 // single space anyway, so behaviour is identical and the term stays group 1.
 const NEGATION_RE = /(?:^|\s)-(\S+)/g;
 
-// Lucene/Elasticsearch `_english_` 33-word stoplist — kept in sync with
-// bm25.ts ENGLISH_STOPWORDS (duplicated, not imported, to keep this module
-// pure: it must import only types + a date helper so the vitest suite needs no
-// MiniSearch/Obsidian shim). Negation tokenization drops these so `-the` is a
-// no-op, exactly as the BM25 analyzer would treat it.
-const MATCH_STOPWORDS = new Set<string>([
-    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for', 'if', 'in',
-    'into', 'is', 'it', 'no', 'not', 'of', 'on', 'or', 'such', 'that', 'the',
-    'their', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'will', 'with',
-]);
-
-// Lowercase + split on non-(letter|number|underscore), drop empties and
-// stop-words. Approximates MiniSearch's default analyzer closely enough that
-// `-term` excludes the same notes BM25 would consider to contain `term`.
-// Unicode-aware (\p{L}\p{N}) so non-ASCII words tokenize too.
+// Negation tokenization routes through the SAME shared pipeline BM25 query
+// terms use (seekTokenize, default derived:true, then processQueryTerm — see
+// bm25.ts distinctQueryTerms, which follows the identical shape) instead of an
+// ad-hoc fourth tokenizer. The old bare `text.toLowerCase().split(/[^\p{L}\p{N}_]+/u)`
+// + a locally-duplicated stoplist had none of seekTokenize's CJK dictionary
+// segmentation or processQueryTerm's diacritic-fold/depluralize — so `-cat`
+// never suppressed `cats` (no depluralize) and non-Latin negated terms didn't
+// fold correctly (no CJK segmentation). Reusing the real pipeline fixes both
+// and retires the duplicated stoplist (audit R2 #11). This is used
+// symmetrically on BOTH sides of a negation: extracting the excluded token(s)
+// from `-term` below, and scanning the candidate note's title+body in
+// excludedNotePaths() — so as long as both calls route through the one
+// function they can never drift from each other, and now also can't drift
+// from what BM25 itself would consider a match.
 function tokenizeForMatch(text: string): string[] {
     const out: string[] = [];
-    for (const raw of text.toLowerCase().split(/[^\p{L}\p{N}_]+/u)) {
-        if (raw && !MATCH_STOPWORDS.has(raw)) out.push(raw);
+    for (const raw of seekTokenize(text)) {
+        const t = processQueryTerm(raw);
+        if (t) out.push(t);
     }
     return out;
 }
@@ -270,15 +313,26 @@ export function parseQuery(raw: string, ctx?: FilterContext): { cleanedQuery: st
             return ' ';
         }
         // after:/before: bind only when Recency is ON (a date field exists to key
-        // off). Otherwise leave the token verbatim so it falls through to search text.
+        // off) AND the value parses as a date — validated with the SAME function
+        // the compiled matcher will use, so bind and bound can't drift. An
+        // unparseable value (`after:yesterday`) previously bound anyway: the
+        // token was stripped from the text AND compiled to a null bound — the
+        // filter silently vanished from BOTH channels. Verbatim fallthrough
+        // (the Recency-OFF arm) keeps it searchable text instead. (The pill UI
+        // already declines these at commit — this closes the raw-string inlets:
+        // CLI, pasted text.)
         if (dafter !== undefined) {
             if (!dateEnabled) return args[0] as string;
-            dateAfter = stripQuotes(dafter).trim();
+            const v = stripQuotes(dafter).trim();
+            if (parseDateMs(v) === null) return args[0] as string;
+            dateAfter = v;
             return ' ';
         }
         if (dbefore !== undefined) {
             if (!dateEnabled) return args[0] as string;
-            dateBefore = stripQuotes(dbefore).trim();
+            const v = stripQuotes(dbefore).trim();
+            if (endBoundMs(v) === null) return args[0] as string;
+            dateBefore = v;
             return ' ';
         }
         if (thash !== undefined) { tags.push(thash); return ' '; }
@@ -341,6 +395,22 @@ function normalizePropValue(s: string): string {
     return toBindForm(s);
 }
 
+// Case-insensitive property lookup with an exact-case fast path. Property maps
+// are small (a handful of keys), so the fallback scan is cheap and only runs on
+// queries that carry property filters at all.
+function lookupProp(
+    props: Record<string, string | string[]> | undefined,
+    key: string,
+): string | string[] | undefined {
+    if (!props) return undefined;
+    if (props[key] !== undefined) return props[key];
+    const lk = key.toLowerCase();
+    for (const k of Object.keys(props)) {
+        if (k.toLowerCase() === lk) return props[k];
+    }
+    return undefined;
+}
+
 /**
  * Compile a QueryFilters into a fast per-chunk predicate. Globs, lowercased
  * filter tags, numeric clauses, and parsed date bounds are computed ONCE here;
@@ -397,20 +467,35 @@ export function compileMatcher(f: QueryFilters, ctx?: FilterContext): (chunk: Ch
         }
 
         // Frontmatter (Obsidian-style: substring + wikilink-aware by default,
-        // `"quoted"` = whole-value exact). Missing key → reject.
+        // `"quoted"` = whole-value exact). Missing key → reject. Key resolution
+        // is case-INSENSITIVE (exact case fast-path first): Obsidian property
+        // names are display labels ('pageType'), and a hand-typed `[pagetype:…]`
+        // used to reject every chunk with zero signal. List-valued properties
+        // match if ANY element matches (Obsidian's own list-property semantics).
         for (const { key, expected, exact } of fmMatchers) {
-            const actual = meta.properties?.[key];
+            const actual = lookupProp(meta.properties, key);
             if (actual === undefined) return false;
-            const actNorm = normalizePropValue(actual);
-            if (exact ? actNorm !== expected : !actNorm.includes(expected)) return false;
+            const values = Array.isArray(actual) ? actual : [actual];
+            const hit = values.some(v => {
+                const actNorm = normalizePropValue(v);
+                return exact ? actNorm === expected : actNorm.includes(expected);
+            });
+            if (!hit) return false;
         }
 
         // Numeric comparison (value-inclusive). Missing key / non-numeric value →
         // reject (consistent with "missing field → reject"; robust to bad data).
+        // Case-insensitive key resolution as above; a list value satisfies the
+        // clause if ANY element does.
         for (const { key, op, value } of numericClauses) {
-            const n = parseNum(meta.properties?.[key]);
-            if (n === null) return false;
-            if (op === '>' ? n < value : op === '<' ? n > value : n !== value) return false;
+            const actual = lookupProp(meta.properties, key);
+            const values = Array.isArray(actual) ? actual : [actual];
+            const hit = values.some(v => {
+                const n = parseNum(v);
+                if (n === null) return false;
+                return op === '>' ? n >= value : op === '<' ? n <= value : n === value;
+            });
+            if (!hit) return false;
         }
 
         // Date filtering (day-inclusive). Missing/unparseable date → reject.

@@ -3,10 +3,14 @@
 // eviction of IndexedDB on iOS. Lifted from the validated spike at
 // github.com/tooape/embeddinggemmaiostest (baseline commit c7198ce) and adapted
 // for production Seek:
-//   - fixed record stride [q:int8×dim | s:f32 | signbits:ceil(dim/8) | crc] — the
+//   - fixed record stride [q:int8×dim | s:f64 | signbits:ceil(dim/8) | crc] — the
 //     persisted DB v6 tiers verbatim, NOT fp32 (hydration is a byte copy). The
-//     stride is derived from the active model's dim (see Q_BYTES below), so a
-//     model swap re-sizes it automatically; metaAccepts gates cross-dim hydration.
+//     scale is stored at the SAME float64 width IndexedDB's `embeddings` store
+//     keeps it at (quantizeInt8's raw `maxAbs / 127`, never truncated) — a
+//     hydrated peer must dequantize with the bit-identical scale the producer
+//     used, or the two devices' cosine scores diverge on a near-tie. The stride
+//     is derived from the active model's dim (see Q_BYTES below), so a model
+//     swap re-sizes it automatically; metaAccepts gates cross-dim hydration.
 //   - per-device `index.<deviceId>.jsonl` — every file has exactly one writer,
 //     readers union all devices' jsonls. Sync providers never merge, so a shared
 //     jsonl would lose writes / spawn conflict copies (the shared-NDJSON-log
@@ -33,11 +37,17 @@ import { ACTIVE_MODEL_SPEC } from './model-registry';
 // automatically and can never disagree with embedder.EMBEDDING_DIM or the iframe's
 // OUTPUT_DIM. SIGN_BYTES === ceil(dim/8) matches binary.ts packSignBits() exactly.
 export const Q_BYTES = ACTIVE_MODEL_SPEC.dim; // int8 rerank tier, one byte per dim
-export const S_BYTES = 4; // f32 dequant scale (little-endian)
+// f64 dequant scale (little-endian). Was f32 (4 B) — truncating to float32 here
+// while IndexedDB's `embeddings` store kept the untruncated float64 `s` meant a
+// hydrated peer dequantized with a slightly different scale than the originating
+// device, producing ~1e-7 score divergence on near-ties. f64 matches IDB exactly
+// (verbatim byte-copy hydration, as the module header promises) at a cost of 4
+// extra bytes/record (~1% of the 440 B stride).
+export const S_BYTES = 8;
 export const SIGN_BYTES = (Q_BYTES + 7) >> 3; // packed sign bits for the candidate tier (ceil(dim/8))
 export const CRC_BYTES = 4; // CRC-32 over [q|s|sign] — detects in-range sync bit-rot (GAP-1)
-export const RECORD_PAYLOAD_BYTES = Q_BYTES + S_BYTES + SIGN_BYTES; // 436 — the CRC covers exactly this prefix
-export const VEC_BYTES = RECORD_PAYLOAD_BYTES + CRC_BYTES; // 440 — fixed per-record stride
+export const RECORD_PAYLOAD_BYTES = Q_BYTES + S_BYTES + SIGN_BYTES; // 440 — the CRC covers exactly this prefix
+export const VEC_BYTES = RECORD_PAYLOAD_BYTES + CRC_BYTES; // 444 — fixed per-record stride
 export const DIM = Q_BYTES; // logical embedding dimension
 
 // Per-shard cap. Obsidian Sync's default per-file limit is 5 MB; staying at 4 MB
@@ -48,7 +58,11 @@ export const MAX_VECTORS_PER_SHARD = Math.floor(SHARD_CAP_BYTES / VEC_BYTES);
 // Bumped when the on-disk record/meta layout changes (forces a version-gate refusal).
 // 1→2: per-record CRC-32 (GAP-1) widened the record 436→440 B. Old format-1
 // sidecars are refused by metaAccepts and re-hydrated on the next full reindex.
-export const SIDECAR_FORMAT = 2;
+// 2→3: dequant scale f32→f64 (436/440 payload/record → 440/444) so a hydrated
+// peer's scale is bit-identical to IndexedDB's, not just float32-close. Old
+// format-2 sidecars are refused by metaAccepts and re-hydrated on the next full
+// reindex — same self-healing path as the 1→2 bump.
+export const SIDECAR_FORMAT = 3;
 
 // One chunk's persisted tiers — the unit the sidecar stores and hydration writes back.
 export interface TierBytes {
@@ -111,12 +125,12 @@ export function isValidRecord(r: unknown): r is IndexRecord {
     return typeof o.seq === 'number' && typeof o.off === 'number';
 }
 
-// ---- 440 B record codec ----
+// ---- 444 B record codec ----
 
 // CRC-32 (IEEE 802.3) over a byte range. Detects an in-range bit-flip in a synced
 // shard that would otherwise make the sign tier (stage-1) and the int8 tier
 // (stage-2) silently disagree with no detector (GAP-1). Lazy 256-entry table;
-// ~µs per 436 B payload.
+// ~µs per 440 B payload.
 let CRC32_TABLE: Uint32Array | null = null;
 function crc32(bytes: Uint8Array, start: number, end: number): number {
     let table = CRC32_TABLE;
@@ -134,20 +148,20 @@ function crc32(bytes: Uint8Array, start: number, end: number): number {
     return (crc ^ 0xFFFFFFFF) >>> 0;
 }
 
-// Pack one chunk's tiers into a 440 B record: [q:384 | s:f32LE:4 | sign:48 | crc:u32LE:4].
+// Pack one chunk's tiers into a 444 B record: [q:384 | s:f64LE:8 | sign:48 | crc:u32LE:4].
 export function encodeRecord(t: TierBytes): Uint8Array {
     if (t.q.length !== Q_BYTES) throw new Error(`encodeRecord: q length ${t.q.length} != ${Q_BYTES}`);
     if (t.sign.length !== SIGN_BYTES) throw new Error(`encodeRecord: sign length ${t.sign.length} != ${SIGN_BYTES}`);
     const out = new Uint8Array(VEC_BYTES);
     out.set(new Uint8Array(t.q.buffer, t.q.byteOffset, Q_BYTES), 0); // int8 bytes reinterpreted as u8 — same bytes
-    new DataView(out.buffer).setFloat32(Q_BYTES, t.s, true); // little-endian scale
+    new DataView(out.buffer).setFloat64(Q_BYTES, t.s, true); // little-endian scale, full IDB precision
     out.set(t.sign, Q_BYTES + S_BYTES);
     // Trailing CRC-32 over [q|s|sign], little-endian (GAP-1).
     new DataView(out.buffer).setUint32(RECORD_PAYLOAD_BYTES, crc32(out, 0, RECORD_PAYLOAD_BYTES), true);
     return out;
 }
 
-// Slice a 440 B record out of a shard buffer at byte offset `off`. Caller must
+// Slice a 444 B record out of a shard buffer at byte offset `off`. Caller must
 // have validated isOffsetInRange first (or accept a throw on a short buffer).
 // Throws on a CRC mismatch (corrupt record) or a dim≠DIM stride mismatch — both
 // are "skip this record" conditions the hydrate callers catch and treat as null.
@@ -165,7 +179,7 @@ export function decodeRecord(buf: ArrayBuffer, off: number, expectedDim: number 
         throw new Error(`decodeRecord: CRC mismatch at off ${off} (stored ${stored}, computed ${computed}) — corrupt record`);
     }
     const q = new Int8Array(buf.slice(off, off + Q_BYTES));
-    const s = new DataView(buf).getFloat32(off + Q_BYTES, true);
+    const s = new DataView(buf).getFloat64(off + Q_BYTES, true);
     const sign = new Uint8Array(buf.slice(off + Q_BYTES + S_BYTES, off + RECORD_PAYLOAD_BYTES));
     return { q, s, sign };
 }
@@ -245,14 +259,32 @@ export async function listDeviceJsonls(adapter: DataAdapter, indexDir: string): 
     return out.sort();
 }
 
-// Cheap change-signature for the index dir: each device jsonl's (path, size,
-// mtime). Lets the periodic reconcile skip the expensive whole-vault re-chunk
-// when no device file has changed since the last run — a handful of stat calls
-// vs. re-reading and re-chunking every note. Any append (size/mtime) or new
-// device file (path/count) changes the signature; a missing stat sorts to -1.
+// List every device's meta.<deviceId>.json under `indexDir`, sorted, conflict
+// copies excluded. Mirrors listDeviceJsonls; sidecarDirSignature watches these
+// too so a producer's version-gate meta update is never missed.
+export async function listDeviceMetas(adapter: DataAdapter, indexDir: string): Promise<string[]> {
+    if (!(await exists(adapter, indexDir))) return [];
+    const ls = await adapter.list(indexDir).catch(() => ({ folders: [] as string[], files: [] as string[] }));
+    const out: string[] = [];
+    for (const f of ls.files) {
+        if (META_RE.test(baseName(f))) out.push(f);
+    }
+    return out.sort();
+}
+
+// Cheap change-signature for the index dir: each device jsonl's AND meta's (path,
+// size, mtime). Lets the periodic reconcile skip the expensive whole-vault
+// re-chunk when no device file has changed since the last run — a handful of
+// stat calls vs. re-reading and re-chunking every note. Any append (size/mtime)
+// or new device file (path/count) changes the signature; a missing stat sorts to
+// -1. meta.<deviceId>.json is watched alongside the jsonls (not just jsonls
+// alone) because a version-refused producer's meta rewrite — e.g. a
+// chunkerVersion bump after a full reindex — doesn't necessarily land in the
+// same instant as its next jsonl append; omitting it left that meta update
+// unnoticed until the jsonl eventually changed too.
 //
-// `selfDeviceId` (when supplied) excludes the LOCAL device's own jsonl from the
-// signature, so a device's own appends cannot wake its own reconcile — only a
+// `selfDeviceId` (when supplied) excludes the LOCAL device's own jsonl/meta from
+// the signature, so a device's own writes cannot wake its own reconcile — only a
 // PEER change should. Without this, a mobile catch-up burst writing to
 // index.<self>.jsonl flips the signature and self-triggers a whole-vault
 // reChunkLive, the device's own writes endlessly waking its own sweep. Own
@@ -263,9 +295,15 @@ export async function listDeviceJsonls(adapter: DataAdapter, indexDir: string): 
 // comparison to hold.
 export async function sidecarDirSignature(adapter: DataAdapter, indexDir: string, selfDeviceId?: string): Promise<string> {
     const jsonls = await listDeviceJsonls(adapter, indexDir);
+    const metas = await listDeviceMetas(adapter, indexDir);
     const parts: string[] = [];
     for (const p of jsonls) {
         if (selfDeviceId && deviceIdFromJsonlPath(p) === selfDeviceId) continue;
+        const st = await adapter.stat(p).catch(() => null);
+        parts.push(`${p}:${st?.size ?? -1}:${st?.mtime ?? -1}`);
+    }
+    for (const p of metas) {
+        if (selfDeviceId && deviceIdFromArtifactPath(p) === selfDeviceId) continue;
         const st = await adapter.stat(p).catch(() => null);
         parts.push(`${p}:${st?.size ?? -1}:${st?.mtime ?? -1}`);
     }
@@ -289,10 +327,41 @@ export function shouldReconcileSidecar(
     return liveSig !== persistedSig;    // otherwise skip only when nothing changed
 }
 
+// True when `meta` — this DEVICE'S OWN last-written sidecar meta — predates
+// `currentFormat` (defaults to the live SIDECAR_FORMAT). A mismatch means the
+// on-disk shard bytes for this device may still use an OLDER record stride than
+// decodeRecord (fixed to the current S_BYTES/VEC_BYTES constants) expects — a
+// SIDECAR_FORMAT bump is deliberately excluded from identityMatches (it governs
+// only the cross-device file protocol, not local IDB validity — identity.ts), so
+// nothing else forces a full reindex (the only path that clears it via
+// clearDevice) just because the format constant moved. A null meta (fresh
+// install, nothing written yet) is NOT stale — there is nothing on disk to
+// misread. Shared by compactOwnSidecar (refuse to decode + wipe instead of
+// misreading stale-stride bytes as corrupt) and the sidecar-commit write path
+// (wipe before the meta write claims a format the actual bytes don't have yet)
+// so the two call sites can't drift out of sync. Pure so the gate is
+// unit-testable without a SearchOrchestrator harness.
+export function staleSidecarFormat(meta: { format: number } | null, currentFormat: number = SIDECAR_FORMAT): boolean {
+    return meta !== null && meta.format !== currentFormat;
+}
+
 // Extract the owning deviceId from an `index.<deviceId>.jsonl` path, or null if
 // the basename isn't a strict device jsonl (e.g. a conflict copy).
 export function deviceIdFromJsonlPath(path: string): string | null {
     const m = JSONL_RE.exec(baseName(path));
+    return m ? m[1] : null;
+}
+
+// Extract the owning deviceId from ANY per-device sidecar artifact path — shard,
+// jsonl, meta, or the cross-device BM25 blob — or null if the basename doesn't
+// match one of the strict per-device patterns (conflict copy, unrelated file).
+// Shared by every caller that needs "whose file is this", notably
+// sweepOrphanTmpFiles' peer-file guard: a .tmp's REAL name (after stripping
+// '.tmp') matches one of these same four patterns, so this also resolves the
+// owner of an in-flight atomic write.
+function deviceIdFromArtifactPath(path: string): string | null {
+    const b = baseName(path);
+    const m = SHARD_RE.exec(b) ?? JSONL_RE.exec(b) ?? META_RE.exec(b) ?? BM25_RE.exec(b);
     return m ? m[1] : null;
 }
 
@@ -315,9 +384,8 @@ export async function listSidecarDeviceIds(adapter: DataAdapter, indexDir: strin
     const ls = await adapter.list(indexDir).catch(() => ({ folders: [] as string[], files: [] as string[] }));
     const ids = new Set<string>();
     for (const f of ls.files) {
-        const b = baseName(f);
-        const m = SHARD_RE.exec(b) ?? JSONL_RE.exec(b) ?? META_RE.exec(b) ?? BM25_RE.exec(b);
-        if (m) ids.add(m[1]);
+        const dev = deviceIdFromArtifactPath(f);
+        if (dev) ids.add(dev);
     }
     return [...ids].sort();
 }
@@ -520,8 +588,15 @@ export async function writeBytesAtomic(adapter: DataAdapter, path: string, bytes
 // .gz.tmp BM25 artifacts) left by a crashed atomic write.
 //   - real file present alongside .tmp → swap completed/never-started → delete .tmp
 //   - real file missing, .tmp present → crash between remove and rename → restore .tmp
-// Returns the number of files acted on.
-export async function sweepOrphanTmpFiles(adapter: DataAdapter, root: string): Promise<number> {
+// Scoped to `deviceId`'s OWN artifacts only: every atomic write in this module is
+// single-writer (one device writes only its own shard/jsonl/meta/bm25 files), so
+// a .tmp owned by a PEER deviceId is that peer's own in-flight write, still being
+// written or mid-sync — deleting it can erase live in-progress data, and
+// rename-restoring it can promote bytes that aren't fully synced yet. A .tmp
+// whose real name doesn't resolve to any known deviceId (malformed/unexpected) is
+// also left alone — only a name we can positively attribute to the local device
+// is acted on. Returns the number of files acted on.
+export async function sweepOrphanTmpFiles(adapter: DataAdapter, root: string, deviceId: string): Promise<number> {
     if (!(await exists(adapter, root))) return 0;
     let count = 0;
     const queue: string[] = [root];
@@ -533,6 +608,7 @@ export async function sweepOrphanTmpFiles(adapter: DataAdapter, root: string): P
         for (const f of ls.files) {
             if (!f.endsWith('.bin.tmp') && !f.endsWith('.jsonl.tmp') && !f.endsWith('.json.tmp') && !f.endsWith('.gz.tmp')) continue;
             const realPath = f.slice(0, -'.tmp'.length);
+            if (deviceIdFromArtifactPath(realPath) !== deviceId) continue; // not ours — never touch a peer's in-flight write
             try {
                 if (await exists(adapter, realPath)) await adapter.remove(f);
                 else await adapter.rename(f, realPath);
@@ -678,7 +754,9 @@ export interface CompactResult {
     compacted: boolean;
     // why nothing happened (compacted:false), or 'done'. 'incomplete-rechunk' means the
     // live-id oracle reported a skipped note → unsafe to delete → retry next session.
-    reason?: 'below-floor' | 'below-ratio' | 'nothing-dead' | 'incomplete-rechunk' | 'done';
+    // 'format-mismatch' means the caller detected this device's own on-disk sidecar
+    // predates the current SIDECAR_FORMAT and refused to decode it (see compactOwnSidecar).
+    reason?: 'below-floor' | 'below-ratio' | 'nothing-dead' | 'incomplete-rechunk' | 'format-mismatch' | 'done';
     recordsBefore: number; // total jsonl record lines before
     recordsAfter: number;  // live records kept after
     bytesBefore: number;   // total shard bytes before
@@ -727,7 +805,28 @@ export async function compactDevice(
         const nil: CompactResult = { compacted: false, recordsBefore: 0, recordsAfter: 0, bytesBefore: 0, bytesAfter: 0, shed: 0 };
         if (!(await exists(adapter, indexDir))) return nil;
 
-        const shardsBefore = await listDeviceShards(adapter, indexDir, deviceId);
+        let shardsBefore = await listDeviceShards(adapter, indexDir, deviceId);
+
+        // Crash-leak reclaim: a shard whose seq is referenced by ZERO jsonl lines
+        // (not even a dead/superseded one) can only be a leftover from a PRIOR
+        // compaction that crashed between the atomic jsonl swap (the single commit
+        // point, above) and the old-shard delete that follows it — the swapped-in
+        // jsonl already points solely at fresh seqs, so nothing on disk can ever
+        // reference the stale ones again. This must run BEFORE the below-floor /
+        // below-ratio / nothing-dead gates below: those compare record counts
+        // within the CURRENT (already-compacted) jsonl, see nothing dead, and
+        // return early — if the leak check were gated behind them too, a crash
+        // right after the swap would leak the old shards permanently (the fast
+        // path can never "see" bytes the jsonl no longer mentions at all).
+        const { records: rawRecords } = await readJsonl(adapter, jsonlPathFor(indexDir, deviceId));
+        const referencedSeqs = new Set<number>();
+        for (const r of rawRecords) if (!isTombstone(r)) referencedSeqs.add(r.seq);
+        const orphanShards = shardsBefore.filter(s => !referencedSeqs.has(s.seq));
+        if (orphanShards.length > 0) {
+            for (const s of orphanShards) await adapter.remove(s.path).catch(() => {});
+            shardsBefore = shardsBefore.filter(s => referencedSeqs.has(s.seq));
+        }
+
         const bytesBefore = shardsBefore.reduce((sum, s) => sum + s.size, 0);
         if (bytesBefore < minShardBytes) return { ...nil, reason: 'below-floor', bytesBefore };
 

@@ -4,7 +4,7 @@
 // the fence-preservation invariant the code-retrieval eval depends on.
 
 import { describe, it, expect } from 'vitest';
-import { cleanDenseText, cleanDenseBody } from './dense-clean';
+import { cleanDenseText, cleanDenseBody, extractLinkTerms, extractLinkTermsBody } from './dense-clean';
 
 describe('cleanDenseText — wikilinks render as the reader sees them', () => {
     it('keeps the ALIAS (opposite of toDisplayForm)', () => {
@@ -114,5 +114,63 @@ describe('cleanDenseBody — fence-aware', () => {
 
     it('drops a paragraph that cleans to nothing', () => {
         expect(cleanDenseBody('![[cover.jpg]]\n\nreal text')).toBe('real text');
+    });
+});
+
+// v10 lexical reclamation: extractLinkTerms must capture EXACTLY what
+// cleanDenseText drops (audit R2 finding 1 — the v8 clean silently removed
+// wikilink targets and URLs from the BM25 channel too). The cascade mirrors
+// cleanDenseText's order, so a construct can never double-contribute.
+describe('extractLinkTerms — captures what the clean drops', () => {
+    it('captures the aliased wikilink TARGET (the alias stays in the body)', () => {
+        expect(extractLinkTerms('met [[Alex Goel|Alex]] today')).toBe('Alex Goel');
+        expect(extractLinkTerms('[[San Francisco|SF]] trip')).toBe('San Francisco');
+    });
+
+    it('captures the full path/#heading form when display is just the basename', () => {
+        expect(extractLinkTerms('[[Notes/Personal/Places/Zurich]]')).toBe('Notes/Personal/Places/Zurich');
+        expect(extractLinkTerms('[[Project Eames#Status]]')).toBe('Project Eames#Status');
+    });
+
+    it('captures NOTHING for a plain wikilink whose display equals its target', () => {
+        expect(extractLinkTerms('see [[Austin]]')).toBe('');
+    });
+
+    it('captures markdown-link and image URLs (the clipped-blog source case)', () => {
+        expect(extractLinkTerms('[Home](https://theverge.com/x)')).toBe('https://theverge.com/x');
+        expect(extractLinkTerms('![alt](https://x.com/a.png)')).toBe('https://x.com/a.png');
+    });
+
+    it('captures an autolink URL that HTML_TAG_RE would silently eat', () => {
+        expect(extractLinkTerms('source: <https://example.com/post>')).toBe('https://example.com/post');
+    });
+
+    it('captures a bare URL verbatim (scheme/TLD survive for query symmetry)', () => {
+        expect(extractLinkTerms('read https://www.theverge.com/x now')).toBe('https://www.theverge.com/x');
+    });
+
+    it('captures asset-embed filenames (the section text pre-v8 was indexed)', () => {
+        expect(extractLinkTerms('![[Rapha Jersey.png]]')).toBe('Rapha Jersey.png');
+    });
+
+    it('never double-captures a URL inside a markdown link (cascade order)', () => {
+        expect(extractLinkTerms('[x](https://a.com/p)')).toBe('https://a.com/p'); // once, not twice
+    });
+
+    it('returns empty for plain prose and for HTML tags', () => {
+        expect(extractLinkTerms('nothing dropped here')).toBe('');
+        expect(extractLinkTerms('some <b>bold</b> text')).toBe('');
+    });
+});
+
+describe('extractLinkTermsBody — fence-aware (mirror of cleanDenseBody)', () => {
+    it('skips fenced code (its URLs are already in the BM25 body verbatim)', () => {
+        const input = 'see [docs](https://docs.example.com/guide)\n\n```\ncurl https://api.x.com\n```';
+        expect(extractLinkTermsBody(input)).toBe('https://docs.example.com/guide');
+    });
+
+    it('collects across multiple prose atoms', () => {
+        const input = '[[A/B|b]] intro\n\nvisit [site](https://s.io)';
+        expect(extractLinkTermsBody(input)).toBe('A/B https://s.io');
     });
 });

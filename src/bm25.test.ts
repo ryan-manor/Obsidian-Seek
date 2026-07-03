@@ -704,6 +704,30 @@ describe('searchable properties field', () => {
         expect(extractPropertiesText(c)).toBe('Austin personal');
     });
 
+    it('a date-prefixed value keeps its trailing free text (audit R2 batch2 #1)', () => {
+        const c = placeChunk('trip', 'Trip', { trip: '2026-06-29 Milan departure' });
+        expect(extractPropertiesText(c)).toContain('Milan');
+        expect(extractPropertiesText(c)).toContain('departure');
+        // a bare date (no trailing text) is still dropped
+        const bare = placeChunk('bare', 'Bare', { trip: '2026-06-29' });
+        expect(extractPropertiesText(bare)).toBe('');
+        // a date + ISO time-of-day tail (no free text) is still dropped too
+        const withTime = placeChunk('time', 'Time', { trip: '2026-06-29T14:30:00Z' });
+        expect(extractPropertiesText(withTime)).toBe('');
+    });
+
+    it('list-valued properties fold into the field per-item (audit R2 batch2 #3)', () => {
+        const c = makeChunk('rel', 'Project Apollo', 'launch planning notes');
+        c.metadata.properties = { relatedPages: ['Mission Control', 'Ground Crew'], context: 'work' };
+        expect(extractPropertiesText(c)).toBe('Mission Control Ground Crew work');
+    });
+
+    it('a list-valued property is still date/number type-filtered per item', () => {
+        const c = makeChunk('rel2', 'Trip Log', 'a trip log body');
+        c.metadata.properties = { dates: ['2026-06-29', 'Milan'], nums: ['4.5'] };
+        expect(extractPropertiesText(c)).toBe('Milan');
+    });
+
     it('pageType folds into the generic properties field by name (no dedicated page_type field)', () => {
         // De-specialization 2026-06-29: `pageType` (a Task-Notes / this-vault
         // convention, not an Obsidian builtin) no longer gets a dedicated
@@ -900,5 +924,35 @@ describe('BM25_COVERAGE_POW — coordination soft-AND contract (de-franken → p
 
     it('annihilates zero coverage', () => {
         expect(softAnd(0.9, 0)).toBe(0);
+    });
+});
+
+// v10 lexical reclamation: buildDoc folds chunk.link_terms into the content
+// field, restoring the pre-v8 symmetry where a URL/link-target query matched
+// the clipping whose CLEANED body no longer carries those bytes.
+describe('link_terms fold into the content field (v10)', () => {
+    it('a URL query matches ONLY via link_terms — the cleaned body alone cannot', () => {
+        const clipped = makeChunk('a', 'Verge Clipping', 'Read the original at The Verge for details');
+        clipped.link_terms = 'https://www.theverge.com/tech/some-post';
+        const control = makeChunk('b', 'Other Clipping', 'Read the original at The Verge for details');
+        const idx = fitBM([clipped, control]);
+
+        const scores = idx.getScores('theverge.com');
+        expect(scores[0]).toBeGreaterThan(0); // reclaimed: URL tokens live in content
+        expect(scores[1]).toBe(0);            // identical cleaned body, no link_terms → still unfindable
+    });
+
+    it('an aliased wikilink TARGET matches via link_terms', () => {
+        const meeting = makeChunk('a', 'Weekly Sync', 'met with Alex to discuss the roadmap');
+        meeting.link_terms = 'Alex Goel';
+        const idx = fitBM([meeting, makeChunk('b', 'Other', 'unrelated body text')]);
+        expect(idx.getScores('goel')[0]).toBeGreaterThan(0);
+    });
+
+    it('a body-less chunk still indexes its link_terms', () => {
+        const stub = makeChunk('a', 'Image Stub', '');
+        stub.link_terms = 'Rapha Jersey.png';
+        const idx = fitBM([stub]);
+        expect(idx.getScores('rapha jersey')[0]).toBeGreaterThan(0);
     });
 });

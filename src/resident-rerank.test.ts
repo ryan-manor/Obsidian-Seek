@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { quantizeInt8, dequantizeInt8, type QuantVec } from './quant';
-import { buildResidentRerankBlock } from './search';
+import { buildResidentRerankBlock, alignCandidate } from './search';
 import { cosineScores } from './ranker';
+import type { ChunkMeta } from './types';
 
 // Deterministic LCG (matches binary.test.ts) — reproducible, no Math.random.
 function lcg(seed: number) {
@@ -131,5 +132,71 @@ describe('buildResidentRerankBlock — resident dequant is bit-identical to the 
             for (let d = 0; d < DIM; d++) if (f32[d] !== idb[d]) { diverged = true; break; }
         }
         expect(diverged).toBe(true);
+    });
+});
+
+// Minimal chunk factory — only the fields alignCandidate reads/copies matter.
+// Mirrors ranker.test.ts's chunk() helper.
+function metaChunk(note_path: string, opts: { lexicalOnly?: boolean } = {}): ChunkMeta {
+    return {
+        chunk_id: note_path,
+        title: note_path.replace(/\.md$/, ''),
+        note_path,
+        heading_path: [],
+        metadata: { tags: [], aliases: [], created: null, modified: null, properties: {} },
+        start_line: 1,
+        end_line: 1,
+        ...(opts.lexicalOnly && { lexicalOnly: true }),
+    };
+}
+
+// ── alignCandidate — the S2 align loop's degrade-not-drop decision ──────────
+// A candidate whose fp32 row is missing/mismatched (getEmbeddingsByIds' `null`,
+// or a half-migrated/corrupted store) used to be dropped outright, even when
+// BM25 ranked it first. It must instead degrade to the SAME lexical-only floor
+// ranker.ts applies to body-less title-only chunks — see the callsite comment
+// in search.ts.
+describe('alignCandidate', () => {
+    it('passes a chunk with a valid, dimension-matching fp32 row through unchanged', () => {
+        const ch = metaChunk('good.md');
+        const v = new Float32Array(384).fill(0.1);
+        const result = alignCandidate(ch, v, 384);
+        expect(result).not.toBeNull();
+        expect(result!.missingFp32).toBe(false);
+        expect(result!.chunk).toBe(ch); // same reference — no copy when the row is fine
+    });
+
+    it('degrades (not drops) a candidate whose fp32 row is null', () => {
+        const ch = metaChunk('missing-vec.md');
+        const result = alignCandidate(ch, null, 384);
+        expect(result).not.toBeNull();               // NOT dropped
+        expect(result!.missingFp32).toBe(true);
+        expect(result!.chunk.lexicalOnly).toBe(true); // routed to the degradation floor
+        expect(result!.chunk.note_path).toBe('missing-vec.md'); // still the real candidate
+    });
+
+    it('degrades a candidate whose fp32 row has the wrong dimension (corruption/half-migration)', () => {
+        const ch = metaChunk('bad-dim.md');
+        const v = new Float32Array(128).fill(0.1); // wrong dim vs. a 384-d query
+        const result = alignCandidate(ch, v, 384);
+        expect(result!.missingFp32).toBe(true);
+        expect(result!.chunk.lexicalOnly).toBe(true);
+    });
+
+    it('never mutates the caller\'s chunk object when degrading', () => {
+        const ch = metaChunk('shared.md'); // as if shared with orderedChunks across queries
+        alignCandidate(ch, null, 384);
+        expect(ch.lexicalOnly).toBeUndefined(); // the original must stay untouched
+    });
+
+    it('preserves an already-lexicalOnly chunk\'s flag when its row is also missing', () => {
+        const ch = metaChunk('title-only.md', { lexicalOnly: true });
+        const result = alignCandidate(ch, null, 384);
+        expect(result!.chunk.lexicalOnly).toBe(true);
+    });
+
+    it('drops the candidate only when there is no chunk metadata at all', () => {
+        expect(alignCandidate(undefined, new Float32Array(384), 384)).toBeNull();
+        expect(alignCandidate(null, new Float32Array(384), 384)).toBeNull();
     });
 });

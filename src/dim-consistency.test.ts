@@ -49,10 +49,12 @@ describe('dimension derivation holds across widths', () => {
             const signBytes = (d + 7) >> 3;
             expect(packSignBits(new Float32Array(d)).length).toBe(signBytes);
             // S_BYTES + CRC_BYTES are dim-independent; the record stride scales
-            // only via q (d bytes) and the sign tier (ceil(d/8) bytes).
+            // only via q (d bytes) and the sign tier (ceil(d/8) bytes). Compare
+            // against the symbolic constants (not a hardcoded byte count) so this
+            // stays correct across a deliberate S_BYTES/CRC_BYTES width change.
             const payload = d + S_BYTES + signBytes;
             const stride = payload + CRC_BYTES;
-            expect(stride).toBe(d + 4 + signBytes + 4);
+            expect(stride).toBe(d + S_BYTES + signBytes + CRC_BYTES);
         });
     }
 });

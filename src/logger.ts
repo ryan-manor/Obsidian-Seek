@@ -94,6 +94,12 @@ const CAPTURE_PREFIX = 'seek-captures-';
 // then the string is sliced by JS length) — fine for a coarse retention cap.
 const MAX_LOG_BYTES = 1 * 1024 * 1024;   // rotate once a device log passes ~1 MB
 const KEEP_LOG_BYTES = 512 * 1024;       // …retaining ~the most recent 512 KB (file stays bounded at ~1 MB)
+// rotateIfOversize used to run load-only, so a session left open for weeks (no
+// reload → no rotation check) could grow past MAX_LOG_BYTES unbounded. append()
+// now also probes opportunistically every this-many lines — cheap (a single
+// stat()) and self-throttling, so a long session still gets capped without a
+// timer (which would need its own idle/teardown handling).
+const ROTATE_CHECK_INTERVAL_APPENDS = 200;
 // Errors are deduped by MESSAGE (the failure identity) — NOT context+message, because
 // the same fault is logged from many call sites (an "iframe not initialized" storm
 // carries ~hundreds of distinct contexts but one message, so context+message would
@@ -112,6 +118,27 @@ const ORPHAN_LOG_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;   // 30 days
 // device-local (NOT vault-synced) and survives plugin reloads — exactly the
 // scope we need: desktop and phone get distinct ids even on the same vault.
 const DEVICE_ID_KEY = 'seek-device-id-v1';
+// Local-only "last generation I personally wrote" counter. Every writeInit()
+// stamps a fresh monotonic generation into this device's per-device init file
+// and remembers it here. A cloned/restored device (e.g. an iOS backup/restore)
+// clones localStorage wholesale, so right after the clone both installs agree
+// on DEVICE_ID_KEY *and* this counter — but they diverge the moment either one
+// writes again. See detectCloneCollision, which uses the divergence as the
+// collision signal.
+//
+// Namespaced per pluginId (via deviceGenKey(), NOT used bare) — unlike
+// DEVICE_ID_KEY, which is deliberately origin-global because deviceId
+// identifies the physical device and co-installed builds (e.g. seek +
+// seek-prototype) are meant to share it. This counter tracks provenance for
+// THIS install's own per-device init FILE (initPath, which — unlike
+// deviceId — IS pluginId-scoped via logDirFor). A bare/shared key here would
+// have every co-installed build's writeInit() bump the SAME counter while
+// checking it against DIFFERENT files: build B's write bumps the counter,
+// then build A's next writeInit() compares ITS OWN (unmoved) file against the
+// now-B-advanced counter, mismatches, and false-positives a clone collision —
+// wiping DEVICE_ID_KEY out from under every co-installed build sharing the
+// device, on a single real, non-cloned machine.
+const DEVICE_GEN_KEY = 'seek-device-gen-v1';
 
 // crypto.randomUUID with a Math.random fallback (mirrors iframe-runner). Used
 // for the device id (once) and the per-load session id.
@@ -172,15 +199,33 @@ export class SeekLogger {
     // Plugin-scoped per-device log directory (logDirFor) — a co-installed build
     // writes into its own folder, not a sibling's. 'seek' → the historical path.
     private readonly logDir: string;
+    // Retained so the clone-collision generation counter (DEVICE_GEN_KEY, below)
+    // can be namespaced per co-installed build — see deviceGenKey().
+    private readonly pluginId: string;
+    // Serializes append() calls onto this device's own log file so two near-
+    // simultaneous callers (e.g. a search trace and an error firing in the same
+    // tick) can never both observe the file absent and both take the create
+    // branch — the second `write()` would silently clobber the first's line.
+    // Cross-process writers to the SAME path are a non-goal (mirrors sidecar.ts's
+    // identical NON-GOAL note): only this plugin instance ever appends here, so
+    // an in-process queue is sufficient.
+    private appendQueue: Promise<void> = Promise.resolve();
+    // Opportunistic-rotation counter — see ROTATE_CHECK_INTERVAL_APPENDS.
+    private appendsSinceRotateCheck = 0;
     constructor(app: App, pluginId: string) {
         this.app = app;
         this.logDir = logDirFor(pluginId);
+        this.pluginId = pluginId;
         this.deviceId = resolveDeviceId();
         this.sessionId = randId();
     }
 
     private logPath(): string { return `${this.logDir}/${LOG_PREFIX}${this.deviceId}.ndjson`; }
     private initPath(): string { return `${this.logDir}/${INIT_PREFIX}${this.deviceId}.json`; }
+    // Namespaced by pluginId — see DEVICE_GEN_KEY's doc comment for why a bare,
+    // origin-global key is wrong here even though deviceId itself is correctly
+    // origin-global (shared on purpose across co-installed builds).
+    private deviceGenKey(): string { return `${DEVICE_GEN_KEY}:${this.pluginId}`; }
 
     // mkdir LOG_DIR if absent. Idempotent and best-effort: the parent
     // .obsidian/plugins/seek folder always exists (the plugin loads from it), so
@@ -199,12 +244,36 @@ export class SeekLogger {
         return { ...entry, deviceId: this.deviceId, sessionId: this.sessionId };
     }
 
+    // Queues onto appendQueue rather than writing directly — see the field doc.
+    // appendLine never rejects (every I/O path below is self-caught), so chaining
+    // never poisons later callers.
     async append(entry: LogEntry): Promise<void> {
         const stamped = this.stamp(entry);
         const line = JSON.stringify(stamped) + '\n';
+        const run = this.appendQueue.then(() => this.appendLine(line));
+        this.appendQueue = run;
+        return run;
+    }
+
+    private async appendLine(line: string): Promise<void> {
         const adapter = this.app.vault.adapter;
         await this.ensureDir();
         const path = this.logPath();
+        // Opportunistic rotation: piggyback the size check onto the write path
+        // itself (throttled) so a session left open for weeks still gets capped,
+        // not just at plugin load (see rotateIfOversize / ROTATE_CHECK_INTERVAL_APPENDS).
+        // Runs inside the same serialized queue as the append below, so it can
+        // never race the write it's protecting.
+        if (++this.appendsSinceRotateCheck >= ROTATE_CHECK_INTERVAL_APPENDS) {
+            this.appendsSinceRotateCheck = 0;
+            // Calls the unqueued core directly, NOT the public rotateIfOversize()
+            // wrapper below — appendLine is already running as the resolution of
+            // appendQueue, so re-entering through the public wrapper (which chains
+            // a new link onto appendQueue and awaits it) would deadlock: the new
+            // link can't resolve until this appendLine call returns, and this call
+            // can't return until the new link resolves.
+            await this.rotateIfOversizeLocked();
+        }
         const exists = await adapter.exists(path).catch(() => false);
         if (!exists) {
             try { await adapter.write(path, line); }
@@ -229,10 +298,74 @@ export class SeekLogger {
     async writeInit(entry: InitEntry): Promise<void> {
         try {
             await this.ensureDir();
-            await this.app.vault.adapter.write(this.initPath(), JSON.stringify(this.stamp(entry), null, 2));
+            await this.detectCloneCollision();
+            const gen = (this.lastWrittenGeneration() ?? 0) + 1;
+            // `_gen` rides along outside the InitEntry union on purpose — it's a
+            // logger-internal bookkeeping field for detectCloneCollision, not part
+            // of the diagnostic schema other code reads.
+            const payload = { ...this.stamp(entry), _gen: gen };
+            await this.app.vault.adapter.write(this.initPath(), JSON.stringify(payload, null, 2));
+            this.rememberWrittenGeneration(gen);
         } catch (e) {
             console.error('[seek] init file write failed:', e);
         }
+    }
+
+    // Last generation THIS install remembers writing to its own init file, or
+    // null if it's never recorded one (fresh install, or an upgrade from before
+    // this field existed).
+    private lastWrittenGeneration(): number | null {
+        try {
+            const raw = window.localStorage.getItem(this.deviceGenKey());
+            const n = raw === null ? NaN : Number(raw);
+            return Number.isFinite(n) ? n : null;
+        } catch { return null; }
+    }
+
+    private rememberWrittenGeneration(gen: number): void {
+        try { window.localStorage.setItem(this.deviceGenKey(), String(gen)); } catch { /* best-effort */ }
+    }
+
+    // Detect a cloned-device deviceId collision. This device's per-device init file
+    // (initPath) is meant to have exactly one writer — this install — and every
+    // writeInit() stamps a local monotonic generation into it (see `_gen` above),
+    // remembering the value it wrote via rememberWrittenGeneration. If the file
+    // we're about to overwrite already carries a *different* generation than the
+    // one we last wrote ourselves, some OTHER install sharing our deviceId has
+    // been writing here too — e.g. an iOS backup/restore clones localStorage
+    // wholesale (DEVICE_ID_KEY *and* DEVICE_GEN_KEY together), so two live devices
+    // end up agreeing on both at the moment of the clone and only diverge once
+    // either writes again. That divergence is the "generation jump we can't
+    // account for" signal. Narrow and best-effort: a missing/unreadable/malformed
+    // file, or no locally-remembered generation yet (fresh install, or first run
+    // after upgrading onto this field), is never treated as a collision — there's
+    // no baseline to compare against.
+    private async detectCloneCollision(): Promise<void> {
+        try {
+            const raw = await this.app.vault.adapter.read(this.initPath());
+            const parsed = JSON.parse(raw) as { _gen?: unknown };
+            const fileGen = typeof parsed._gen === 'number' ? parsed._gen : null;
+            const expected = this.lastWrittenGeneration();
+            if (fileGen === null || expected === null || fileGen === expected) return;
+            const reason = `deviceId "${this.deviceId}" init file is at generation ${fileGen}, this install last wrote ${expected} — a write landed on our per-device file that we didn't make (likely a cloned/restored device sharing this deviceId)`;
+            await this.appendError('device-clone-detected', new Error(reason)).catch(() => {});
+            this.regenerateDeviceId(reason);
+        } catch { /* file absent/unreadable/malformed — nothing to compare, not a collision */ }
+    }
+
+    // Wipe this install's persisted identity so the NEXT load mints a fresh,
+    // uncontended deviceId (resolveDeviceId generates + persists a new one when
+    // DEVICE_ID_KEY is absent). Deliberately does NOT swap `this.deviceId` for the
+    // rest of THIS session — it's already baked into this session's log/init
+    // paths and captured independently by other modules at load (e.g. Forensics).
+    // Live-swapping it mid-session would need a wider identity-propagation change;
+    // this is detect-and-regenerate, not that.
+    private regenerateDeviceId(reason: string): void {
+        try {
+            window.localStorage.removeItem(DEVICE_ID_KEY);
+            window.localStorage.removeItem(this.deviceGenKey());
+        } catch { /* best-effort */ }
+        console.error(`[seek] cloned-device collision — regenerating deviceId on next load: ${reason}`);
     }
 
     async appendError(context: string, e: unknown): Promise<void> {
@@ -344,14 +477,33 @@ export class SeekLogger {
         }
     }
 
-    // Tail-truncate THIS device's log if it has grown past MAX_LOG_BYTES, keeping the
-    // most recent KEEP_LOG_BYTES. Best-effort and load-only (never in the append hot
-    // path); per-device files mean each device only ever trims its own stream. stat
-    // gives a cheap size probe so an in-bounds log is never fully read just to measure;
-    // when stat is unavailable we fall back to a single startup read. The cut is
-    // advanced to the next '\n' so the retained head starts on a clean line boundary —
-    // and parseLog already skips any malformed line, so a worst-case slice is harmless.
+    // Public entry point — called directly from main.ts's onload chain, OUTSIDE
+    // appendQueue (it runs before any append() has queued anything). Queues onto
+    // appendQueue itself so that call can never race a concurrently-queued
+    // append() (e.g. onload's crash-forensics append a few lines later): both a
+    // read-then-overwrite rotation and a plain append mutate the same file, and
+    // without this the rotation's read could predate an append's write while its
+    // own write lands after, silently reverting the just-appended line. The
+    // opportunistic call from inside appendLine (already running as part of the
+    // queue) goes straight to rotateIfOversizeLocked instead — see that call site.
     async rotateIfOversize(): Promise<void> {
+        const run = this.appendQueue.then(() => this.rotateIfOversizeLocked());
+        this.appendQueue = run;
+        return run;
+    }
+
+    // Tail-truncate THIS device's log if it has grown past MAX_LOG_BYTES, keeping the
+    // most recent KEEP_LOG_BYTES. Best-effort; per-device files mean each device only
+    // ever trims its own stream. Called both at load (main.ts's onload chain, via the
+    // queued rotateIfOversize() wrapper above) and opportunistically from the append
+    // hot path itself every ROTATE_CHECK_INTERVAL_APPENDS lines (appendLine, directly —
+    // see that call site), so a session that stays open for weeks without a reload
+    // still gets capped. stat gives a cheap size probe so an in-bounds log is never
+    // fully read just to measure; when stat is unavailable we fall back to a single
+    // read. The cut is advanced to the next '\n' so the retained head starts on a
+    // clean line boundary — and parseLog already skips any malformed line, so a
+    // worst-case slice is harmless.
+    private async rotateIfOversizeLocked(): Promise<void> {
         const adapter = this.app.vault.adapter;
         const path = this.logPath();
         try {

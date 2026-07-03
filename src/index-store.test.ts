@@ -208,11 +208,16 @@ describe('classifyFileDelta', () => {
 
     it('unchanged mtime is clean without reading bytes', () => {
         expect(classifyFileDelta(rec(1000, 'aaa'), 1000)).toBe('clean'); // equal
-        expect(classifyFileDelta(rec(1000, 'aaa'), 999)).toBe('clean');  // older (clock skew)
     });
 
     it('mtime advanced on a hash-bearing record asks for the bytes', () => {
         expect(classifyFileDelta(rec(1000, 'aaa'), 2000)).toBe('check-bytes');
+    });
+
+    it('mtime REGRESSION (restored/reverted file) is checked, not silently clean', () => {
+        expect(classifyFileDelta(rec(1000, 'aaa'), 999)).toBe('check-bytes');
+        expect(classifyFileDelta(rec(1000, 'aaa'), 999, 'aaa')).toBe('clean'); // clock skew, same bytes
+        expect(classifyFileDelta(rec(1000, 'aaa'), 999, 'bbb')).toBe('dirty'); // backup restore — bytes changed
     });
 
     it('mtime-only re-stamp (identical bytes) is clean — the churn fix', () => {

@@ -430,13 +430,21 @@ export const MACHINERY_KEYS = new Set([
 // everything-but-machinery posture, not a curated allowlist. `pageType` used to
 // be excluded here (it had a dedicated `page_type` field); that field is gone,
 // so it now flows through this catch-all by name like any other scalar prop.
-// Compared lowercased; chunker's extractProperties stores SCALARS only, so
-// list-valued props (relatedPages-style) never reach this field at all.
+// Compared lowercased against every key, scalar or list-valued alike —
+// extractPropertiesText below folds a list value's items in per-element (audit
+// R2 batch2 #3), so a list-valued key excluded here (e.g. a future dedicated
+// field) is excluded the same way a scalar one would be.
 const PROPERTY_EXCLUDE_KEYS = new Set([
     'tags', 'aliases', 'alias', 'created', 'modified', 'datelink',
     ...MACHINERY_KEYS,
 ]);
-const PROPERTY_DATE_RE = /^\d{4}-\d{2}-\d{2}/;
+// Anchored BOTH ends (audit R2 batch2 #1): a bare date or ISO date+time is
+// inert (dates are queryable via [key:value] filters, which read the same
+// backing store untouched) but a date-PREFIXED value that carries trailing
+// free text ("2026-06-29 Milan departure") is not — the old prefix-only test
+// (no trailing `$`) matched on the date alone and dropped the whole value,
+// silently swallowing "Milan departure" out of the lexical channel.
+const PROPERTY_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/i;
 const PROPERTY_NUM_RE = /^-?[\d., ]+$/;
 
 // Property VALUES -> plain text for the `properties` field. Not a custom
@@ -455,9 +463,18 @@ export function extractPropertiesText(chunk: ChunkMeta): string {
     const vals: string[] = [];
     for (const [key, raw] of Object.entries(props)) {
         if (PROPERTY_EXCLUDE_KEYS.has(key.toLowerCase())) continue;
-        const v = toDisplayForm(String(raw).replace(/^["']|["']$/g, ''));
-        if (!v || PROPERTY_DATE_RE.test(v) || PROPERTY_NUM_RE.test(v)) continue;
-        vals.push(v);
+        // List values (stored as string[] since v10 for the FILTER matcher) used
+        // to be skipped here entirely, leaving them dense-suffix-only — a
+        // relatedPages-style list was BM25-invisible even with a scalar sibling
+        // property fully indexed (audit R2 batch2 #3). Folded in per-item through
+        // the SAME normalize/type-drop gates as a scalar value, joined with the
+        // rest — consistent with how the scalar half of this field is built.
+        const items = Array.isArray(raw) ? raw : [raw];
+        for (const item of items) {
+            const v = toDisplayForm(String(item).replace(/^["']|["']$/g, ''));
+            if (!v || PROPERTY_DATE_RE.test(v) || PROPERTY_NUM_RE.test(v)) continue;
+            vals.push(v);
+        }
     }
     return vals.join(' ');
 }
@@ -535,12 +552,19 @@ export class MultiFieldBM25 {
     // incremental add() so a row appended live is byte-for-byte the same document
     // a full refit would have produced for that chunk.
     private buildDoc(c: ChunkMeta, body: string): IndexedDoc {
+        // link_terms: the raw substrings the v8 dense-clean dropped from this
+        // chunk's section (wikilink targets, markdown-link/autolink URLs — see
+        // dense-clean.ts extractLinkTerms). Folded into `content` rather than a
+        // new field because pre-v8 these bytes lived IN the body at content
+        // weight — this is restoration of the query↔doc analyzer symmetry
+        // (`theverge.com` matching a clipping's source link), not a new lever.
+        const lt = c.link_terms;
         return {
             chunk_id: c.chunk_id,
             title: extractNoteName(c),
             aliases: extractAliasesText(c),
             tags: extractTagsText(c),
-            content: body,
+            content: lt ? (body ? `${body}\n${lt}` : lt) : body,
             ...(this.withProps && { properties: extractPropertiesText(c) }),
             ...(this.withHeadings && { headings: extractHeadingsText(c) }),
         };

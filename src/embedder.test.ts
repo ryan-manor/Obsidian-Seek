@@ -73,6 +73,84 @@ function mkLoad() {
     return { e, fr };
 }
 
+// A runner stub whose load() is GATED (holds open until the test releases it),
+// so a test can pause recycle() mid-reload and fire a concurrent load() into
+// the gap — the exact window the R2B2 "recycle bypasses _loadPromise" bug
+// lived in. init() resolves synchronously ready (recycle's own rebuild step
+// isn't what's under test here).
+function fakeRecycleRunner() {
+    let initCalls = 0;
+    let loadCalls = 0;
+    let loadEntries = 0;   // incremented BEFORE the gate — proof runner.load() was reached
+    let live = false;
+    let release!: () => void;
+    let gate = new Promise<void>((res) => { release = res; });
+    return {
+        initCalls: () => initCalls,
+        loadCalls: () => loadCalls,
+        loadEntries: () => loadEntries,
+        releaseLoad: () => release(),
+        dispose: () => { live = false; },
+        init: async () => {
+            initCalls++;
+            live = true;
+            return {
+                buildTimestamp: 't', cdnUrl: 'c', transformersVersion: '4.2.0',
+                ready: true, error: null, initMs: 1,
+            };
+        },
+        load: async () => {
+            if (!live) throw new Error('iframe not initialized');
+            loadEntries++;
+            await gate;
+            loadCalls++;
+            return {
+                device: 'wasm', dtype: 'q4', coldStartMs: 1,
+                warmupMs: null, warmupSkipped: false,
+                webgpuAttempted: false, webgpuError: null, glue: null,
+            };
+        },
+    };
+}
+
+// A runner stub whose init() is GATED (holds open until the test releases it),
+// so a test can pause recycle() mid-REBUILD — before its rebuild promise ever
+// resolves, i.e. before recycle's own loadImpl() has reached runner.load() —
+// and fire a concurrent load() into that earlier gap. This is the window the
+// R2B2 fix's own _loadPromise assignment (after `await rebuild`) left open;
+// fakeRecycleRunner above only exercises the later, already-fixed window.
+function fakeRecycleRunnerGatedInit() {
+    let initCalls = 0;
+    let loadCalls = 0;
+    let live = false;
+    let releaseInit!: () => void;
+    const initGate = new Promise<void>((res) => { releaseInit = res; });
+    return {
+        initCalls: () => initCalls,
+        loadCalls: () => loadCalls,
+        releaseInit: () => releaseInit(),
+        dispose: () => { live = false; },
+        init: async () => {
+            initCalls++;
+            await initGate;
+            live = true;
+            return {
+                buildTimestamp: 't', cdnUrl: 'c', transformersVersion: '4.2.0',
+                ready: true, error: null, initMs: 1,
+            };
+        },
+        load: async () => {
+            if (!live) throw new Error('iframe not initialized');
+            loadCalls++;
+            return {
+                device: 'wasm', dtype: 'q4', coldStartMs: 1,
+                warmupMs: null, warmupSkipped: false,
+                webgpuAttempted: false, webgpuError: null, glue: null,
+            };
+        },
+    };
+}
+
 describe('iframe init coalescing (startup deferral)', () => {
     it('a load() fired before init resolves WAITS for it (no \'iframe not initialized\')', async () => {
         const { e, fr } = mkLoad();
@@ -138,6 +216,26 @@ describe('iframe init coalescing (startup deferral)', () => {
         await e.recycle();                     // dispose + direct runner.init + repopulate
         expect((e as unknown as { _initPromise: unknown })._initPromise).not.toBeNull();
     });
+
+    it('teardown() resets the tokenizer latch so ensureTokenizer re-loads on the fresh runner', async () => {
+        const e = new LocalEmbedder();
+        let tokLoads = 0;
+        const fr = { loadTokenizer: async () => { tokLoads++; }, dispose: () => {} };
+        (e as unknown as { runner: unknown }).runner = fr;
+
+        await e.ensureTokenizer();
+        expect(tokLoads).toBe(1);
+        await e.ensureTokenizer();             // latched — idempotent while the iframe lives
+        expect(tokLoads).toBe(1);
+
+        // The tokenizer dies with the disposed iframe. If the latch survives
+        // teardown, ensureTokenizer short-circuits forever and every
+        // tokenCounts() hits a tokenizer-less iframe ('iframe not initialized').
+        e.teardown();
+        (e as unknown as { runner: unknown }).runner = fr;   // re-stub the fresh runner
+        await e.ensureTokenizer();
+        expect(tokLoads).toBe(2);              // re-loaded, not short-circuited
+    });
 });
 
 describe('load single-flight + recycle memo (F4 / ADJ-1)', () => {
@@ -176,6 +274,75 @@ describe('load single-flight + recycle memo (F4 / ADJ-1)', () => {
         // init() succeeded inside recycle but load() failed: the memo must NOT pin a
         // resolved "ready" entry for a pipeline that never loaded.
         expect((e as unknown as { _initPromise: unknown })._initPromise).toBeNull();
+    });
+
+    it('a load() fired mid-recycle coalesces onto recycle\'s own latch, not a second runner.load() (R2B2)', async () => {
+        const e = new LocalEmbedder();
+        const fr = fakeRecycleRunner();
+        (e as unknown as { runner: unknown }).runner = fr;
+        (e as unknown as { _loaded: boolean })._loaded = true;   // recycling an already-loaded pipeline
+
+        const recycleP = e.recycle();
+        // Let recycle's own reload reach runner.load() (gated open) before firing
+        // the concurrent caller — this is also the point _loadPromise is set.
+        while (fr.loadEntries() < 1) await Promise.resolve();
+        expect((e as unknown as { _loadPromise: unknown })._loadPromise).not.toBeNull();
+
+        const loadP = e.load('wasm', 'q4');   // e.g. main.ts's ensureModelLoaded firing on _loaded flipping false
+
+        fr.releaseLoad();
+        await Promise.all([recycleP, loadP]);
+        expect(fr.loadCalls()).toBe(1);       // NOT two concurrent ~250 MB loads stacked (jetsam)
+        expect(fr.loadEntries()).toBe(1);
+    });
+
+    it('a load() fired during recycle\'s iframe-rebuild phase (before runner.load() is ever reached) coalesces onto recycle, not a second runner.init()/load() (adversarial R2B2)', async () => {
+        const e = new LocalEmbedder();
+        const fr = fakeRecycleRunnerGatedInit();
+        (e as unknown as { runner: unknown }).runner = fr;
+        (e as unknown as { _loaded: boolean })._loaded = true;   // recycling an already-loaded pipeline
+
+        const recycleP = e.recycle();
+        // Let recycle reach runner.init() (dispose + rebuild kicked off) but NOT
+        // resolve it — this is the window BEFORE recycle's own loadImpl() could
+        // possibly have reached runner.load(). The fix must set _loadPromise
+        // synchronously here, before the rebuild ever settles.
+        while (fr.initCalls() < 1) await Promise.resolve();
+        expect((e as unknown as { _loadPromise: unknown })._loadPromise).not.toBeNull();
+
+        const loadP = e.load('wasm', 'q4');   // races in during the rebuild window itself
+
+        fr.releaseInit();
+        await Promise.all([recycleP, loadP]);
+        expect(fr.initCalls()).toBe(1);   // no second iframe rebuild triggered by the racing load()
+        expect(fr.loadCalls()).toBe(1);   // NOT two concurrent ~250 MB loads stacked (jetsam)
+    });
+
+    it('embed() during the recycle window awaits the in-flight latch instead of throwing "Model not loaded" (R2B2)', async () => {
+        const e = new LocalEmbedder();
+        const fr = fakeRecycleRunner();
+        (e as unknown as { runner: unknown }).runner = fr;
+        (e as unknown as { _loaded: boolean })._loaded = true;
+        // embed() needs runner.embed() once recycle settles.
+        (fr as unknown as { embed: (t: string) => Promise<{ vector: Float32Array; latencyMs: number }> }).embed =
+            async (text: string) => ({ vector: new Float32Array([text.length, 0, 0, 0]), latencyMs: 3 });
+
+        const recycleP = e.recycle();
+        while (fr.loadEntries() < 1) await Promise.resolve();
+        expect((e as unknown as { _loaded: boolean })._loaded).toBe(false);   // the recycle window
+
+        const embedP = e.embed('swiss hotels');   // a concurrent query fired during the recycle window
+
+        fr.releaseLoad();
+        await recycleP;
+        const result = await embedP;               // resolves once recycle settles — no raw "Model not loaded"
+        expect(result.vector.length).toBe(4);
+    });
+
+    it('embed() still throws "Model not loaded" when nothing is in flight', async () => {
+        const { e } = mk();
+        (e as unknown as { _loaded: boolean })._loaded = false;
+        await expect(e.embed('x')).rejects.toThrow(/Model not loaded/);
     });
 });
 

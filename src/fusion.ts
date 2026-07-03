@@ -59,7 +59,9 @@ export interface RecencyChunk {
     metadata?: {
         created?: string | null;
         modified?: string | null;
-        properties?: Record<string, string>;
+        // string[] since v10 (list-valued props stored for the filter matcher);
+        // date reads take the FIRST element of a (pathological) list value.
+        properties?: Record<string, string | string[]>;
     };
 }
 
@@ -85,9 +87,11 @@ export function recencyDate(
     createdProp = 'created',
 ): string | null {
     const meta = chunk?.metadata;
+    const rawProp = meta?.properties?.[createdProp];
+    const propCreated = Array.isArray(rawProp) ? rawProp[0] : rawProp;
     const created = (createdProp === 'created'
         ? meta?.created
-        : meta?.properties?.[createdProp] ?? meta?.created)
+        : propCreated ?? meta?.created)
         ?? filenameDate(chunk?.note_path);
     if (key === 'modified') return meta?.modified ?? created ?? null;
     return created ?? meta?.modified ?? null;
@@ -98,21 +102,46 @@ export interface RecencyOptions {
     referenceDateMs?: number;
 }
 
+// A bare "YYYY-MM-DD" (no time-of-day) → LOCAL midnight, not UTC. Matches the
+// convention already used for displaying created dates (search-modal.ts
+// fmtCreated): native Date.parse treats a date-ONLY ISO string as UTC
+// midnight, which rolls the calendar day back a day for anyone west of UTC.
+// A full timestamp (with or without an explicit offset) is unaffected — it
+// already falls through to native Date.parse, which resolves those as local
+// time (no offset) or the given offset, not UTC.
+function localDateOnlyMs(y: string, mo: string, d: string): number | null {
+    // The numeric-args Date constructor NORMALIZES out-of-range fields instead
+    // of rejecting them (month 13 rolls into next January, day 32 rolls into
+    // the next month) — unlike the old Date.parse-based code, which validated
+    // month∈[1,12] and day∈[1,31] syntactically before falling to calendar
+    // arithmetic for in-range-but-nonexistent combinations (e.g. Feb 30 →
+    // rolls to Mar 2, unchanged here). Reject the syntactically-invalid case
+    // so a typo'd month/day (e.g. `created: 2026-13-01`) degrades to null —
+    // as documented on parseDateMs's callers — instead of silently landing on
+    // a wrong date.
+    const moNum = Number(mo), dNum = Number(d);
+    if (moNum < 1 || moNum > 12 || dNum < 1 || dNum > 31) return null;
+    const dt = new Date(Number(y), moNum - 1, dNum);
+    return isNaN(dt.getTime()) ? null : dt.getTime();
+}
+
 export function parseDateMs(dateStr: string | null | undefined): number | null {
     if (!dateStr) return null;
     const cleaned = String(dateStr).trim().replace(/^["'{]+|["'}]+$/g, '').trim();
     if (!cleaned) return null;
 
-    // Native Date.parse handles ISO 8601, "YYYY-MM-DD", and most variations.
+    const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(cleaned);
+    if (dateOnly) return localDateOnlyMs(dateOnly[1], dateOnly[2], dateOnly[3]);
+
+    // Native Date.parse handles ISO 8601 timestamps (local or offset-bearing)
+    // and most other variations; only the bare-date case above needs the
+    // local override.
     const direct = Date.parse(cleaned);
     if (!isNaN(direct)) return direct;
 
-    // Fallback: pull just the YYYY-MM-DD prefix.
-    const m = /(\d{4}-\d{2}-\d{2})/.exec(cleaned);
-    if (m) {
-        const ms = Date.parse(m[1]);
-        if (!isNaN(ms)) return ms;
-    }
+    // Fallback: pull just the YYYY-MM-DD prefix, same local-midnight treatment.
+    const m = /(\d{4})-(\d{2})-(\d{2})/.exec(cleaned);
+    if (m) return localDateOnlyMs(m[1], m[2], m[3]);
     return null;
 }
 
@@ -267,13 +296,25 @@ export function hybridFusion(dense: Float64Array, bm25: Float64Array, alpha: num
 // all-in-title gate on a `Ryan` title even though BM25 stripped it and matched.
 //
 // derived:FALSE is deliberate and eval-gated (audit 2026-06-29 #4,
-// nav_tokenizer_arm.py over the 483-q personal + 127-q dnd sets). The boost is a
-// coverage RATIO |q∩t|/|t|, so it must match the bound/coverage ENUMERATORS —
-// which also take derived:false — NOT the matching path: the glue/camel forms
-// exist to widen match RECALL, but in a precision DENOMINATOR they are noise (a
-// dated title `2026-05-19` would gain its concatenation `20260519`, shrinking
-// precision on exactly the dated known-item titles this boost targets). Measured:
-// derived:false is a strict no-op (+0.0000), derived:true −0.0002. Dated titles
+// nav_tokenizer_arm.py over the 483-q personal + 127-q dnd sets) for the
+// coverage DENOMINATOR |t| — it must match the bound/coverage ENUMERATORS,
+// which also take derived:false: the glue/camel forms exist to widen match
+// RECALL, but in a precision denominator they are noise (a dated title
+// `2026-05-19` would gain its concatenation `20260519`, shrinking precision
+// on exactly the dated known-item titles this boost targets). Measured:
+// derived:false denominator is a strict no-op (+0.0000), derived:true
+// denominator −0.0002.
+//
+// The GATE/MEMBERSHIP test is a separate question (audit R2 2026-07-02 #2)
+// and DOES use the derived stream on the title side: a query typed as one
+// glued token ("gpt4") must still satisfy the gate against a hyphenated
+// title ("GPT-4"), the same morphological-variant recall BM25 already gets
+// via seekTokenize's default derived:true. Mirrors the existing bound
+// contract (getQueryBound above): derived forms score/match without
+// enlarging the enumerator they're checked against. So coverage() below
+// checks membership against a DERIVED title-token set while still dividing
+// by the CANONICAL |t| — loosens the gate, leaves the precision denominator
+// (and therefore the eval-gated magnitude) untouched. Dated titles
 // still explode into y/m/d tokens (matched by date-proximity, not here); "1x1"
 // stays intact. (Was ASCII-only /[a-z0-9]+/g until 2026-06-10, which matched
 // every token of "Café Zürich" as empty — non-ASCII titles couldn't fire at all.)
@@ -282,7 +323,12 @@ export interface TitleBoostChunk {
     metadata?: { aliases?: string[] };
 }
 
-function tokenSet(s: string, dropStopwords = false): Set<string> {
+// `derived` (default false) selects the CANONICAL vs derived seekTokenize
+// stream — see the derived:FALSE-for-the-denominator comment above. Both the
+// query and (for the coverage DENOMINATOR) the title call this with the
+// default; coverage() below separately builds a derived:true set for the
+// title to use ONLY as the membership gate.
+function tokenSet(s: string, dropStopwords = false, derived = false): Set<string> {
     // Depluralize each token with the SAME rule BM25 applies in processTerm, run
     // symmetrically over both the query and the title here — so a plural query
     // token matches a singular title token and vice-versa ("parks" → "park" now
@@ -299,7 +345,7 @@ function tokenSet(s: string, dropStopwords = false): Set<string> {
     // TITLE side keeps stopwords (default false): we don't touch what's matchable
     // there — that's the BM25-channel name-as-stopword problem (§6.2, deferred).
     const out = new Set<string>();
-    for (const raw of seekTokenize(s, { derived: false })) {
+    for (const raw of seekTokenize(s, { derived })) {
         const m = raw.toLowerCase();   // seekTokenize preserves case (camel split needs it)
         // seekTokenize already CJK-segments; the per-token branch re-applies the
         // SAME segmenter (idempotent on a single CJK piece) and, for non-CJK,
@@ -316,12 +362,21 @@ function tokenSet(s: string, dropStopwords = false): Set<string> {
 
 // |query ∩ title| / |title| when ALL query tokens are in the title, else 0.
 function coverage(qTokens: Set<string>, title: string): number {
-    const t = tokenSet(title);
+    const t = tokenSet(title);                // canonical — the precision DENOMINATOR
     if (t.size === 0) return 0;
+    // The gate accepts the title's derived forms too (glue-joined compounds,
+    // camelCase splits — tokenize.ts) so "gpt4" reaches a "GPT-4" title, the
+    // same morphological-variant recall BM25 already has. |t| above stays
+    // canonical, so this can't dilute precision on titles that don't need it
+    // (audit R2 2026-07-02 #2).
+    const matchable = tokenSet(title, false, true);
     let inter = 0;
-    for (const tok of qTokens) if (t.has(tok)) inter++;
+    for (const tok of qTokens) if (matchable.has(tok)) inter++;
     if (inter < qTokens.size) return 0; // require full query coverage (known-item gate)
-    return inter / t.size;              // precision
+    // Clamped: a single derived match (e.g. "gpt4") can cover more canonical
+    // title tokens than it counts toward `inter`, which would otherwise let
+    // several such matches push the ratio above 1.
+    return Math.min(1, inter / t.size); // precision
 }
 
 export function titleMatchBoost(query: string, chunks: TitleBoostChunk[], boost = 0.8): Float64Array {

@@ -20,9 +20,11 @@
 // Tab-accept with an empty ghost. That keeps the busiest-first progressive
 // model (tag:m -> tag:meetings -> tag:meetings/1x1s, one Tab at a time).
 
-import type { App } from 'obsidian';
+import type { App, TFile } from 'obsidian';
 import { toDisplayForm } from './prop-normalize';
 import { enumerateDatePropertyNames, enumerateNumberPropertyNames } from './prop-types';
+import { shouldIndexPath } from './search';
+import type { SeekSettings } from './types';
 
 export interface Completion {
     // What the input's full value becomes if accepted (head + completed token).
@@ -88,6 +90,26 @@ const TAG_CH = "[^\\s!-,./:-@\\[-\\^`{-~\\u2000-\\u206F\\u2E00-\\u2E7F]";
 const PARSER_TAG = new RegExp(`^${TAG_CH}+(?:/${TAG_CH}+)*$`, 'u');
 const PARSER_KEY = new RegExp(`^${TAG_CH}+$`, 'u');
 
+// Every tag surface-form a single note contributes to Obsidian's vault-wide
+// aggregate (metadataCache.getTags()) — inline body '#tags' (already
+// position-parsed by Obsidian, no I/O needed) unioned with frontmatter
+// `tags:`. Sigil-stripped + lowercased so it can be compared against
+// this.tags' keys (whose canonical casing, from getTags(), may differ from
+// any one file's). Used only to attribute a tag to excluded vs. included
+// notes below — not a full reimplementation of chunker.ts's extractTags
+// (no casing preservation / de-dup needed for a membership check).
+function fileTagKeys(cacheEntry: { tags?: Array<{ tag: string }>; frontmatter?: Record<string, unknown> } | null | undefined): Set<string> {
+    const out = new Set<string>();
+    for (const t of cacheEntry?.tags ?? []) out.add(t.tag.replace(/^#/, '').toLowerCase());
+    const raw = cacheEntry?.frontmatter?.tags;
+    const list = Array.isArray(raw) ? raw.map(String) : typeof raw === 'string' ? raw.split(/[,\s]+/) : [];
+    for (const t of list) {
+        const s = t.trim();
+        if (s) out.add(s.replace(/^#/, '').toLowerCase());
+    }
+    return out;
+}
+
 interface ActiveToken {
     kind: 'tag' | 'path' | 'field' | 'fieldkey';
     from: number;        // index in the query where the active token starts
@@ -128,7 +150,16 @@ export class SuggestEngine {
     // Build all dictionaries from the in-memory metadata cache. Cheap enough to
     // run on every modal open (a single pass over getMarkdownFiles, no I/O), so
     // suggestions always reflect the current vault.
-    build(app: App): this {
+    //
+    // `settings`, when supplied, gates every candidate on the same
+    // index-membership predicate the real indexer uses (shouldIndexPath in
+    // search.ts — Obsidian's "Excluded files" setting, when honorIgnoredFolders
+    // is on). Without it, app.metadataCache still carries notes from
+    // index-excluded folders, so a completed `[key:value]` or `tag:`/`#` pill
+    // built from one would always return 0 results — the note was never
+    // chunked, so the matcher can never find it. Optional (not required) so
+    // existing callers keep working unfiltered; the search modal passes it.
+    build(app: App, settings?: SeekSettings): this {
         this.numericKeys = enumerateNumberPropertyNames(app);
         this.dateKeys = new Set(enumerateDatePropertyNames(app).map(k => k.toLowerCase()));
         const cache = app.metadataCache as unknown as { getTags?: () => Record<string, number> };
@@ -137,12 +168,30 @@ export class SuggestEngine {
             if (PARSER_TAG.test(tag)) this.tags.set(tag, c); // skip non-bindable tags (space/emoji/non-ASCII)
         }
 
+        // getTags() is a vault-wide aggregate with no per-file breakdown, so a
+        // tag sourced ONLY from index-excluded notes can't be subtracted from it
+        // directly. Instead: track which tags occur on at least one INCLUDED
+        // file (below) and which files were excluded, then after the loop drop
+        // any tag that only ever showed up on an excluded file. Inert (and
+        // cheap — one empty-array check) when nothing is excluded, which keeps
+        // the common case byte-identical to the old unfiltered behavior.
+        const excludedFiles: TFile[] = [];
+        const includedTagKeys = new Set<string>();
+
         const rawFields = new Map<string, Map<string, number>>();
         for (const f of app.vault.getMarkdownFiles()) {
+            if (settings && !shouldIndexPath(app, settings, f.path)) {
+                excludedFiles.push(f);
+                continue;
+            }
+
             const folder = f.parent?.path;
             if (folder && folder !== '/') this.folders.set(folder, (this.folders.get(folder) ?? 0) + 1);
 
-            const fm = app.metadataCache.getFileCache(f)?.frontmatter;
+            const cacheEntry = app.metadataCache.getFileCache(f);
+            for (const k of fileTagKeys(cacheEntry)) includedTagKeys.add(k);
+
+            const fm = cacheEntry?.frontmatter;
             if (!fm) continue;
             for (const [k, v] of Object.entries(fm)) {
                 // Skip own-operator/machinery keys (blocklist), registry-typed
@@ -180,6 +229,18 @@ export class SuggestEngine {
                     m.set(s, (m.get(s) ?? 0) + 1);
                 };
                 if (Array.isArray(v)) v.forEach(add); else add(v);
+            }
+        }
+        // Drop any tag that occurs ONLY on excluded notes — offering it would
+        // promise a `tag:`/`#` pill that the matcher can never satisfy.
+        if (excludedFiles.length > 0) {
+            const excludedTagKeys = new Set<string>();
+            for (const f of excludedFiles) {
+                for (const k of fileTagKeys(app.metadataCache.getFileCache(f))) excludedTagKeys.add(k);
+            }
+            for (const tag of this.tags.keys()) {
+                const k = tag.toLowerCase();
+                if (excludedTagKeys.has(k) && !includedTagKeys.has(k)) this.tags.delete(tag);
             }
         }
         for (const [k, m] of rawFields) {

@@ -167,6 +167,15 @@ export class SeekSearchModal extends Modal {
     private shownCount = 0;
     private sentinelEl: HTMLElement | null = null;
     private revealObserver: IntersectionObserver | null = null;
+    // Set true at the top of onClose, before any teardown. A fresh modal
+    // instance is constructed on every open, so this never needs resetting —
+    // it just gives in-flight async work (a query embed, checkIndexState, the
+    // model-load promise) a way to recognize "the modal I'd paint into is
+    // already gone" and no-op instead of writing into detached DOM, rendering
+    // into the now-unloaded markdownComponent, or (via renderResults →
+    // updateSentinel) constructing a fresh IntersectionObserver that nothing
+    // will ever disconnect.
+    private closed = false;
     // The latest SearchEntry returned by the orchestrator. Click events
     // reference its searchId so offline analysis can correlate the click back
     // to the originating query and the alternatives the user passed over.
@@ -267,7 +276,7 @@ export class SeekSearchModal extends Modal {
 
         // Build the suggestion dictionaries once (one in-memory cache pass) and
         // the tag set used to flag non-binding `tag:` pills.
-        this.suggester = new SuggestEngine().build(this.app);
+        this.suggester = new SuggestEngine().build(this.app, this.settings);
         this.vaultTagSet = this.collectVaultTags();
 
         // Component 1 — the token/pill query field. The 4th arg gates after:/before:
@@ -321,10 +330,15 @@ export class SeekSearchModal extends Modal {
         this.field.setModelReady(this.modelReady);
         if (!this.modelReady) {
             this.modelReadyPromise.then(() => {
+                // The modal may have closed while the model was still loading
+                // (e.g. the user dismissed it before the cold start finished) —
+                // don't touch the (unloaded) field or paint into detached DOM.
+                if (this.closed) return;
                 this.modelReady = true;
                 this.field?.setModelReady(true);
                 if (!this.lastQuery.trim()) this.renderEmpty();
             }).catch(err => {
+                if (this.closed) return;
                 this.modelLoadError = err instanceof Error ? err : new Error(String(err));
                 // Leave the glyph dimmed — it honestly reflects "never loaded";
                 // the failure itself is surfaced as status text / a Notice.
@@ -365,6 +379,10 @@ export class SeekSearchModal extends Modal {
     }
 
     onClose(): void {
+        // Flip first, before any other teardown: everything below (and every
+        // guard this flag feeds) assumes "closed" is already visible to any
+        // async completion that races this call.
+        this.closed = true;
         if (this.timer != null) window.clearTimeout(this.timer);
         if (this.settleTimer != null) { window.clearTimeout(this.settleTimer); this.settleTimer = null; }
         // Session ended — trigger the catch-up drain (the backup window to the
@@ -531,11 +549,13 @@ export class SeekSearchModal extends Modal {
             try {
                 await this.modelReadyPromise;
             } catch (e) {
-                if (id !== this.currentSearch) return;
+                if (id !== this.currentSearch || this.closed) return;
                 this.renderStatus(`Model load failed: ${e instanceof Error ? e.message : String(e)}`);
                 return;
             }
-            if (id !== this.currentSearch) return; // a newer query superseded us during load
+            // Bail if a newer query superseded us during load OR the modal was
+            // closed while we waited — either way there's nothing left to paint.
+            if (id !== this.currentSearch || this.closed) return;
             this.modelReady = true;
         }
 
@@ -543,13 +563,18 @@ export class SeekSearchModal extends Modal {
         try {
             this.setSearching();
             const { results, entry } = await this.orchestrator.search(query, MAX_RESULTS);
-            if (id !== this.currentSearch) return; // stale
+            // Stale (a newer query landed) or the modal closed mid-search — in
+            // the closed case `renderResults` would otherwise paint into
+            // detached DOM and (via updateSentinel) spin up a fresh
+            // IntersectionObserver that onClose already ran and will never
+            // disconnect.
+            if (id !== this.currentSearch || this.closed) return;
             this.latestSearchEntry = entry;
             this.latestResultsShown = results;
             this.latestSearchCompletedAt = performance.now();
             this.renderResults(results);
         } catch (e) {
-            if (id !== this.currentSearch) return;
+            if (id !== this.currentSearch || this.closed) return;
             this.renderStatus(`Error: ${e instanceof Error ? e.message : String(e)}`);
         } finally {
             this.endInFlight();
@@ -608,7 +633,10 @@ export class SeekSearchModal extends Modal {
     // query is left to the next keystroke's search, never stomped here.
     private async checkIndexState(): Promise<void> {
         const chunks = await this.orchestrator.indexedChunkCount();
-        if (chunks == null) return;
+        // The modal can close while this off-critical-path probe is still in
+        // flight (it's kicked off fire-and-forget from onOpen) — don't repaint
+        // a resting copy into a modal that's gone.
+        if (chunks == null || this.closed) return;
         const wasEmpty = this.indexEmpty;
         this.indexEmpty = chunks === 0;
         if (this.indexEmpty === wasEmpty) return;            // verdict unchanged → nothing to repaint

@@ -102,6 +102,37 @@ describe('Tier-2 scenario harness', () => {
         expect(paths.has('gone.md')).toBe(false);              // skipped, not indexed
     });
 
+    // ── Scenario 4b — a persistently unreadable file does not wedge computeDelta ─
+    // Scenario 4 pins the single-pass skip. Without quarantining, that skipped
+    // file's record never gets written, so classifyFileDelta(undefined, mtime)
+    // reports it 'dirty' again on EVERY later computeDelta call — forever. That
+    // wedges reconcileIdentityInPlace in 'drained' permanently (search.ts),
+    // which short-circuits periodicReconcile past sidecar reconcile / orphan
+    // sweep / compaction for the rest of the session over one bad file.
+    // quarantineUnreadable() backs it off after the first attempt instead.
+    it('a persistently unreadable file is quarantined out of dirty after one attempt', async () => {
+        const s = await boot();
+        s.vault.write('good.md', 'a healthy note about hiking', 1000);
+        await s.coldStart();
+
+        s.vault.write('bad.md', 'an undownloaded iCloud placeholder', 2000);
+        s.vault.failReads.add('bad.md');                       // permanently unreadable
+
+        // First pass: attempted (and skipped) — the quarantine is set here.
+        let delta = await s.orch.computeDelta();
+        expect(delta.dirty).toContain('bad.md');
+        await s.orch.reindexDelta(delta.dirty, delta.deleted, { embed: true });
+
+        // Second pass: WITHOUT the fix, bad.md's dropped record makes it dirty
+        // again — forever. With the fix it is quarantined and excluded.
+        delta = await s.orch.computeDelta();
+        expect(delta.dirty).not.toContain('bad.md');
+
+        // A third pass, still inside the backoff window, still excludes it.
+        delta = await s.orch.computeDelta();
+        expect(delta.dirty).not.toContain('bad.md');
+    });
+
     // ── Scenario 5 — a real edit re-embeds; a delete removes from index+search ─
     // The complement of Scenario 2 (changed bytes MUST re-embed) plus the
     // deleted-path drop, both composed through the real store after a cold build.

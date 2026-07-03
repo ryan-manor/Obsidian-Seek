@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { IframeRunner } from './iframe-runner';
+import { IframeRunner, buildChildScript } from './iframe-runner';
 
 // F5 — per-RPC timeout. A jetsam-killed iframe child never replies; without the
 // timeout the parent promise hangs forever, stranding the embed catch's
@@ -43,5 +43,22 @@ describe('IframeRunner per-RPC timeout (F5)', () => {
     it('an uninitialized runner rejects immediately, not via the timeout', async () => {
         const r = new IframeRunner();   // no iframe injected
         await expect(r.embedBatch(['x'])).rejects.toThrow(/not initialized/);
+    });
+});
+
+// Iframe child's RPC dispatch runs inside a srcdoc'd module script, which we
+// can't execute in the node test env — so assert on the emitted source text
+// that the child rejects postMessage events not sourced from window.parent
+// before it ever reaches the RPC dispatcher (mirrors the parent-side
+// `event.source !== this.iframe.contentWindow` guard in buildIframe()).
+describe('iframe child message handler — source check', () => {
+    it('gates RPC dispatch on event.source === window.parent', () => {
+        const script = buildChildScript('https://example.com/cdn', 384);
+        const handlerStart = script.indexOf("addEventListener('message', async (event)");
+        expect(handlerStart).toBeGreaterThan(-1);
+        const guardIdx = script.indexOf('event.source !== window.parent', handlerStart);
+        const dispatchIdx = script.indexOf("data.type === 'load'", handlerStart);
+        expect(guardIdx).toBeGreaterThan(handlerStart);
+        expect(guardIdx).toBeLessThan(dispatchIdx);
     });
 });

@@ -118,6 +118,11 @@ export function indexDbPrefix(pluginId: string): string {
 // CHUNKER_VERSION bump: ids are unchanged, peers' sidecars stay valid, and the
 // sidecar carries no line numbers (hydrate re-chunks the live file).
 export const DB_VERSION = 11;
+// Version of the META RECORD SHAPE (the MetaConfig field set), NOT the IDB store
+// layout above. Written by every setMeta site in search.ts; carried into the
+// identity tuple (identity.ts identityFromMeta → dbVersion) but deliberately not
+// compared by identityMatches. Bump only when MetaConfig's field semantics change.
+export const META_SCHEMA_VERSION = 2;
 // Thrown by requireDb when the connection is null (closed by onunload, or by an
 // onversionchange from another window/instance deleting the DB). Exported so the
 // indexer's per-file commit catch can recognize it and abort the WHOLE pass fast,
@@ -221,7 +226,7 @@ export function findOrphanChunkIds(allChunkIds: string[], referenced: ReadonlySe
 //   'dirty'       — (re)embed: never indexed, no stored hash (legacy → backfill),
 //                   or the bytes changed.
 //   'clean'       — up to date; skip.
-//   'check-bytes' — mtime advanced on a hash-bearing record; the caller must read
+//   'check-bytes' — mtime moved on a hash-bearing record; the caller must read
 //                   the bytes, hash them, and re-call with `liveHash`.
 export type DeltaDecision = 'dirty' | 'clean' | 'check-bytes';
 export function classifyFileDelta(
@@ -230,7 +235,12 @@ export function classifyFileDelta(
     liveHash?: string,
 ): DeltaDecision {
     if (prev === undefined) return 'dirty';            // never indexed
-    if (liveMtime <= prev.mtimeMs) return 'clean';     // mtime unchanged
+    // Strict equality, not <=: an mtime REGRESSION (file restored from backup /
+    // iCloud conflict resolved to the older copy) carries different bytes behind
+    // an older stamp — '<=' classified it clean and the index served the phantom
+    // newer content forever. Regression now takes the same hash check as an
+    // advance; genuine clock skew with identical bytes still resolves clean.
+    if (liveMtime === prev.mtimeMs) return 'clean';    // mtime unchanged
     if (prev.contentHash === undefined) return 'dirty'; // legacy record → re-embed backfills the hash
     if (liveHash === undefined) return 'check-bytes';  // need the bytes to decide
     return liveHash === prev.contentHash ? 'clean' : 'dirty';
@@ -400,6 +410,24 @@ export function openDb(dbName: string, allowRecovery = true): Promise<IDBDatabas
                 if (db.objectStoreNames.contains(STORE_FILES)) db.deleteObjectStore(STORE_FILES);
             }
 
+            // v9 -> v10 (suffix cleanliness gates -> id shift) and v10 -> v11
+            // (start_line/end_line move to raw-file coordinates: an mtime-only
+            // delta would leave a mixed body/file-relative index) BOTH document a
+            // forced clean rebuild in the DB_VERSION history above — but until
+            // 2026-07-02 (audit R2 #7) NO code implemented it: a v9/v10 origin
+            // carried its stale stores straight through, and identity.ts
+            // deliberately excludes dbVersion from the re-embed gate on the
+            // strength of exactly this promise. Same drop set as v8->v9
+            // (bm25 stamp-gated + meta kept). One range branch covers both hops,
+            // mirroring the `< 6` pattern.
+            if (oldVersion >= 9 && oldVersion < 11) {
+                if (db.objectStoreNames.contains(STORE_CHUNK_META)) db.deleteObjectStore(STORE_CHUNK_META);
+                if (db.objectStoreNames.contains(STORE_CHUNK_BODY)) db.deleteObjectStore(STORE_CHUNK_BODY);
+                if (db.objectStoreNames.contains(STORE_EMBEDDINGS)) db.deleteObjectStore(STORE_EMBEDDINGS);
+                if (db.objectStoreNames.contains(STORE_BINARY)) db.deleteObjectStore(STORE_BINARY);
+                if (db.objectStoreNames.contains(STORE_FILES)) db.deleteObjectStore(STORE_FILES);
+            }
+
             // v8: metadata and body live in separate stores. The legacy `chunks`
             // store is intentionally NOT recreated (it's dropped above for every
             // pre-v8 origin and absent on a fresh install).
@@ -543,7 +571,10 @@ export class IndexStore {
         const store = tx.objectStore(STORE_META);
         const existing = await awaitRequest(store.get(META_KEY)) as MetaConfig | undefined;
         if (existing) return existing;
-        return { embeddingDim: ACTIVE_MODEL_SPEC.dim, lastIndexedAt: null, schemaVersion: DB_VERSION };
+        // Fabricated default for an empty store — META_SCHEMA_VERSION, not
+        // DB_VERSION: the two are different version spaces (record shape vs IDB
+        // layout) and the written metas all carry META_SCHEMA_VERSION.
+        return { embeddingDim: ACTIVE_MODEL_SPEC.dim, lastIndexedAt: null, schemaVersion: META_SCHEMA_VERSION };
     }
 
     async setMeta(meta: MetaConfig): Promise<void> {

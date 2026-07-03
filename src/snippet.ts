@@ -29,18 +29,57 @@ const TABLE_DELIM_RE = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
 // absolutely-positioned button — so a config-dump note (body = one ```json
 // block) shows up as a lone copy icon with no preview. Dropping the fence lines
 // lets the inner text render as a normal clipped one-liner instead.
+//
+// A chunk that's ENTIRELY a table or a $$…$$ formula (no surrounding prose)
+// strips down to nothing above, which would otherwise render as a blank
+// result row even though it's the thing that matched. In that case fall back
+// to a flattened, single-line rendering of the stripped table/math content
+// itself so the row still shows something recognizable.
 export function sanitizeSnippet(md: string): string {
+    const mathBlocks: string[] = [];
     const noEmbeds = md
-        .replace(/\$\$[\s\S]*?\$\$/g, '')       // $$display math$$ (multi-line)
+        .replace(/\$\$[\s\S]*?\$\$/g, (block) => {           // $$display math$$ (multi-line)
+            mathBlocks.push(block.slice(2, -2).trim());
+            return '';
+        })
         .replace(/!\[\[[^\]]*?\]\]/g, '')       // ![[file]] / ![[file|size]]
         .replace(/!\[[^\]]*?\]\([^)]*?\)/g, ''); // ![alt](url)
 
+    const tableRows: string[] = [];
     const noTables = noEmbeds
         .split('\n')
-        .filter(line => !TABLE_ROW_RE.test(line) && !TABLE_DELIM_RE.test(line))
+        .filter(line => {
+            if (TABLE_DELIM_RE.test(line)) return false; // |---|---| — no content to keep
+            if (TABLE_ROW_RE.test(line)) {
+                tableRows.push(line);
+                return false;
+            }
+            return true;
+        })
         .join('\n');
 
     const noFences = noTables.replace(/^\s*(?:```|~~~).*$/gm, ''); // ``` / ```json / ~~~
 
-    return noFences.replace(/\n{3,}/g, '\n\n').trim();
+    const result = noFences.replace(/\n{3,}/g, '\n\n').trim();
+    if (result) return result;
+
+    // Nothing left after stripping — the chunk was entirely a table and/or a
+    // math block. Flatten whichever we captured into a compact one-liner.
+    const fallbackParts: string[] = [];
+    if (tableRows.length) {
+        const flatCells = tableRows
+            .map(row => row.trim().replace(/^\|/, '').replace(/\|$/, ''))
+            .map(row => row.split('|').map(cell => cell.trim()).filter(Boolean).join(' · '))
+            .filter(Boolean);
+        if (flatCells.length) fallbackParts.push(flatCells.join('  |  '));
+    }
+    if (mathBlocks.length) {
+        const flatMath = mathBlocks
+            .map(block => block.replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .join('  ');
+        if (flatMath) fallbackParts.push(flatMath);
+    }
+
+    return fallbackParts.join('  —  ');
 }

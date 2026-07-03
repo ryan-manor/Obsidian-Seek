@@ -28,20 +28,23 @@ import { parseAtoms } from './atoms';
 
 // Image/asset extensions whose embeds carry no readable text — the file name
 // ("Pasted image 20260628.png", an og:image path) is junk, so the whole embed
-// drops to ''. Mirrors chunker.ts SUFFIX_ASSET_RE; kept local so dense-clean and
-// chunker stay free of an import cycle (chunker imports this module).
-const ASSET_EXT_RE = /\.(?:png|jpe?g|gif|webp|svg|bmp|tiff?|pdf|mp4|mov|webm|mkv|mp3|m4a|wav|zip)$/i;
+// drops to ''. SINGLE SOURCE OF TRUTH for asset-extension detection: chunker.ts's
+// suffix shape-gate imports this directly (no cycle — chunker already imports
+// this module) instead of keeping its own copy, so the two can't drift apart
+// the way they did pre-2026-07-02 ($ end-anchor vs \b word-boundary).
+export const ASSET_EXT_RE = /\.(?:png|jpe?g|gif|webp|svg|bmp|tiff?|pdf|mp4|mov|webm|mkv|mp3|m4a|wav|zip)$/i;
 
 // Order is load-bearing (see cleanDenseText): each EMBED form is collapsed
 // before its non-embed counterpart so the leading `!` can't be orphaned, and
 // markdown image before markdown link for the same reason.
 const EMBED_WIKI_RE = /!\[\[([^\]]+?)\]\]/g;       // ![[target|disp]] / ![[t#sec]] / ![[img.png]]
-const MD_IMAGE_RE   = /!\[([^\]]*?)\]\([^)]*?\)/g; // ![alt](url) -> alt
+const MD_IMAGE_RE   = /!\[([^\]]*?)\]\(([^)]*?)\)/g; // ![alt](url) -> alt
 const WIKILINK_RE   = /\[\[([^\]]+?)\]\]/g;        // [[t|alias]] / [[t#sec]] / [[t]]
 const MD_LINK_RE    = /\[([^\]]*?)\]\(([^)]*?)\)/g;// [text](url) -> text
 const HTML_TAG_RE   = /<\/?[a-z][^>]*>/gi;         // <b> </b> <img …> -> ' '
 const THEMATIC_RE   = /^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$/gm; // --- *** ___ rule
 const BARE_URL_RE   = /\bhttps?:\/\/[^\s)<>\]]+/gi;// a standalone URL run
+const AUTOLINK_RE   = /<(https?:\/\/[^>\s]+)>/gi;  // <https://…> — HTML_TAG_RE would eat it
 
 // ![[…]] embed -> the text a reader sees. Alias wins; otherwise the target
 // basename (heading/block ref dropped), UNLESS the target is an image/asset, in
@@ -112,4 +115,66 @@ export function cleanDenseBody(md: string): string {
         .filter(t => t.length > 0)
         .join('\n\n')
         .trim();
+}
+
+// ── Lexical reclamation (v10, 2026-07-02) ──────────────────────────────────
+//
+// cleanDenseText DROPS raw substrings the dense channel shouldn't see — but
+// pre-v8 those bytes were BM25-indexed, and seekTokenize fragmented them
+// symmetrically with queries: `theverge.com` as a query matched the URL in a
+// clipping's body. v8's clean-once decision silently removed them from the
+// lexical channel too (audit R2 finding 1). extractLinkTerms recovers exactly
+// those dropped substrings so the chunker can persist them (Chunk.link_terms)
+// for BM25 to fold back into the content field — dense input, chunk_id and
+// vectors stay untouched.
+//
+// The extraction is a REPLACEMENT CASCADE over the SAME regexes in the SAME
+// order as cleanDenseText, replacing each construct with its display form —
+// so every later pattern sees the identical intermediate text the cleaner
+// saw, and a construct can never double-contribute (a markdown link's URL is
+// consumed before the bare-URL pass runs). Dropped substrings are captured
+// verbatim: the standard analyzer then fragments them on the index side the
+// same way it fragments the query (glue tokens included), which is the whole
+// symmetry this restores. Duplicates are kept — pre-v8 a URL appearing twice
+// contributed tf twice.
+export function extractLinkTerms(md: string): string {
+    if (!md) return '';
+    const dropped: string[] = [];
+    const keep = (s: string) => { const t = s.trim(); if (t) dropped.push(t); };
+    // The dropped part of a wiki construct: everything the rendered display
+    // form loses — the pre-bar target for aliased links, the whole inner for
+    // asset embeds (display ''), the folder path / #heading fragment otherwise.
+    const wikiDropped = (inner: string, display: string) => {
+        const bar = inner.indexOf('|');
+        const target = (bar !== -1 ? inner.slice(0, bar) : inner).trim();
+        if (target && target !== display) keep(target);
+    };
+    md
+        .replace(EMBED_WIKI_RE, (_m, inner: string) => {
+            const d = embedDisplay(inner);
+            wikiDropped(inner, d);
+            return d;
+        })
+        .replace(MD_IMAGE_RE, (_m, alt: string, url: string) => { keep(url); return alt.trim(); })
+        .replace(WIKILINK_RE, (_m, inner: string) => {
+            const d = wikiDisplay(inner);
+            wikiDropped(inner, d);
+            return d;
+        })
+        .replace(MD_LINK_RE, (_m, text: string, url: string) => { keep(url); return text.trim(); })
+        .replace(AUTOLINK_RE, (_m, url: string) => { keep(url); return ' '; })
+        .replace(HTML_TAG_RE, ' ')
+        .replace(BARE_URL_RE, m => { keep(m); return cleanUrl(m); });
+    return dropped.join(' ');
+}
+
+// Fence-aware counterpart, mirroring cleanDenseBody: fenced code passes into
+// the BM25 content field verbatim already, so its URLs contribute nothing here
+// (capturing them again would double their tf).
+export function extractLinkTermsBody(md: string): string {
+    if (!md) return '';
+    return parseAtoms(md)
+        .map(a => (a.type === 'fence' ? '' : extractLinkTerms(a.text)))
+        .filter(t => t.length > 0)
+        .join(' ');
 }

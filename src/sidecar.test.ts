@@ -30,6 +30,7 @@ import {
     shardPathFor,
     shouldReconcileSidecar,
     sidecarDirSignature,
+    staleSidecarFormat,
     sweepOrphanTmpFiles,
     MAX_VECTORS_PER_SHARD,
     Q_BYTES,
@@ -116,13 +117,14 @@ function adapter(): DataAdapter {
 
 const DIR = '.obsidian/plugins/seek/index';
 
-// Deterministic tiers for a seed. `s` is fround-ed so the f32 round-trip is exact.
+// Deterministic tiers for a seed. `s` round-trips exactly at the record codec's
+// float64 scale width (no truncation, unlike the old f32 encoding).
 function tiers(seed: number): TierBytes {
     const q = new Int8Array(Q_BYTES);
     for (let i = 0; i < Q_BYTES; i++) q[i] = (((seed * 31 + i) % 255) - 127) as number;
     const sign = new Uint8Array(SIGN_BYTES);
     for (let i = 0; i < SIGN_BYTES; i++) sign[i] = (seed + i * 7) & 0xff;
-    return { q, s: Math.fround(0.001 + seed * 1e-5), sign };
+    return { q, s: 0.001 + seed * 1e-5, sign };
 }
 
 // A minimal valid SidecarMeta for a device (content is irrelevant to enumeration;
@@ -150,7 +152,7 @@ async function appendOne(a: DataAdapter, dir: string, dev: string, id: string, t
 // ---- codec ----
 
 describe('record codec', () => {
-    it('encode → decode round-trips byte-exact (including f32 scale)', () => {
+    it('encode → decode round-trips byte-exact (including f64 scale)', () => {
         const t = tiers(42);
         const enc = encodeRecord(t);
         expect(enc.byteLength).toBe(VEC_BYTES);
@@ -220,10 +222,10 @@ describe('tier fidelity (IDB ↔ sidecar)', () => {
         const enc = encodeRecord({ q: q.q, s: q.s, sign });
         const dec = decodeRecord(enc.buffer as ArrayBuffer, 0);
 
-        // q and sign are byte-identical; the scale is stored f32 (it only ever
-        // multiplies an int8, so f32 precision is orders below the quantization
-        // error already present). So compare the scale at f32 resolution.
-        expect(dec.s).toBe(Math.fround(q.s));
+        // q, sign, AND the scale are byte-identical — the scale is stored at full
+        // float64 width so a hydrated peer dequantizes with the exact same scale
+        // IndexedDB holds locally (no f32-truncation divergence across devices).
+        expect(dec.s).toBe(q.s);
         expect([...dec.q]).toEqual([...q.q]);
         expect([...dec.sign]).toEqual([...sign]);
     });
@@ -467,7 +469,7 @@ describe('sweepOrphanTmpFiles', () => {
         // Orphan: only tmp present → restored.
         await a.writeBinary(`${DIR}/embeddings.desktop-aaa.1.bin.tmp`, new ArrayBuffer(VEC_BYTES));
 
-        const n = await sweepOrphanTmpFiles(a, DIR);
+        const n = await sweepOrphanTmpFiles(a, DIR, 'desktop-aaa');
         expect(n).toBe(2);
         expect(await a.exists(`${DIR}/embeddings.desktop-aaa.0.bin.tmp`)).toBe(false);
         expect(await a.exists(`${DIR}/embeddings.desktop-aaa.1.bin.tmp`)).toBe(false);
@@ -477,7 +479,7 @@ describe('sweepOrphanTmpFiles', () => {
     it('also recovers an orphan .jsonl.tmp (restores when the real jsonl is missing)', async () => {
         const a = adapter();
         await a.write(`${DIR}/index.desktop-aaa.jsonl.tmp`, '{"id":"c1"}\n');
-        const n = await sweepOrphanTmpFiles(a, DIR);
+        const n = await sweepOrphanTmpFiles(a, DIR, 'desktop-aaa');
         expect(n).toBe(1);
         expect(await a.exists(`${DIR}/index.desktop-aaa.jsonl.tmp`)).toBe(false);
         expect(await a.exists(`${DIR}/index.desktop-aaa.jsonl`)).toBe(true);
@@ -487,12 +489,32 @@ describe('sweepOrphanTmpFiles', () => {
     it('also recovers an orphan .json.tmp meta (so an atomic writeDeviceMeta crash self-heals)', async () => {
         const a = adapter();
         await a.write(`${DIR}/meta.desktop-aaa.json.tmp`, '{"format":1}');
-        const n = await sweepOrphanTmpFiles(a, DIR);
+        const n = await sweepOrphanTmpFiles(a, DIR, 'desktop-aaa');
         expect(n).toBe(1);
         expect(await a.exists(`${DIR}/meta.desktop-aaa.json.tmp`)).toBe(false);
         expect(await a.exists(`${DIR}/meta.desktop-aaa.json`)).toBe(true);
         // A .json.tmp must not be confused with a .jsonl.tmp (distinct suffixes).
         expect(await a.read(`${DIR}/meta.desktop-aaa.json`)).toBe('{"format":1}');
+    });
+
+    it('leaves a PEER device\'s .tmp files untouched (never promotes/deletes another device\'s in-flight write)', async () => {
+        const a = adapter();
+        // Our own device: stale .tmp alongside real → gets swept.
+        await a.writeBinary(`${DIR}/embeddings.desktop-self.0.bin`, new ArrayBuffer(VEC_BYTES));
+        await a.writeBinary(`${DIR}/embeddings.desktop-self.0.bin.tmp`, new ArrayBuffer(VEC_BYTES));
+        // A peer mid-write: orphan .tmp with no real file yet — must NOT be
+        // rename-restored (could promote not-fully-synced bytes) or deleted.
+        await a.writeBinary(`${DIR}/embeddings.mobile-peer.0.bin.tmp`, new ArrayBuffer(VEC_BYTES));
+        await a.write(`${DIR}/index.mobile-peer.jsonl.tmp`, '{"id":"peer"}\n');
+
+        const n = await sweepOrphanTmpFiles(a, DIR, 'desktop-self');
+        expect(n).toBe(1); // only our own stale .tmp acted on
+        expect(await a.exists(`${DIR}/embeddings.desktop-self.0.bin.tmp`)).toBe(false);
+        // Peer files: completely untouched, still exactly as the peer left them.
+        expect(await a.exists(`${DIR}/embeddings.mobile-peer.0.bin.tmp`)).toBe(true);
+        expect(await a.exists(`${DIR}/embeddings.mobile-peer.0.bin`)).toBe(false);
+        expect(await a.exists(`${DIR}/index.mobile-peer.jsonl.tmp`)).toBe(true);
+        expect(await a.exists(`${DIR}/index.mobile-peer.jsonl`)).toBe(false);
     });
 });
 
@@ -574,6 +596,38 @@ describe('sidecarDirSignature', () => {
         expect(shouldReconcileSidecar(live, persisted, false)).toBe(false);
         // But an empty store still forces recovery regardless of the sig.
         expect(shouldReconcileSidecar(live, persisted, true)).toBe(true);
+    });
+
+    it('a peer meta rewrite alone (no jsonl append) still moves the signature', async () => {
+        const a = adapter();
+        await appendOne(a, DIR, 'desktop-aaa', 'c1', tiers(1), 100);
+        await writeDeviceMeta(a, DIR, meta('desktop-aaa'));
+        const s1 = await sidecarDirSignature(a, DIR);
+
+        // A version-refused producer rewriting ONLY its meta (e.g. a chunkerVersion
+        // bump after a full reindex, no new jsonl line yet) must be picked up —
+        // this is the meta-file gap: omitting meta.<dev>.json left such an update
+        // invisible until the next jsonl append. (chunkerVersion goes 1→42, not
+        // 1→2, so the JSON byte length actually changes — the fake adapter's
+        // stat() doesn't track mtime, only size.)
+        await writeDeviceMeta(a, DIR, { ...meta('desktop-aaa'), chunkerVersion: 42 });
+        const s2 = await sidecarDirSignature(a, DIR);
+        expect(s2).not.toBe(s1);
+    });
+
+    it('excludes the local device\'s own meta too (self-exclusion covers meta, not just jsonl)', async () => {
+        const a = adapter();
+        await appendOne(a, DIR, 'desktop-aaa', 'c1', tiers(1), 100);   // a peer
+        await writeDeviceMeta(a, DIR, meta('mobile-self'));            // us
+        const s1 = await sidecarDirSignature(a, DIR, 'mobile-self');
+
+        // Our own meta rewrite must not move the self-excluded signature.
+        await writeDeviceMeta(a, DIR, { ...meta('mobile-self'), chunkerVersion: 42 });
+        expect(await sidecarDirSignature(a, DIR, 'mobile-self')).toBe(s1);
+
+        // A peer's meta rewrite still must move it.
+        await writeDeviceMeta(a, DIR, { ...meta('desktop-aaa'), chunkerVersion: 42 });
+        expect(await sidecarDirSignature(a, DIR, 'mobile-self')).not.toBe(s1);
     });
 });
 
@@ -687,6 +741,29 @@ describe('shouldReconcileSidecar', () => {
     });
 });
 
+// staleSidecarFormat guards compactOwnSidecar + the sidecar-commit write path
+// (R2B2 adversarial finding: SIDECAR_FORMAT bumps are excluded from
+// identityMatches, so nothing else forces a full reindex to clear an old-stride
+// sidecar before compactDevice() would otherwise misdecode it as corrupt).
+describe('staleSidecarFormat', () => {
+    it('own meta at the current format is not stale', () => {
+        expect(staleSidecarFormat({ format: SIDECAR_FORMAT }, SIDECAR_FORMAT)).toBe(false);
+    });
+
+    it('own meta at an older format IS stale', () => {
+        expect(staleSidecarFormat({ format: SIDECAR_FORMAT - 1 }, SIDECAR_FORMAT)).toBe(true);
+    });
+
+    it('no meta at all (fresh install, nothing written yet) is not stale — nothing to misread', () => {
+        expect(staleSidecarFormat(null, SIDECAR_FORMAT)).toBe(false);
+    });
+
+    it('defaults to the live SIDECAR_FORMAT when no currentFormat arg is passed', () => {
+        expect(staleSidecarFormat({ format: SIDECAR_FORMAT })).toBe(false);
+        expect(staleSidecarFormat({ format: SIDECAR_FORMAT - 1 })).toBe(true);
+    });
+});
+
 // ---- compactDevice (R1: sidecar self-compaction) ----
 
 describe('compactDevice', () => {
@@ -751,6 +828,31 @@ describe('compactDevice', () => {
         // old shard is gone — so a peer's new jsonl can never point into an old shard.
         expect(after.every(s => s.seq > oldSeq)).toBe(true);
         expect(await a.exists(shardPathFor(DIR, DEV, oldSeq))).toBe(false);
+    });
+
+    it('reclaims a leftover pre-compaction shard even when the current jsonl has nothing dead (crash between the jsonl swap and the old-shard delete)', async () => {
+        const a = adapter();
+        await appendOne(a, DIR, DEV, 'c1', tiers(1), 100); // live record, referenced shard at seq 0
+
+        // Simulate a crash mid-compaction: the jsonl swap already landed (it only
+        // references seq 0), but an old shard from a PRIOR generation survives on
+        // disk with NO jsonl line pointing to it at all — the delete step that
+        // should have followed the swap never ran.
+        await a.writeBinary(shardPathFor(DIR, DEV, 9), new ArrayBuffer(VEC_BYTES));
+        expect(await listDeviceShards(a, DIR, DEV)).toHaveLength(2);
+
+        // Nothing in the CURRENT jsonl is dead — record-count gates alone would
+        // return 'nothing-dead' and never touch the unreferenced shard.
+        const r = await compactDevice(a, DIR, DEV, live('c1'), FORCE);
+        expect(r.reason).toBe('nothing-dead');
+
+        // The crash-leak shard must be gone regardless of that fast path.
+        const after = await listDeviceShards(a, DIR, DEV);
+        expect(after.map(s => s.seq)).toEqual([0]);
+        expect(await a.exists(shardPathFor(DIR, DEV, 9))).toBe(false);
+        // The live record survives untouched.
+        const map = await resolve(a);
+        expect(tiersEqual((await readRecordAt(a, DIR, map.get('c1')!))!, tiers(1))).toBe(true);
     });
 
     it('below the byte floor: no-op, files left byte-identical (and never calls the oracle)', async () => {

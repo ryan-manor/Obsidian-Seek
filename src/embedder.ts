@@ -381,7 +381,18 @@ export class LocalEmbedder {
     }
 
     async embed(text: string): Promise<EmbedTimed> {
-        if (!this._loaded) throw new Error('Model not loaded.');
+        if (!this._loaded) {
+            // A load()/recycle() is in flight (they share _loadPromise — see
+            // recycle()) — e.g. a query fired while the indexer's SafeInt-overflow
+            // recycle is mid-rebuild (~2-4 s). Await the SAME latch instead of
+            // surfacing a raw 'Model not loaded' to the user; once it settles the
+            // model is loaded and we proceed normally. A genuinely never-loaded
+            // embedder (no in-flight latch) still throws immediately. If the
+            // in-flight load/recycle itself fails, that rejection (a more useful
+            // error than the generic message below) propagates to the caller.
+            if (this._loadPromise) await this._loadPromise;
+            if (!this._loaded) throw new Error('Model not loaded.');
+        }
         const hit = this.queryEmbedCache.get(text);
         if (hit !== undefined) {
             this.queryEmbedCache.delete(text);     // re-insert at tail → most-recent
@@ -389,6 +400,13 @@ export class LocalEmbedder {
             return { vector: hit, iframeLatencyMs: 0, cacheHit: true };
         }
         const r = await this.runner.embed(text);
+        // A non-finite vector (WASM numeric fault, torn model load) must not
+        // enter the LRU: a cached NaN row would replay the poisoned vector on
+        // every repeat of this query until eviction. Return it uncached — the
+        // search-side sanity gate rejects it and a retry re-embeds fresh.
+        if (!r.vector.every(Number.isFinite)) {
+            return { vector: r.vector, iframeLatencyMs: r.latencyMs, cacheHit: false };
+        }
         this.queryEmbedCache.set(text, r.vector);
         if (this.queryEmbedCache.size > LocalEmbedder.QUERY_EMBED_CACHE_MAX) {
             this.queryEmbedCache.delete(this.queryEmbedCache.keys().next().value as string);  // evict LRU head
@@ -428,21 +446,40 @@ export class LocalEmbedder {
             return this.toInitEntry(init);
         })();
         this._initPromise = rebuild;
-        await rebuild;
+        // Route the reload through loadImpl — the SAME single-flight latch load()
+        // itself uses (_loadPromise) — instead of a hand-rolled runner.load() call.
+        // Without this, a load() triggered concurrently (e.g. main.ts's
+        // ensureModelLoaded firing off the `_loaded = false` flip above) sees
+        // _loadPromise still null, so it sails past the guard and fires its OWN
+        // runner.load() while this one is in flight: two concurrent ~250 MB model
+        // loads (a jetsam trigger on mobile). Setting the latch here makes that
+        // concurrent load() coalesce onto THIS promise instead. loadImpl's own
+        // this.init() short-circuits on the rebuild memo just assigned above, so
+        // this doesn't trigger a second iframe init.
+        //
+        // Assigned SYNCHRONOUSLY (before the `await rebuild` below), wrapping the
+        // rebuild AND the reload in one promise — not just the reload. A load()
+        // guard is only checked once, at call time; setting the latch after
+        // `await rebuild` (the ~2-4 s iframe rebuild) left that whole window with
+        // _loadPromise still null, so a concurrent load() arriving mid-rebuild
+        // would already have committed to its own loadImpl()/runner.load() before
+        // the latch was ever set — the exact "two concurrent ~250 MB loads" bug
+        // this latch exists to prevent, just narrowed to the rebuild phase.
+        const p = (async (): Promise<LoadEntry> => {
+            await rebuild;
+            return this.loadImpl(this._lastRequested, this._lastReqDtype, this._lastModelId, this._lastRevision);
+        })();
+        this._loadPromise = p;
         try {
-            const result = await this.runner.load(
-                this._lastModelId, this._lastRequested, this._lastReqDtype, /* skipWarmup */ true, this._lastRevision,
-            );
-            this._device = result.device;
-            this._dtype = result.dtype;
-            this._loaded = true;
-            this.queryEmbedCache.clear();   // rebuilt pipeline → drop any memoized vectors
+            await p;
         } catch (e) {
             // init() succeeded but load() failed: without this the memo pins a
             // resolved "ready" entry pointing at an iframe whose model never
             // loaded, so the next init() short-circuits to a false-ready.
             this._initPromise = null;
             throw e;
+        } finally {
+            this._loadPromise = null;
         }
     }
 
@@ -495,6 +532,10 @@ export class LocalEmbedder {
 
     teardown(): void {
         this._loaded = false;
+        // The tokenizer lives in the disposed iframe; the fresh runner has none.
+        // Without this reset, ensureTokenizer() short-circuits forever and every
+        // tokenCounts() hits a tokenizer-less iframe until plugin reload.
+        this._tokenizerLoaded = false;
         // save-assign-dispose: point this.runner at the fresh instance and null
         // the memos BEFORE disposing the old runner, so the invariant "this.runner
         // pairs with _initPromise" never transiently breaks for a racing init().

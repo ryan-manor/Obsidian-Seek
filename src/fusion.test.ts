@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { hybridFusion, titleMatchBoost, theoreticalNormDense, theoreticalNormBm25, browseOrder, recencyDate, computeRecencyScore } from './fusion';
+import { hybridFusion, titleMatchBoost, theoreticalNormDense, theoreticalNormBm25, browseOrder, recencyDate, computeRecencyScore, parseDateMs } from './fusion';
 
 describe('titleMatchBoost — token coverage (precision-scaled)', () => {
     const chunk = (note_path: string, aliases?: string[]) => ({ note_path, metadata: { aliases } });
@@ -115,14 +115,23 @@ describe('titleMatchBoost — token coverage (precision-scaled)', () => {
         expect(out[0]).toBeCloseTo(B, 10); // precision 1 after the clitic drops
     });
 
-    it('uses the CANONICAL stream (derived:false), so a glue/camel form does not fire — deliberate', () => {
-        // derived:false omits the additive glue-join, so "gpt4" does NOT cover a
-        // `GPT-4` title ({gpt4} ⊄ {gpt,4}). This is the eval-gated choice (audit
-        // #4): derived:true would fire it but inflates |t| on dated titles for a
-        // measured −0.0002 vs the strict no-op of derived:false. Pinned so a
-        // future "just use derived:true" change trips this test and re-reads why.
+    it('a glue-joined query reaches a hyphenated title via the derived gate (audit R2 2026-07-02 #2)', () => {
+        // The GATE now accepts the title's derived forms (glue-joined
+        // compounds), so "gpt4" covers a `GPT-4` title ({gpt4} ⊆ {gpt,4,gpt4}).
+        // The DENOMINATOR stays canonical ({gpt,4}, size 2) so this doesn't
+        // reopen the dated-title dilution the derived:false denominator choice
+        // guards against (audit 2026-06-29 #4) — precision is 1/2, not 1.
         const out = titleMatchBoost('gpt4', [chunk('Notes/GPT-4.md')], B);
-        expect(out[0]).toBe(0);
+        expect(out[0]).toBeCloseTo(B * (1 / 2), 10);
+    });
+
+    it('clamps precision at 1 when derived matches outnumber canonical title tokens', () => {
+        // "Co-op" canonical {co,op} (denominator=2) but derived-matchable
+        // {co,op,coop} (3). Querying with both the glued and split forms
+        // ("coop co op") lets `inter` (3) exceed |t| (2) — must not exceed
+        // the full boost.
+        const out = titleMatchBoost('coop co op', [chunk('Notes/Co-op.md')], B);
+        expect(out[0]).toBeCloseTo(B, 10);
     });
 });
 
@@ -345,5 +354,33 @@ describe('computeRecencyScore — smooth half-life decay (replaced the two-stage
 
     it('future dates clamp to age 0 (score 1), not >1', () => {
         expect(computeRecencyScore(daysAgo(-30), { halfLifeDays: 180, referenceDateMs: NOW })).toBeCloseTo(1.0, 10);
+    });
+});
+
+describe('parseDateMs — bare-date rejects out-of-range month/day instead of normalizing (2026-07-02 review)', () => {
+    it('rejects a typo\'d month (13) instead of silently rolling into next January', () => {
+        expect(parseDateMs('2026-13-01')).toBeNull();
+    });
+
+    it('rejects month 00', () => {
+        expect(parseDateMs('2026-00-01')).toBeNull();
+    });
+
+    it('rejects a day out of the 1-31 range', () => {
+        expect(parseDateMs('2026-01-32')).toBeNull();
+        expect(parseDateMs('2026-01-00')).toBeNull();
+    });
+
+    it('still accepts a real date at local midnight', () => {
+        const ms = parseDateMs('2026-06-15');
+        expect(ms).not.toBeNull();
+        const dt = new Date(ms!);
+        expect(dt.getFullYear()).toBe(2026);
+        expect(dt.getMonth()).toBe(5); // 0-indexed June
+        expect(dt.getDate()).toBe(15);
+    });
+
+    it('same rejection applies via the embedded-prefix fallback path', () => {
+        expect(parseDateMs('2026-13-01 some note title')).toBeNull();
     });
 });

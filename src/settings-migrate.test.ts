@@ -159,4 +159,14 @@ describe('migrateSettings — rev 8 denseWeight 0.80→0.85 re-eval', () => {
         expect(raw.denseWeight).toBe(0.80); // past rev 8 — the user's choice is preserved
         expect(raw.settingsRev).toBe(8);
     });
+
+    it('never DOWNGRADES the rev stamp of a data.json written by a newer Seek', () => {
+        // Cross-device sync hazard: a rev-9+ data.json loaded by this older build
+        // must keep its stamp, or the newer device re-runs its migrations on next
+        // load (conditional default moves misfire on second application).
+        const raw: Partial<SeekSettings> = { settingsRev: 9, denseWeight: 0.70 };
+        migrateSettings(raw);
+        expect(raw.settingsRev).toBe(9);    // not stamped back to 8
+        expect(raw.denseWeight).toBe(0.70); // and no rev<9 migration re-fired
+    });
 });

@@ -148,6 +148,51 @@ describe('parseQuery / tag: prefix', () => {
     });
 });
 
+describe('parseQuery / leading token boundary (audit R2 #9)', () => {
+    it('a pasted URL fragment is not parsed as a #tag filter', () => {
+        const { cleanedQuery, filters } = parseQuery('see https://example.com/page#fragment');
+        expect(filters).toBeNull();
+        expect(cleanedQuery).toBe('see https://example.com/page#fragment');
+    });
+
+    it('"montag:meeting" does not bind tag:meeting mid-word', () => {
+        const { cleanedQuery, filters } = parseQuery('montag:meeting notes');
+        expect(filters).toBeNull();
+        expect(cleanedQuery).toBe('montag:meeting notes');
+    });
+
+    it('a real #tag still binds right after the mid-word non-match', () => {
+        const { cleanedQuery, filters } = parseQuery('montag:meeting #meetings');
+        expect(filters!.tags).toEqual(['meetings']);
+        expect(cleanedQuery).toBe('montag:meeting');
+    });
+});
+
+describe('parseQuery / adjacent filters with no separating whitespace (audit R2 review-2 #1)', () => {
+    it('two bracket filters concatenated with zero space both bind', () => {
+        const { cleanedQuery, filters } = parseQuery('[context:work][pageType:task]');
+        expect(filters!.frontmatter).toEqual({ context: 'work', pageType: 'task' });
+        expect(cleanedQuery).toBe('');
+    });
+
+    it('a comparison bracket directly followed by a substring bracket both bind', () => {
+        const { filters } = parseQuery('[price>50][pageType:task]', ctx(['price']));
+        expect(filters!.numeric).toEqual([{ key: 'price', op: '>', value: 50 }]);
+        expect(filters!.frontmatter).toEqual({ pageType: 'task' });
+    });
+
+    it('a hashtag directly followed by a bracket filter both bind', () => {
+        const { filters } = parseQuery('#tag[key:value]');
+        expect(filters!.tags).toEqual(['tag']);
+        expect(filters!.frontmatter).toEqual({ key: 'value' });
+    });
+
+    it('three bracket filters chained with zero space all bind', () => {
+        const { filters } = parseQuery('[a:b][c:d][e:f]');
+        expect(filters!.frontmatter).toEqual({ a: 'b', c: 'd', e: 'f' });
+    });
+});
+
 describe('parseQuery / [key:value] frontmatter', () => {
     it('simple property, bracket consumed', () => {
         const { cleanedQuery, filters } = parseQuery('alex [context:work]');
@@ -382,9 +427,14 @@ describe('parseQuery / negation (-term)', () => {
         expect(b.cleanedQuery).toBe('notes');
     });
 
-    it('hyphenated negation splits into tokens (-foo-bar → foo, bar)', () => {
+    it('hyphenated negation splits into tokens, plus the glued compound (shared seekTokenize)', () => {
+        // seekTokenize is now the shared tokenizer (audit R2 #11): hyphen is
+        // glue punctuation, so "foo-bar" additively emits the joined "foobar"
+        // alongside the split "foo"/"bar" — exactly as it would on the BM25
+        // query side (bm25.ts distinctQueryTerms), so a doc indexed under the
+        // compound form is excludable too.
         const { filters } = parseQuery('x -foo-bar');
-        expect(filters!.exclude).toEqual(['foo', 'bar']);
+        expect(filters!.exclude).toEqual(['foo', 'bar', 'foobar']);
     });
 
     it('combines with other operators', () => {
@@ -398,6 +448,16 @@ describe('parseQuery / negation (-term)', () => {
         const { cleanedQuery, filters } = parseQuery('-work');
         expect(cleanedQuery).toBe('');
         expect(filters!.exclude).toEqual(['work']);
+    });
+
+    it('negation shares the pipeline depluralizer (audit R2 #11: -cat now folds like a query term)', () => {
+        const { filters } = parseQuery('x -cat');
+        expect(filters!.exclude).toEqual(['cat']);
+    });
+
+    it('negation shares the pipeline diacritic fold (-café → cafe)', () => {
+        const { filters } = parseQuery('x -café');
+        expect(filters!.exclude).toEqual(['cafe']);
     });
 });
 
@@ -450,6 +510,13 @@ describe('excludedNotePaths (note-level, token match)', () => {
     it('empty exclude list excludes nothing', () => {
         const chunks = [makeChunk({ note_path: 'A.md', content: 'work' })];
         expect(excludedNotePaths(chunks, [], getBody(chunks)).size).toBe(0);
+    });
+
+    it('-cat (end to end) suppresses a note that only contains the plural "cats" (audit R2 #11)', () => {
+        const { filters } = parseQuery('meeting -cat');
+        const chunks = [makeChunk({ note_path: 'A.md', content: 'I love cats' })];
+        const out = excludedNotePaths(chunks, filters!.exclude!, getBody(chunks));
+        expect(out.has('A.md')).toBe(true);
     });
 });
 
@@ -651,6 +718,15 @@ describe('matchesFilters / dates (day-inclusive, missing→reject)', () => {
         expect(matchesFilters(afternoon, filters({ dateBefore: '2026-05-16' }), ctx())).toBe(true);
     });
 
+    it('before: includes a same-day LATE-EVENING timestamp (local-time-consistent boundary)', () => {
+        // Regression for a UTC-anchored `before:` bound vs a local-time property
+        // parse: an evening event would fall on the *next* UTC calendar day and
+        // get rejected west of UTC even though it's still the same local day.
+        // Both sides must live in the same (local) frame.
+        const evening = makeChunk({ metadata: { created: '2026-05-16T23:45:00' } });
+        expect(matchesFilters(evening, filters({ dateBefore: '2026-05-16' }), ctx())).toBe(true);
+    });
+
     it('before: a bare year covers the whole year', () => {
         const dec = makeChunk({ metadata: { created: '2026-12-31' } });
         expect(matchesFilters(dec, filters({ dateBefore: '2026' }), ctx())).toBe(true);
@@ -740,5 +816,90 @@ describe('compileMatcher is reusable across chunks', () => {
         const m = compileMatcher(filters({ tags: ['meetings'] }));
         expect(m(makeChunk({ metadata: { tags: ['meetings/1x1'] } }))).toBe(true);
         expect(m(makeChunk({ metadata: { tags: ['projects'] } }))).toBe(false);
+    });
+});
+
+// ── v10 query-side silent-zero fixes (audit R2 #3/#4 + case-sensitive keys) ──
+
+describe('parseQuery / unparseable date values fall through as text (audit R2 #4)', () => {
+    it('after:yesterday binds NO filter and stays searchable text', () => {
+        // Pre-fix: the token was stripped from the text AND compiled to a null
+        // bound — deleted from both channels. Verbatim fallthrough mirrors the
+        // Recency-OFF arm.
+        const { cleanedQuery, filters } = parseQuery('standup after:yesterday', ctx());
+        expect(filters).toBeNull();
+        expect(cleanedQuery).toBe('standup after:yesterday');
+    });
+
+    it('before:not-a-date likewise', () => {
+        const { cleanedQuery, filters } = parseQuery('report before:soon', ctx());
+        expect(filters).toBeNull();
+        expect(cleanedQuery).toBe('report before:soon');
+    });
+
+    it('a parseable date still binds (guard is validation, not a regression)', () => {
+        const { filters } = parseQuery('after:2026-04-01', ctx());
+        expect(filters!.dateAfter).toBe('2026-04-01');
+    });
+
+    // 2026-07-02 review: endBoundMs's day-branch used the numeric-args Date
+    // constructor, which NORMALIZES an out-of-range month/day (e.g. month 13
+    // rolls into next January) instead of rejecting it like the old
+    // Date.parse-based code did — so a typo'd before:/after: bound would
+    // silently bind to the wrong date instead of falling through as text.
+    it('before:2026-13-01 (typo month) falls through as text, does not bind', () => {
+        const { cleanedQuery, filters } = parseQuery('report before:2026-13-01', ctx());
+        expect(filters).toBeNull();
+        expect(cleanedQuery).toBe('report before:2026-13-01');
+    });
+
+    it('after:2026-01-32 (out-of-range day) falls through as text, does not bind', () => {
+        const { cleanedQuery, filters } = parseQuery('report after:2026-01-32', ctx());
+        expect(filters).toBeNull();
+        expect(cleanedQuery).toBe('report after:2026-01-32');
+    });
+});
+
+describe('matchesFilters / case-insensitive property keys', () => {
+    it('[pagetype:task] matches a stored pageType key', () => {
+        const chunk = makeChunk({ metadata: { properties: { pageType: 'task' } } });
+        expect(matchesFilters(chunk, filters({ frontmatter: { pagetype: 'task' } }))).toBe(true);
+        expect(matchesFilters(chunk, filters({ frontmatter: { PAGETYPE: 'task' } }))).toBe(true);
+    });
+
+    it('exact-case lookup still wins the fast path', () => {
+        const chunk = makeChunk({ metadata: { properties: { pageType: 'task' } } });
+        expect(matchesFilters(chunk, filters({ frontmatter: { pageType: 'task' } }))).toBe(true);
+    });
+
+    it('numeric clauses resolve keys case-insensitively too', () => {
+        const chunk = makeChunk({ metadata: { properties: { Price: '160' } } });
+        expect(matchesFilters(chunk, filters({ numeric: [{ key: 'price', op: '=', value: 160 }] }))).toBe(true);
+    });
+});
+
+describe('matchesFilters / list-valued properties (audit R2 #3)', () => {
+    it('matches when ANY element matches (Obsidian list-property semantics)', () => {
+        const chunk = makeChunk({ metadata: { properties: { genre: ['scifi', 'fantasy'] } } });
+        expect(matchesFilters(chunk, filters({ frontmatter: { genre: 'scifi' } }))).toBe(true);
+        expect(matchesFilters(chunk, filters({ frontmatter: { genre: 'fantasy' } }))).toBe(true);
+        expect(matchesFilters(chunk, filters({ frontmatter: { genre: 'romance' } }))).toBe(false);
+    });
+
+    it('quoted-exact matches a whole ELEMENT, not the joined list', () => {
+        const chunk = makeChunk({ metadata: { properties: { genre: ['scifi', 'fantasy'] } } });
+        expect(matchesFilters(chunk, filters({ frontmatter: { genre: '"scifi"' } }))).toBe(true);
+        expect(matchesFilters(chunk, filters({ frontmatter: { genre: '"sci"' } }))).toBe(false);
+    });
+
+    it('wikilink list elements stay substring-matchable through toBindForm', () => {
+        const chunk = makeChunk({ metadata: { properties: { relatedPages: ['[[Notes/People/Alex Goel|Alex]]'] } } });
+        expect(matchesFilters(chunk, filters({ frontmatter: { relatedpages: 'alex' } }))).toBe(true);
+    });
+
+    it('numeric clause satisfied by any list element', () => {
+        const chunk = makeChunk({ metadata: { properties: { sizes: ['12', '40'] } } });
+        expect(matchesFilters(chunk, filters({ numeric: [{ key: 'sizes', op: '>', value: 30 }] }))).toBe(true);
+        expect(matchesFilters(chunk, filters({ numeric: [{ key: 'sizes', op: '>', value: 50 }] }))).toBe(false);
     });
 });

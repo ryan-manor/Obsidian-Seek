@@ -449,7 +449,10 @@ export class IframeRunner {
     }
 }
 
-function buildChildScript(cdnUrl: string, outputDim: number): string {
+// Exported for testing only — the string content of the RPC dispatch handler
+// (e.g. the source-origin check) can't be exercised via a real srcdoc iframe
+// in the node test env, so tests assert on the emitted script text instead.
+export function buildChildScript(cdnUrl: string, outputDim: number): string {
     // Script body runs INSIDE the iframe. It imports transformers.js from CDN,
     // owns pipeline state, and responds to postMessage RPCs from the parent.
     // The ${...} substitutions below pin the warmup grid AND the output dimension
@@ -1084,6 +1087,12 @@ function collectTransfer(result) {
 }
 
 window.addEventListener('message', async (event) => {
+    // Mirror the parent-side source check (buildIframe()'s listener): only
+    // dispatch RPCs that actually came from the window that embedded us.
+    // Currently unreachable (no other frame holds a reference to post from),
+    // but cheap to harden so a future embedding context can't slip messages
+    // straight into the RPC dispatcher.
+    if (event.source !== window.parent) return;
     const data = event.data;
     if (!data || typeof data !== 'object' || !data.id || !data.type) return;
     try {

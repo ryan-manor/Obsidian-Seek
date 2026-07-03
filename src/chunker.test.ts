@@ -117,6 +117,26 @@ describe('MarkdownChunker — start_line/end_line are RAW-FILE coordinates (fron
     });
 });
 
+describe('MarkdownChunker — BOM-prefixed files (audit R2 batch2 #4)', () => {
+    // FRONTMATTER_RE is anchored at the very start of the string (^---); a
+    // leading byte-order-mark (U+FEFF, common from Windows editors and some
+    // web clippers) prevented it from ever matching, so the whole frontmatter
+    // block (tags, aliases, every property) silently vanished.
+    it('strips a leading BOM so frontmatter still parses', () => {
+        const content = '\uFEFF---\npageType: notes\ntags:\n  - notes\n---\n\n' + 'x'.repeat(80);
+        const chunks = chunker.chunkContent(content, 'Notes/Bom.md');
+        expect(chunks.length).toBeGreaterThan(0);
+        expect(chunks[0].metadata.tags).toContain('notes');
+    });
+
+    it('BOM-prefixed and BOM-free files produce the same chunk_id', () => {
+        const body = ['---', 'pageType: notes', '---', '', 'x'.repeat(80)].join('\n');
+        const withBom = chunker.chunkContent('\uFEFF' + body, 'Notes/Bom.md');
+        const withoutBom = chunker.chunkContent(body, 'Notes/Bom.md');
+        expect(withBom[0].chunk_id).toBe(withoutBom[0].chunk_id);
+    });
+});
+
 describe('MarkdownChunker — sub-min sections fold instead of dropping (§7)', () => {
     const big = 'x'.repeat(80); // clears minChunkChars on its own
 
@@ -304,6 +324,31 @@ describe('MarkdownChunker — dense frontmatter suffix (2026-06-18 frontmatter-i
         expect(chunk.denseSuffix).not.toContain('2026-06-17'); // created + dateLink
         expect(chunk.denseSuffix).not.toMatch(/(^|\s)5(\s|$)/); // rating
         expect(chunk.denseSuffix).not.toContain('false');       // draft
+    });
+
+    it('a date-prefixed value keeps its trailing free text (audit R2 batch2 #1)', () => {
+        const dated = [
+            '---', 'trip: 2026-06-29 Milan departure', '---',
+            'A body long enough to clear the minChunkChars gate and emit a real chunk.',
+        ].join('\n');
+        const [chunk] = chunker.chunkContent(dated, 'Notes/Trips/Milan.md');
+        expect(chunk.denseSuffix).toBeDefined();
+        expect(chunk.denseSuffix).toContain('Milan');
+        expect(chunk.denseSuffix).toContain('departure');
+        // a bare date (no trailing text) is still inert
+        const bare = [
+            '---', 'trip: 2026-06-29', '---',
+            'A body long enough to clear the minChunkChars gate and emit a real chunk.',
+        ].join('\n');
+        const [bareChunk] = chunker.chunkContent(bare, 'Notes/Trips/Bare.md');
+        expect(bareChunk.denseSuffix).toBeUndefined();
+        // a date + ISO time-of-day tail (no free text) is still inert too
+        const withTime = [
+            '---', 'trip: 2026-06-29T14:30:00Z', '---',
+            'A body long enough to clear the minChunkChars gate and emit a real chunk.',
+        ].join('\n');
+        const [timeChunk] = chunker.chunkContent(withTime, 'Notes/Trips/Time.md');
+        expect(timeChunk.denseSuffix).toBeUndefined();
     });
 
     it('omits the field entirely when no value survives the type filter', () => {
@@ -545,5 +590,94 @@ views:
             expect(c.lexicalOnly).toBeUndefined();   // a named view is not a content-free stub
             expect(c.content.length).toBeGreaterThan(0);
         }
+    });
+});
+
+// v10 lexical reclamation (audit R2 finding 1): the raw substrings dense-clean
+// drops must land on the chunk as link_terms — WITHOUT entering chunk_id.
+describe('MarkdownChunker — link_terms reclamation (v10)', () => {
+    it('link_terms never enters chunk_id — identical CLEANED bodies share ids', () => {
+        // Same rendered prose, one via aliased wikilink: cleaned bytes are equal,
+        // so ids must be equal while link_terms differ. This is the structural
+        // guarantee that v10 needed no re-embed (vectors keyed by unchanged ids).
+        const a = chunker.chunkContent('met [[San Francisco|SF]] today and talked shop for a while', 'N.md');
+        const b = chunker.chunkContent('met SF today and talked shop for a while', 'N.md');
+        expect(a[0].chunk_id).toBe(b[0].chunk_id);
+        expect(a[0].link_terms).toBe('San Francisco');
+        expect(b[0].link_terms).toBeUndefined();
+    });
+
+    it('a short link-bearing section CARRIES its link_terms into the neighbour it folds into', () => {
+        const note = [
+            '# Note',
+            '',
+            '## Source',
+            '[origin](https://blog.example.com/post)',
+            '',
+            '## Body',
+            'This section is comfortably long enough to clear the minimum chunk gate on its own merit.',
+        ].join('\n');
+        const chunks = chunker.chunkContent(note, 'Clippings/Carry.md');
+        expect(chunks.length).toBe(1); // short Source folded forward into Body
+        expect(chunks[0].link_terms).toBe('https://blog.example.com/post');
+    });
+
+    it('a trailing image-only section parks its link_terms on the preceding chunk', () => {
+        const note = [
+            '# Note',
+            '',
+            'A body paragraph that is long enough to be emitted as a real standalone chunk here.',
+            '',
+            '## Gallery',
+            '![[Rapha Jersey.png]]',
+        ].join('\n');
+        const chunks = chunker.chunkContent(note, 'Notes/Trailing.md');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].link_terms).toBe('Rapha Jersey.png');
+    });
+
+    it('a raw HEADING wikilink contributes its dropped target', () => {
+        const note = [
+            '# Note',
+            '',
+            '## Sync with [[Alex Goel|Alex]]',
+            'Talked about the roadmap for quite some time, long enough to clear the minimum gate.',
+        ].join('\n');
+        const chunks = chunker.chunkContent(note, 'Notes/HeadingLink.md');
+        expect(chunks[0].link_terms).toBe('Alex Goel');
+        expect(chunks[0].heading_path).toEqual(['Note', 'Sync with Alex']); // cleaned display in the path
+    });
+
+    it('title-only fallback still reclaims from the whole body', () => {
+        const chunks = chunker.chunkContent('![[cover.jpg]]', 'Notes/Stub.md');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].lexicalOnly).toBe(true);      // body cleaned to nothing
+        expect(chunks[0].link_terms).toBe('cover.jpg'); // but the embed name survives lexically
+    });
+});
+
+// v10 list-valued properties: stored as string[] for the filter matcher
+// (audit R2 #3 — the suggester offered list-prop pills the scalar-only store
+// could never match); tags/aliases keep their dedicated fields.
+describe('MarkdownChunker — list-valued properties stored for the matcher (v10)', () => {
+    it('keeps list props as string[]; skips tags/aliases; scalars unchanged', () => {
+        const note = [
+            '---',
+            'genre:',
+            '  - scifi',
+            '  - fantasy',
+            'context: personal',
+            'tags: [books]',
+            'aliases: [B]',
+            '---',
+            'A body paragraph long enough to clear the minimum chunk gate for this test note.',
+        ].join('\n');
+        const [chunk] = chunker.chunkContent(note, 'Notes/Books.md');
+        expect(chunk.metadata.properties.genre).toEqual(['scifi', 'fantasy']);
+        expect(chunk.metadata.properties.context).toBe('personal');
+        expect(chunk.metadata.properties.tags).toBeUndefined();
+        expect(chunk.metadata.properties.aliases).toBeUndefined();
+        expect(chunk.metadata.tags).toEqual(['books']);     // dedicated field intact
+        expect(chunk.metadata.aliases).toEqual(['B']);
     });
 });

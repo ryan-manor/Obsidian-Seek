@@ -22,6 +22,7 @@
 import { Platform, setIcon } from 'obsidian';
 import type { SuggestEngine } from './suggest';
 import { parseDateMs } from './fusion';
+import { parseNum } from './query-parser';
 
 export type PillOp = 'tag' | 'path' | 'after' | 'before' | 'prop';
 
@@ -142,6 +143,27 @@ function caretAtStart(el: HTMLElement): boolean {
     pre.selectNodeContents(el);
     pre.setEnd(r.endContainer, r.endOffset);
     return pre.toString().length === 0;
+}
+
+// Whether a `prop` pill's value would fail to bind as a numeric filter at match
+// time (D3/audit R2 #10) — the red error-pill condition. TWO ways this happens:
+//   1. the key isn't a declared Number property (comparison syntax on a
+//      substring-only key is unsatisfiable, never falls back to substring);
+//   2. the key IS Number-typed but the value itself doesn't parse (`[price>49,99]`
+//      — a stray comma). Previously only (1) was checked, so a bad numeric
+//      LITERAL rendered as a healthy-looking pill while compileMatcher's
+//      numericTypeMismatch short-circuit hard-zeroed the whole query at match
+//      time. Reuses query-parser's own `parseNum` (the exact function the
+//      comparison branch and compileMatcher's numeric clause use) — a single
+//      source of truth, so this can never drift from what actually matches.
+export function propPillNumericError(
+    key: string | undefined,
+    value: string,
+    isNumericKey: (k: string) => boolean,
+): boolean {
+    if (!key || !/^\s*[<>=]/.test(value)) return false;
+    if (!isNumericKey(key)) return true;
+    return parseNum(value.replace(/^\s*[<>=]\s*/, '')) === null;
 }
 
 export class PillQueryField {
@@ -685,6 +707,14 @@ export class PillQueryField {
     // ---- keyboard ----
 
     private onKeyDown(e: KeyboardEvent): void {
+        // IME composition (audit R2 #10): during CJK composition, Enter
+        // confirms the composition, Space picks a candidate, and arrows
+        // navigate the IME's candidate window — none of them are meant for the
+        // modal. Acting here would submit the search or commit a half-composed
+        // pill. Bail and let the browser/IME own the key. keyCode 229 covers
+        // WebKit fires where the composition-commit keydown lacks isComposing.
+        if (e.isComposing || e.keyCode === 229) return;
+
         const text = this.readText();
         const last = (text.match(/(\S*)$/)?.[1]) ?? '';
         const openSugg = this.sugg.open && this.sugg.items.length > 0;
@@ -871,14 +901,18 @@ export class PillQueryField {
                 pill.addClass('seek-pill-warn');
                 pill.setAttr('aria-label', `No vault tag matches "${t.value}". Tag filtering is exact + hierarchical, so a sibling like "${t.value}s" won't match.`);
             }
-            // D3: a numeric comparison (`[price>50]`, value starts with an
-            // operator) on a key that isn't a declared Number property can't be
-            // honored — flag the pill red. It serializes fine but matches nothing
-            // (the matcher returns 0 results for the whole query). The fix is to set
-            // the property's type to Number in Obsidian.
-            if (t.op === 'prop' && !!t.key && /^\s*[<>=]/.test(t.value) && !this.suggester.isNumericKey(t.key)) {
+            // D3 / audit R2 #10: a numeric comparison (`[price>50]`, value starts
+            // with an operator) that can't be honored — either the key isn't a
+            // declared Number property, or the value itself won't parse
+            // (`[price>49,99]`) — flag the pill red. It serializes fine but
+            // matches nothing (the matcher returns 0 results for the whole
+            // query). propPillNumericError shares query-parser's own parseNum,
+            // so this can't drift from what the matcher actually accepts.
+            if (t.op === 'prop' && propPillNumericError(t.key, t.value, k => this.suggester.isNumericKey(k))) {
                 pill.addClass('seek-pill-error');
-                pill.setAttr('aria-label', `"${t.key}" isn't a Number property — set its type to Number in Obsidian to filter numerically. This filter currently matches nothing.`);
+                pill.setAttr('aria-label', this.suggester.isNumericKey(t.key ?? '')
+                    ? `"${t.value.replace(/^\s*[<>=]\s*/, '').trim()}" isn't a valid number — this filter currently matches nothing.`
+                    : `"${t.key}" isn't a Number property — set its type to Number in Obsidian to filter numerically. This filter currently matches nothing.`);
             }
             // A prop pill's keycap is its frontmatter key (`context:`), not the
             // internal op name; every other op labels with the op itself.

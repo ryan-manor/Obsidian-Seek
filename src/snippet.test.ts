@@ -73,3 +73,32 @@ describe('sanitizeSnippet — embeds, tables, fences', () => {
         expect(sanitizeSnippet(md)).toBe('text');
     });
 });
+
+// A chunk that's ENTIRELY a table or a $$…$$ formula has no surrounding prose
+// to fall back on, so the normal strip-and-trim above returns ''. Rather than
+// showing a blank result row for a chunk that DID match, render a flattened
+// one-liner of the stripped content so it's still recognizable.
+describe('sanitizeSnippet — table-only / math-only fallback', () => {
+    it('flattens a table-only chunk instead of returning blank', () => {
+        const md = '| Name | Age |\n|---|---|\n| Alice | 30 |\n| Bob | 40 |';
+        const out = sanitizeSnippet(md);
+        expect(out).not.toBe('');
+        expect(out).toContain('Name');
+        expect(out).toContain('Alice');
+        expect(out).toContain('Bob');
+        expect(out).not.toContain('|---|');
+    });
+
+    it('flattens a math-only chunk instead of returning blank', () => {
+        const md = '$$\n\\text{CSLS}(q, d) = 2\\cos(q, d) - r_k(q) - r_k(d)\n$$';
+        const out = sanitizeSnippet(md);
+        expect(out).not.toBe('');
+        expect(out).not.toContain('$$');
+        expect(out).toContain('CSLS');
+    });
+
+    it('still returns empty for a chunk with no extractable content at all', () => {
+        const md = '![[cover.jpg]]\n\n![alt](pic.png)';
+        expect(sanitizeSnippet(md)).toBe('');
+    });
+});

@@ -1,22 +1,29 @@
 import { describe, it, expect } from 'vitest';
 import { SuggestEngine } from './suggest';
+import type { SeekSettings } from './types';
 
 // Minimal fake of the bits of `App` that SuggestEngine.build() touches:
 // metadataCache.getTags(), vault.getMarkdownFiles(), metadataCache.getFileCache().
 function fakeApp(opts: {
     tags: Record<string, number>;
-    files: Array<{ parent: string; fm?: Record<string, unknown> }>;
+    files: Array<{ parent: string; fm?: Record<string, unknown>; tags?: string[] }>;
     // Properties declared Number in the (faked) type registry — drives the numeric
     // inline-filter branch (enumerateNumberPropertyNames reads metadataTypeManager).
     numberProps?: string[];
     // Properties declared Date / Date & time — drives the date-key exclusion
     // branch (enumerateDatePropertyNames reads the same registry).
     dateProps?: string[];
+    // Simulates Obsidian's Settings → Files & Links → "Excluded files" list
+    // (folder/path prefixes), read via vault.getConfig('userIgnoreFilters') —
+    // the same fallback isUserIgnored() (search.ts) uses when the real
+    // metadataCache.isUserIgnored() isn't available.
+    ignoreFilters?: string[];
 }) {
     const files = opts.files.map((f, i) => ({
         path: `${f.parent}/n${i}.md`,
         parent: { path: f.parent },
         __fm: f.fm,
+        __tags: f.tags,
     }));
     const types = Object.fromEntries([
         ...(opts.numberProps ?? []).map(name => [name, { name, type: 'number' }]),
@@ -26,11 +33,22 @@ function fakeApp(opts: {
         metadataTypeManager: { getAllProperties: () => types },
         metadataCache: {
             getTags: () => opts.tags,
-            getFileCache: (f: { __fm?: Record<string, unknown> }) => ({ frontmatter: f.__fm }),
+            getFileCache: (f: { __fm?: Record<string, unknown>; __tags?: string[] }) => ({
+                frontmatter: f.__fm,
+                tags: f.__tags?.map(t => ({ tag: t })),
+            }),
         },
-        vault: { getMarkdownFiles: () => files },
+        vault: {
+            getMarkdownFiles: () => files,
+            getConfig: (k: string) => (k === 'userIgnoreFilters' ? (opts.ignoreFilters ?? []) : undefined),
+        },
     } as unknown as Parameters<SuggestEngine['build']>[0];
 }
+
+// A minimal honorIgnoredFolders-only settings fake — mirrors the pattern used
+// by index-coordinator.test.ts / bm25-persist.test.ts for the (large)
+// SeekSettings surface.
+const settingsHonoring = (honor = true) => ({ honorIgnoredFolders: honor }) as unknown as SeekSettings;
 
 function engine() {
     return new SuggestEngine().build(fakeApp({
@@ -343,5 +361,83 @@ describe('SuggestEngine — quoted paths (spaces, Obsidian path:"…")', () => {
 
     it('picks the busiest matching folder inside a quote', () => {
         expect(C('path:"Notes/W')?.accept).toBe('path:"Notes/Work/Meetings/*"'); // 5 beats Notes/Work's 2
+    });
+});
+
+describe('SuggestEngine — index-excluded folders (audit R2: dead pills)', () => {
+    // A note under Obsidian's "Excluded files" list never reaches the
+    // chunker/matcher, so a pill built purely from it would always return 0
+    // results. Passing `settings` gates candidates on the same predicate the
+    // real indexer uses (shouldIndexPath, search.ts).
+
+    it('drops a [key:value] pill whose only source note is index-excluded', () => {
+        const app = fakeApp({
+            tags: {},
+            files: [{ parent: 'Archive', fm: { status: 'onlyInArchive' } }],
+            ignoreFilters: ['Archive'],
+        });
+        expect(new SuggestEngine().build(app, settingsHonoring()).complete('[status:only', true)).toBeNull();
+    });
+
+    it('offers the same pill when honorIgnoredFolders is off (user opted out)', () => {
+        const app = fakeApp({
+            tags: {},
+            files: [{ parent: 'Archive', fm: { status: 'onlyInArchive' } }],
+            ignoreFilters: ['Archive'],
+        });
+        expect(new SuggestEngine().build(app, settingsHonoring(false)).complete('[status:only', true)?.accept)
+            .toBe('[status:onlyInArchive]');
+    });
+
+    it('is a no-op when settings is omitted (backward-compatible default)', () => {
+        const app = fakeApp({
+            tags: {},
+            files: [{ parent: 'Archive', fm: { status: 'onlyInArchive' } }],
+            ignoreFilters: ['Archive'],
+        });
+        expect(new SuggestEngine().build(app).complete('[status:only', true)?.accept).toBe('[status:onlyInArchive]');
+    });
+
+    it('keeps a value that also occurs on a non-excluded note', () => {
+        const app = fakeApp({
+            tags: {},
+            files: [
+                { parent: 'Archive', fm: { status: 'shared' } },
+                { parent: 'Notes', fm: { status: 'shared' } },
+            ],
+            ignoreFilters: ['Archive'],
+        });
+        expect(new SuggestEngine().build(app, settingsHonoring()).complete('[status:sha', true)?.accept)
+            .toBe('[status:shared]');
+    });
+
+    it('drops a frontmatter tag sourced only from an index-excluded note', () => {
+        const app = fakeApp({
+            tags: { '#secretarchivetag': 3 },
+            files: [{ parent: 'Archive', fm: { tags: ['secretArchiveTag'] } }],
+            ignoreFilters: ['Archive'],
+        });
+        expect(new SuggestEngine().build(app, settingsHonoring()).complete('tag:secretarch', true)).toBeNull();
+    });
+
+    it('drops an inline body tag sourced only from an index-excluded note', () => {
+        const app = fakeApp({
+            tags: { '#onlyinarchive': 2 },
+            files: [{ parent: 'Archive', tags: ['#onlyInArchive'] }],
+            ignoreFilters: ['Archive'],
+        });
+        expect(new SuggestEngine().build(app, settingsHonoring()).complete('tag:onlyinarch', true)).toBeNull();
+    });
+
+    it('keeps a tag that also occurs on a non-excluded note', () => {
+        const app = fakeApp({
+            tags: { '#shared': 5 },
+            files: [
+                { parent: 'Archive', tags: ['#shared'] },
+                { parent: 'Notes', tags: ['#shared'] },
+            ],
+            ignoreFilters: ['Archive'],
+        });
+        expect(new SuggestEngine().build(app, settingsHonoring()).complete('tag:shar', true)?.accept).toBe('tag:shared');
     });
 });

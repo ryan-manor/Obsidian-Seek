@@ -163,6 +163,7 @@ export class SeekSettingTab extends PluginSettingTab {
         this.stats = null;
         this.modelStatus = null;
         this.modelDeleteConfirm = false;
+        this.resetConfirm = false;
     }
 
     private async loadData(): Promise<void> {

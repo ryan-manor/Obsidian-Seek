@@ -48,15 +48,18 @@ export interface ChunkMetadata {
     aliases: string[];
     created: string | null;
     modified: string | null;
-    // All scalar frontmatter values (string-coerced), keyed by frontmatter
-    // key — the generic backing store for `[key:value]` inline filters
-    // (context, status, pageType, …) AND the searchable-properties BM25 field.
-    // No frontmatter key gets a dedicated field of its own except tags/aliases
-    // (which are list-valued and have their own operators); everything else,
-    // pageType included, lives here keyed by name. Array fields (tags/aliases)
-    // are NOT duplicated here. Added when the inline-filter parser shipped;
-    // populated on (re)index.
-    properties: Record<string, string>;
+    // All frontmatter values, keyed by frontmatter key — the generic backing
+    // store for `[key:value]` inline filters (context, status, pageType, …) AND
+    // the searchable-properties BM25 field. Scalars are string-coerced; LIST
+    // values (relatedPages-style) are kept as string[] (v10, audit R2 #3: the
+    // suggester offered list-prop pills the scalar-only store could never
+    // match). The matcher treats a list as any-element-matches (Obsidian's own
+    // list-property semantics); the BM25 properties field folds each list item
+    // in too, per-element, through the same type-drop gates as a scalar value
+    // (extractPropertiesText, audit R2 batch2 #3).
+    // tags/aliases are NOT duplicated here (dedicated fields + operators).
+    // Populated on (re)index.
+    properties: Record<string, string | string[]>;
 }
 
 // Structured filters extracted from a raw query string by parseQuery()
@@ -158,6 +161,19 @@ export interface Chunk {
     // a CHUNKER_VERSION bump rides with it. Absent (undefined) when the note has
     // no qualifying values. See [[Seek Domain Agnostic LoRA]] (locked 2026-06-18).
     denseSuffix?: string;
+    // Lexical reclamation (v10, 2026-07-02): the raw substrings cleanDenseBody
+    // DROPPED from this chunk's section — wikilink targets behind aliases,
+    // markdown-link/autolink URLs, bare-URL scheme+TLD forms (dense-clean.ts
+    // extractLinkTerms). Folded into the BM25 `content` field at doc-build time
+    // (bm25.ts buildDoc) and into NOTHING else: not the embed input, not the
+    // snippet body, and NOT chunk_id — ids and vectors are byte-identical with
+    // or without it (the CHUNKER_VERSION 10 bump exists only to backfill this
+    // field into stored records fleet-wide). Restores the pre-v8 query symmetry
+    // where `theverge.com` lexically matched a clipping that links its source.
+    // Absent when the section dropped nothing. Split parts share the section's
+    // whole value (token-budget.ts `...chunk` spread) — a minor tf inflation on
+    // oversized sections, accepted for wiring simplicity.
+    link_terms?: string;
 }
 
 // One synthetic search document extracted from a `.base` file (Obsidian Bases).
@@ -333,8 +349,9 @@ export interface SeekSettings {
     // metadata: "san francisco restaurants" finds notes whose body never says
     // either but whose placeLoc/placeType do. Values are wikilink-unwrapped
     // and date/number values dropped (extractPropertiesText); machinery keys
-    // (icon, cssclasses, dates, …) and list-valued props are excluded; terms
-    // then run the standard analyzer. Harness gate 2026-06-11
+    // (icon, cssclasses, dates, …) are excluded, list-valued props fold in
+    // per-item (audit R2 batch2 #3); terms then run the standard analyzer.
+    // Harness gate 2026-06-11
     // (props_field_arm): captures +0.059 at boost 2 (clean-SF 0.58→0.77,
     // "swiss hotel" crater 0.0→0.19), personal 483-q net-zero — churn is
     // symmetric on person-name/link-valued props, which is why the boost
@@ -584,7 +601,11 @@ export function migrateSettings(raw: Partial<SeekSettings>): Partial<SeekSetting
     // so a pre-bound install whose 0.92 the rev-2 surgery already dropped lands on 0.85
     // too. Score-time only: no reindex/refit (the dense weight is applied at fusion).
     if (fromRev < 8 && raw.denseWeight === 0.80) raw.denseWeight = 0.85;
-    raw.settingsRev = 8;
+    // Never DOWNGRADE the stamp: a data.json synced from a device running a newer
+    // Seek (rev 9+) must keep its rev, or this older build stamps it back to 8 and
+    // the newer device re-runs its migrations on next load (conditional default
+    // moves misfire on second application).
+    raw.settingsRev = Math.max(fromRev, 8);
     return raw;
 }
 
