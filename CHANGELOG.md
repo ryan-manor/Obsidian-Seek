@@ -2,6 +2,27 @@
 
 All notable changes to Seek are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## 1.0.4
+
+Search accuracy and cross-device sync reliability release.
+
+### Changed
+- Lexical (keyword) search now indexes link targets, URLs, and aliased link text that were previously stripped before reaching it. Notes are now findable by the links and sources they reference, not just the surrounding prose.
+- Inline `#tags` in note body text and the legacy `alias:` frontmatter key now reach tag search and the title index, matching what `tags:`/`aliases:` already did.
+- List-valued frontmatter properties are now searchable as text, not just filterable.
+
+### Fixed
+- Date filters (`before:`/`after:`) no longer silently accept an out-of-range day or month (e.g. Feb 30) and normalize it into an unintended date.
+- A timezone mismatch that could shift a date filter's boundary by a day is fixed.
+- Typing with an IME (e.g. Japanese, Chinese, Korean input) while a filter pill was focused could interrupt composition; fixed.
+- Filter pills no longer suggest notes excluded from the index.
+- Numeric property filter pills now flag a value that fails to parse instead of matching silently.
+- Several low-probability sync races fixed, including a stale index surviving a database upgrade, a duplicate device identity after cloning or restoring a vault, and orphaned index data not being reclaimed on some devices.
+
+### Internal
+- Hardened startup, log rotation, and index-compaction paths against concurrent-write races.
+- Hardened the internal release pipeline that produces this build.
+
 ## 1.0.3
 
 Settings refinement. Search, indexing, and sync are unchanged.
