@@ -2,6 +2,19 @@
 
 All notable changes to Seek are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## 1.0.5
+
+CPU-compute reliability release, prompted by a community bug report — thank you.
+
+### Fixed
+- On desktop and Android, loading the embedding model on the CPU path failed with `Could not find an implementation for GatherBlockQuantized`, so building the index was impossible whenever WebGPU wasn't usable (for example with hardware acceleration turned off) and when "Force CPU" was selected. Seek now loads the ONNX runtime build that includes the CPU kernels the quantized model needs. iPhone and iPad were unaffected. As a side effect, the CPU runtime download is ~10 MB smaller.
+- When both WebGPU and the CPU fallback failed, the error reported only the CPU failure and discarded the reason WebGPU fell back. Both causes are now reported.
+
+### Changed
+- The diagnostic report now names the GPU adapter and flags software (fallback) adapters — "GPU yes" alone couldn't distinguish a real GPU from software rendering.
+- The report now includes the last model load: which compute backend and quantization actually served it, and the fallback reason if WebGPU didn't.
+- The report's version stamp now reflects the installed plugin version (it previously always read "v0.0.1").
+
 ## 1.0.4
 
 Search accuracy and cross-device sync reliability release.
