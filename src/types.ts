@@ -39,7 +39,14 @@ export type Dtype = 'q4f16' | 'q4' | 'q8' | 'fp32';
 // init early-returned (iframe already live), not a zero-cost build.
 // v12: ModelDeliveryEntry — per-load record of the active model spec, storage
 // persistence, and stale-model cache eviction (production model-delivery layer).
-export const LOG_SCHEMA_VERSION = 12;
+// v13: PlatformEntry.gpuIsFallbackAdapter — distinguishes a real GPU from a
+// software (SwiftShader-class) fallback adapter. Additive/forward-only. The
+// r/ObsidianMD triage showed "GPU yes" is ambiguous without it: requestAdapter
+// can hand back a software adapter when hardware acceleration is off, which
+// then fails ORT's WebGPU init while the report still reads as GPU-capable.
+// Also LoadEntry.glue — which ort-wasm glue variant actually loaded
+// (previously only recoverable from the `checks` strings).
+export const LOG_SCHEMA_VERSION = 13;
 
 // ---- chunk model ----
 
@@ -761,6 +768,10 @@ export interface PlatformEntry {
     iosVersion: number | null;
     gpuAvailable: boolean;
     gpuAdapterDescription: string | null;
+    // true = software fallback adapter (SwiftShader-class): the "GPU yes but
+    // not really" case where ORT WebGPU init typically fails (e.g. hardware
+    // acceleration disabled). null = attribute not exposed on this platform.
+    gpuIsFallbackAdapter: boolean | null;
     gpuAdapterLimits: AdapterLimits | null;
     storageUsedMB: number | null;
     storageQuotaMB: number | null;
@@ -800,6 +811,10 @@ export interface LoadEntry {
     webgpuAttempted: boolean;
     webgpuFailed: boolean;
     webgpuError: string | null;
+    // Non-null when a glue override applied: 'jspi' | 'asyncify' (WebKit
+    // WebGPU) or 'plain' (non-WebKit wasm pin — the only ort-wasm build with
+    // the CPU GatherBlockQuantized kernel). Previously only in `checks` text.
+    glue: string | null;
     pass: boolean;
     checks: string[];
 }

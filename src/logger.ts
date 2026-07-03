@@ -33,7 +33,7 @@ import type { App } from 'obsidian';
 import type {
     LogEntry, LogMeta, InitEntry, PlatformEntry,
     IndexCompleteEntry, SearchEntry, ErrorEntry,
-    CrashDetectedEntry,
+    CrashDetectedEntry, LoadEntry,
 } from './types';
 import { LOG_SCHEMA_VERSION } from './types';
 import { isMobilePlatform } from './platform';
@@ -697,6 +697,7 @@ export class SeekLogger {
         const crashes = filterByType<CrashDetectedEntry & LogMeta>(d.entries, 'crash-detected');
         const lastInit = filterByType<InitEntry>(d.entries, 'init').at(-1);
         const lastPlatform = filterByType<PlatformEntry>(d.entries, 'platform').at(-1);
+        const lastLoad = filterByType<LoadEntry>(d.entries, 'load').at(-1);
 
         lines.push('\n> [!warning] Review before sharing — this report includes your recent search queries and matching note paths (but **not** note contents).');
         lines.push(`\n**Full data:** \`${REPORT_JSON_PATH}\` — parse that for analysis; this \`.md\` is a human summary.`);
@@ -705,7 +706,33 @@ export class SeekLogger {
         lines.push(`- Events: ${d.includedCount} in report${d.includedCount < d.entryCount ? ` of ${d.entryCount} total (older high-volume entries capped — see \`caps\` in the JSON)` : ''} · ${d.firstTimestamp} → ${d.lastTimestamp}`);
         lines.push(`- Devices: ${d.devices.map(x => `\`${x.id}\` (${x.count})`).join(', ')}`);
         if (lastInit) lines.push(`- Last init: v${lastInit.pluginVersion}, iframe ${lastInit.iframeReady ? '✅' : '❌'}${lastInit.error ? ` · ⚠️ \`${lastInit.error}\`` : ''}`);
-        if (lastPlatform) lines.push(`- Platform: ${lastPlatform.isMobile ? 'mobile' : 'desktop'} · GPU ${lastPlatform.gpuAvailable ? 'yes' : 'no'} · storage ${fmtMB(lastPlatform.storageUsedMB)} / ${fmtMB(lastPlatform.storageQuotaMB)}`);
+        if (lastPlatform) {
+            // "GPU yes" alone is ambiguous: requestAdapter can return a
+            // SOFTWARE fallback adapter (e.g. hardware acceleration off) that
+            // then fails ORT's WebGPU init. Print the adapter description and
+            // flag fallbacks so a report reader can tell the two apart —
+            // the r/ObsidianMD triage had to ask for the JSON to know.
+            let gpu = lastPlatform.gpuAvailable ? 'yes' : 'no';
+            if (lastPlatform.gpuAvailable && (lastPlatform.gpuAdapterDescription || lastPlatform.gpuIsFallbackAdapter)) {
+                const parts = [];
+                if (lastPlatform.gpuAdapterDescription) parts.push(lastPlatform.gpuAdapterDescription);
+                if (lastPlatform.gpuIsFallbackAdapter) parts.push('⚠️ SOFTWARE FALLBACK');
+                gpu += ` (${parts.join(', ')})`;
+            }
+            lines.push(`- Platform: ${lastPlatform.isMobile ? 'mobile' : 'desktop'} · GPU ${gpu} · storage ${fmtMB(lastPlatform.storageUsedMB)} / ${fmtMB(lastPlatform.storageQuotaMB)}`);
+        }
+        // Which EP/dtype actually served the last successful model load — the
+        // first question of any embed-failure triage, previously only in the
+        // JSON. Absent entirely when no load ever succeeded (itself a signal).
+        if (lastLoad) {
+            // webgpuError carries raw ORT/Dawn output — Tint shader-compile
+            // diagnostics are multiline and can contain backticks. Flatten +
+            // cap so a hostile payload can't split this list item mid-code-span
+            // and corrupt the rest of the section.
+            const errText = lastLoad.webgpuError ? lastLoad.webgpuError.replace(/[`\n\r]/g, ' ').slice(0, 300) : null;
+            const webgpuNote = errText ? ` · webgpu fell back: \`${errText}\`` : '';
+            lines.push(`- Last model load: ${lastLoad.actualDevice} (dtype=${lastLoad.dtype})${lastLoad.glue ? ` · glue ${lastLoad.glue}` : ''}${webgpuNote}`);
+        }
         lines.push(`- Searches ${searches.length} · index runs ${indexes.length} · errors ${errors.length} · crashes ${crashes.length}`);
         if (crashes.length > 0) {
             const c = crashes[crashes.length - 1];

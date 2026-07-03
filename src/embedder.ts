@@ -130,7 +130,13 @@ export const LOCAL_MODEL = {
     vaultRelPath: 'seek-test-model',   // Q2 side-load: visible vault-root folder (iOS Files can't see .obsidian/)
     dtype: 'q4' as Dtype,   // <<< ONE-LINE SWITCH: 'q4' | 'fp32'
 };
-const PLUGIN_VERSION = '0.0.1';
+// Injected by esbuild from manifest.json (see esbuild.config.mjs), so the
+// version stamp tracks the built release instead of a constant that goes
+// stale. The typeof guard keeps the module importable under vitest, where
+// the define doesn't exist ('typeof' on an undeclared identifier yields
+// 'undefined' without throwing).
+declare const __PLUGIN_VERSION__: string;
+const PLUGIN_VERSION = typeof __PLUGIN_VERSION__ !== 'undefined' ? __PLUGIN_VERSION__ : '0.0.0';
 
 // Output vector dimension. SINGLE SOURCE OF TRUTH = the active model spec's
 // `dim` (model-registry.ts). The iframe's OUTPUT_DIM and the sidecar record
@@ -306,11 +312,13 @@ export class LocalEmbedder {
 
         if (result.webgpuAttempted && result.webgpuError) checks.push(`⚠️ WebGPU attempted: ${result.webgpuError}`);
         else if (result.webgpuAttempted && result.device === 'webgpu') checks.push(`✅ WebGPU loaded successfully (dtype=${result.dtype})`);
-        // Non-null only when the WebKit glue override applied (iOS path):
-        // which ort-wasm variant is actually resident matters for the memory
-        // investigation (asyncify = 23.6 MB binary + eager-compile multiplier
-        // vs jspi 14.5 MB — see Seek Mobile WebGPU Investigation).
-        if (result.glue) checks.push(`ℹ️ webkit glue: ${result.glue}`);
+        // Non-null when a glue override applied: WebKit WebGPU (jspi/asyncify)
+        // or the non-WebKit wasm plain pin. Which ort-wasm variant is actually
+        // resident matters both for the memory investigation (asyncify =
+        // 23.6 MB binary + eager-compile multiplier vs jspi 14.5 MB) and for
+        // the CPU-kernel-set gap (plain is the only build with the CPU
+        // GatherBlockQuantized kernel).
+        if (result.glue) checks.push(`ℹ️ ort glue: ${result.glue}`);
 
         // Surface the warmup decomposition inline so the report doesn't
         // need a separate parser pass. Three cases:
@@ -375,6 +383,7 @@ export class LocalEmbedder {
             webgpuAttempted: result.webgpuAttempted,
             webgpuFailed: result.webgpuAttempted && result.device !== 'webgpu',
             webgpuError: result.webgpuError,
+            glue: result.glue ?? null,
             pass,
             checks,
         };

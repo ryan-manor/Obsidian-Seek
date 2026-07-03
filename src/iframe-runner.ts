@@ -162,10 +162,12 @@ export interface LoadResult {
     warmupSkipped: boolean;
     webgpuAttempted: boolean;
     webgpuError: string | null;
-    // Which wasm glue variant the WebKit override actually selected on the
-    // successful WebGPU load ('jspi' | 'asyncify'). null everywhere the
-    // override didn't apply (desktop, WASM fallback). Closes the diagnostics
-    // gap where the running glue was only ever visible in failure strings.
+    // Which ort-wasm glue variant an override actually selected: 'jspi' |
+    // 'asyncify' (WebKit WebGPU attempt) or 'plain' (non-WebKit wasm pin —
+    // the only build carrying the CPU GatherBlockQuantized kernel). null when
+    // no override applied (WebKit wasm rides tx.js's own plain pin untouched).
+    // Closes the diagnostics gap where the running glue was only ever visible
+    // in failure strings.
     glue: string | null;
 }
 
@@ -704,6 +706,29 @@ function overrideWebkitGlueForWebgpu(env) {
     return variant;
 }
 
+// The mirror image, for the pure-WASM path on NON-WebKit engines. tx.js pins
+// the ORT glue by ENGINE, not by requested device: WebKit gets the plain
+// ort-wasm-simd-threaded build, everything else (Electron desktop, Android
+// WebView) gets the asyncify WebGPU-native build — for device:'wasm' sessions
+// too. Those builds do NOT carry the same CPU kernel set: the asyncify/jspi
+// binaries register GatherBlockQuantized only on the webgpu EP, so a CPU-only
+// session cannot place the GBQ4 model's quantized embedding-table node and
+// session creation dies with "Could not find an implementation for
+// GatherBlockQuantized" (r/ObsidianMD report, 2026-07-03) — the wasm fallback
+// was dead-on-arrival on every Chromium machine, and with it "Force CPU" and
+// all of Android. The plain build carries the full CPU kernel set (it is the
+// binary every WebKit device has been running q4 on in production), so pin it
+// for wasm sessions here. No-op on WebKit (already plain) and when wasmPaths
+// is unset. Bonus: plain is 12.9 MB vs asyncify's 23.6 MB.
+function overrideGlueForWasm(env) {
+    const wp = env.backends.onnx.wasm.wasmPaths;
+    if (!wp || typeof wp !== 'object' || !wp.mjs) return null;
+    if (!String(wp.mjs).includes('ort-wasm-simd-threaded.asyncify.mjs')) return null; // already plain
+    wp.mjs = String(wp.mjs).replace('ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.mjs');
+    wp.wasm = String(wp.wasm).replace('ort-wasm-simd-threaded.asyncify.wasm', 'ort-wasm-simd-threaded.wasm');
+    return 'plain';
+}
+
 async function tryWebgpu(modelId, preferredDtype, revision) {
     const order = [preferredDtype, ...WEBGPU_DTYPE_LADDER.filter(d => d !== preferredDtype)];
     const errors = [];
@@ -849,27 +874,52 @@ async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, r
 
     // WASM fallback — always on a FRESH module instance (a failed WebGPU
     // attempt above poisoned the previous instance's webInitChain; see
-    // freshTransformers). No glue override here: on WebKit the wasm EP rides
-    // tx.js's Safari plain-glue pin, the known-good path mobile has been
-    // loading on all along.
+    // freshTransformers). Glue: on WebKit the wasm EP rides tx.js's Safari
+    // plain-glue pin (the known-good mobile path); on every OTHER engine
+    // overrideGlueForWasm rewrites tx.js's asyncify pin back to the same
+    // plain build, because asyncify has no CPU GatherBlockQuantized kernel
+    // and a q4 session can never be created on it (see the function comment).
     //
+    // Both-fail rethrow: if WebGPU was attempted and the wasm leg ALSO dies,
+    // throwing only the wasm error strands the WebGPU failure cause —
+    // loadModel throws before returning the LoadResult, so webgpuAttempted /
+    // webgpuError never reach the log and the diagnostic report shows only
+    // the terminal wasm session error, not the WebGPU init failure that
+    // forced the fallback (exactly the blind spot in the r/ObsidianMD
+    // report). Combine both causes so 'why did WebGPU fail' is answerable.
+    const wasmFail = function (e) {
+        if (webgpuAttempted && webgpuError) {
+            const combined = new Error('model load failed on both paths — webgpu: ' + webgpuError + ' || wasm: ' + String(e));
+            // Keep the terminal wasm throw-site stack: the child handler posts
+            // e.stack to the parent, and without this the combined error's
+            // stack points HERE instead of into ORT — degrading the forensic
+            // channel this rethrow exists to protect.
+            if (e && e.stack) combined.stack = combined.stack + '\\ncaused by (wasm): ' + e.stack;
+            return combined;
+        }
+        return e;
+    };
     // SIMD retry: transformers.js v3+ requires SIMD in sandboxed iframe /
     // WKWebView contexts; auto-detection can silently report "no available
     // backend" instead of falling back. Catch that case and retry — again on
     // a fresh instance, since the failure just poisoned this one — with SIMD
     // + multithread explicitly disabled (the conservative path the runtime
     // would have picked if detection had worked).
+    let wasmGlue = null;
     try {
-        const { createPipeline } = await freshTransformers(modelId);
+        const { createPipeline, env } = await freshTransformers(modelId);
+        wasmGlue = overrideGlueForWasm(env);
         pipeline = await createPipeline('feature-extraction', modelId, { device: 'wasm', dtype: requestedDtype, ...(revision ? { revision } : {}) });
     } catch (e) {
-        if (String(e).includes('no available backend')) {
+        if (!String(e).includes('no available backend')) throw wasmFail(e);
+        try {
             const { createPipeline, env } = await freshTransformers(modelId);
+            wasmGlue = overrideGlueForWasm(env);
             env.backends.onnx.wasm.simd = false;
             env.backends.onnx.wasm.numThreads = 1;
             pipeline = await createPipeline('feature-extraction', modelId, { device: 'wasm', dtype: requestedDtype, ...(revision ? { revision } : {}) });
-        } else {
-            throw e;
+        } catch (e2) {
+            throw wasmFail(e2);
         }
     }
     return {
@@ -883,7 +933,7 @@ async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, r
         // "warmup was skipped because we knew the shaders were cached".
         warmupSkipped: false,
         webgpuAttempted, webgpuError,
-        glue: null,
+        glue: wasmGlue,
     };
 }
 

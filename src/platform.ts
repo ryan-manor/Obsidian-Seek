@@ -175,9 +175,13 @@ export async function collectPlatformInfo(): Promise<PlatformEntry> {
     // can still return null pre-iOS-26).
     let gpuAvailable = false;
     let gpuAdapterDescription: string | null = null;
+    let gpuIsFallbackAdapter: boolean | null = null;
     let gpuAdapterLimits: AdapterLimits | null = null;
     interface MaybeAdapter {
-        info?: { description?: string };
+        // Spec: GPUAdapter.isFallbackAdapter; some engines mirror it on
+        // GPUAdapterInfo instead — probe both.
+        isFallbackAdapter?: boolean;
+        info?: { description?: string; isFallbackAdapter?: boolean };
         requestAdapterInfo?: () => Promise<{ description?: string }>;
         limits?: {
             maxBufferSize?: number;
@@ -195,6 +199,16 @@ export async function collectPlatformInfo(): Promise<PlatformEntry> {
             const adapter = await gpuNav.gpu.requestAdapter();
             if (adapter) {
                 gpuAvailable = true;
+                // A non-null adapter can still be a SOFTWARE fallback
+                // (SwiftShader-class, e.g. hardware acceleration off) that
+                // ORT's WebGPU init then rejects — without this flag the
+                // report's "GPU yes" reads as a contradiction of a WebGPU
+                // load failure (r/ObsidianMD triage, 2026-07-03).
+                if (typeof adapter.isFallbackAdapter === 'boolean') {
+                    gpuIsFallbackAdapter = adapter.isFallbackAdapter;
+                } else if (typeof adapter.info?.isFallbackAdapter === 'boolean') {
+                    gpuIsFallbackAdapter = adapter.info.isFallbackAdapter;
+                }
                 try {
                     if (adapter.requestAdapterInfo) {
                         const info = await adapter.requestAdapterInfo();
@@ -254,6 +268,7 @@ export async function collectPlatformInfo(): Promise<PlatformEntry> {
         iosVersion,
         gpuAvailable,
         gpuAdapterDescription,
+        gpuIsFallbackAdapter,
         gpuAdapterLimits,
         storageUsedMB,
         storageQuotaMB,

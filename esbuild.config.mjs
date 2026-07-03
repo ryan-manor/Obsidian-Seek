@@ -4,6 +4,13 @@ import { readFileSync } from 'node:fs';
 
 const prod = process.argv[2] === 'production';
 
+// Plugin version for the diagnostic report's per-init stamp (embedder.ts
+// PLUGIN_VERSION → InitEntry.pluginVersion). manifest.json is the version
+// source of truth (the promote/release flow rewrites it), so read it here —
+// the previous hand-maintained constant went stale and shipped 1.0.x public
+// builds stamped every report "v0.0.1".
+const pluginVersion = JSON.parse(readFileSync('manifest.json', 'utf8')).version;
+
 // Content hash of the BM25 analyzer sources + the MiniSearch version. Any edit
 // to tokenization / term processing / depluralize tables / field derivation —
 // or a MiniSearch upgrade — changes which tokens land in the persisted index's
@@ -50,6 +57,7 @@ const context = await esbuild.context({
     define: {
         'process.env.NODE_ENV': JSON.stringify(prod ? 'production' : 'development'),
         '__BUILD_TS__': JSON.stringify(new Date().toISOString()),
+        '__PLUGIN_VERSION__': JSON.stringify(pluginVersion),
         '__SEEK_ANALYZER_VERSION__': JSON.stringify(analyzerVersion),
         '__BINARY_WORKER_SRC__': JSON.stringify(binaryWorkerSrc),
     },

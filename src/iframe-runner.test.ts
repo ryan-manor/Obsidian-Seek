@@ -62,3 +62,59 @@ describe('iframe child message handler — source check', () => {
         expect(guardIdx).toBeLessThan(dispatchIdx);
     });
 });
+
+// tx.js pins non-WebKit engines to the asyncify ORT build for EVERY device,
+// but that build has no CPU GatherBlockQuantized kernel — a device:'wasm'
+// session can never load the shipped GBQ4 model on it (the r/ObsidianMD
+// desktop failure; also all of Android). The child must rewrite the asyncify
+// pin back to the plain build on BOTH wasm attempts (initial + SIMD retry).
+describe('iframe child WASM path — plain-glue pin (CPU GBQ kernel)', () => {
+    it('emits the asyncify→plain wasmPaths rewrite and applies it on the wasm path', () => {
+        const script = buildChildScript('https://example.com/cdn', 384);
+        // The override rewrites BOTH the .mjs glue and the .wasm binary.
+        expect(script).toContain("'ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.mjs'");
+        expect(script).toContain("'ort-wasm-simd-threaded.asyncify.wasm', 'ort-wasm-simd-threaded.wasm'");
+        // Applied on the wasm fallback: initial attempt + the 'no available
+        // backend' SIMD retry each get a fresh module instance, so each must
+        // re-apply the override. Match the call-site text (assignment form),
+        // not the bare identifier — indexOf on the identifier alone would
+        // count the function DECLARATION as the first hit and pass even if
+        // the retry-path re-application were deleted.
+        const first = script.indexOf('wasmGlue = overrideGlueForWasm(env)');
+        const second = script.indexOf('wasmGlue = overrideGlueForWasm(env)', first + 1);
+        expect(first).toBeGreaterThan(-1);
+        expect(second).toBeGreaterThan(first);
+    });
+
+    it('no-ops when wasmPaths is not the asyncify pin (WebKit plain path)', () => {
+        const script = buildChildScript('https://example.com/cdn', 384);
+        const fnStart = script.indexOf('function overrideGlueForWasm');
+        expect(fnStart).toBeGreaterThan(-1);
+        const guardIdx = script.indexOf("includes('ort-wasm-simd-threaded.asyncify.mjs')", fnStart);
+        const rewriteIdx = script.indexOf('wp.mjs = ', fnStart);
+        expect(guardIdx).toBeGreaterThan(fnStart);
+        expect(guardIdx).toBeLessThan(rewriteIdx);
+    });
+});
+
+// When 'auto' falls through to WASM and WASM ALSO fails, the child must not
+// throw only the terminal wasm error — that discards webgpuError before
+// loadModel can return a LoadResult, so the diagnostic report shows the wasm
+// session error but never WHY WebGPU fell back (the blind spot in the
+// r/ObsidianMD report). Assert the emitted child preserves both causes, on
+// both wasm attempts.
+describe('iframe child WASM fallback — preserves the WebGPU failure cause', () => {
+    it('re-throws with both webgpu and wasm error context when webgpu was attempted', () => {
+        const script = buildChildScript('https://example.com/cdn', 384);
+        // The combined throw fires only when a WebGPU attempt recorded an error.
+        expect(script).toContain('webgpuAttempted && webgpuError');
+        expect(script).toContain('model load failed on both paths');
+        expect(script).toMatch(/webgpu: '\s*\+\s*webgpuError/);
+        // Both the initial wasm attempt and the SIMD retry route their
+        // failures through the combining helper.
+        const first = script.indexOf('wasmFail(e)');
+        const second = script.indexOf('wasmFail(e2)');
+        expect(first).toBeGreaterThan(-1);
+        expect(second).toBeGreaterThan(first);
+    });
+});
