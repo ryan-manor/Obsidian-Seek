@@ -18,7 +18,7 @@ import { buildSynonymMap, chunkDeclaresAlias, SYNONYM_WEIGHT, type SynonymMap } 
 import { rank, cosineScores, DEFAULT_RANKING_CONFIG } from './ranker';
 import { browseOrder, recencyDate } from './fusion';
 import { IndexStore, nukeDatabase, classifyFileDelta, findOrphanChunkIds, isStoreClosedError, META_SCHEMA_VERSION, type MetaConfig, type FileRecord } from './index-store';
-import { LocalEmbedder, EMBEDDING_DIM, LEGACY_ENGLISH_MODEL_ID, MODEL_ID } from './embedder';
+import { LocalEmbedder, EMBEDDING_DIM, LEGACY_ENGLISH_MODEL_ID, MODEL_ID, PLUGIN_VERSION } from './embedder';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
 import { selectIndexBucket } from './iframe-runner';
@@ -412,6 +412,21 @@ export class SearchOrchestrator {
         let lastProgressAt = performance.now();
         let tokenBudgetSplits = 0;
         let tokenBudgetOverBudget = 0;
+        // Embed-failure quarantine accounting (issue #4): files committed WITH a
+        // failure marker (some chunks missing) and the total chunks they lost.
+        // `quarantined` remembers each marker written this pass so the pass-end
+        // mass-failure gate can UNWIND them: solo-retry evidence can't tell a
+        // poisoned chunk from a wedged environment (device-lost storm, app
+        // backgrounded mid-pass) — both retries share the same environment. The
+        // discriminator is volume: deterministic content failures are rare by
+        // nature (issue #4 = one file), an environmental storm hits every
+        // in-flight file at once.
+        let filesQuarantined = 0;
+        let chunksFailedEmbed = 0;
+        const quarantined: Array<{ path: string; kept: number }> = [];
+        // Check lines minted before the `checks` array exists (the mass-unwind
+        // runs right after the bucket drain); spliced into `checks` at build.
+        const checksExtra: string[] = [];
         // Fix A (cold first-build identity + background): whether the store was EMPTY
         // before this pass committed anything, from the caller's pass-start snapshot
         // (see the `budget.storeWasEmpty` comment). A truly-empty store means every
@@ -513,6 +528,19 @@ export class SearchOrchestrator {
         // instead of each paying a full yield (pacer.ts / PR #1).
         const pacer = new CompositorPacer();
 
+        // Forensics suffix for embed-failure log contexts: enough to separate a
+        // content-shaped failure (which token counts?) from an environment one
+        // (which device/glue?) straight from a report — issue #4's log had
+        // neither and the triage stalled on it. Counts only, never chunk text
+        // (reports are shared). Goes in the CONTEXT, not the message: appendError
+        // dedups on message, so a varying suffix here can't fragment the dedup key.
+        const dispatchInfo = (inputs: string[], bucket: number, tokens?: number[]): string => {
+            const glue = this.embedder.glue;
+            return ` n=${inputs.length} bucket=${bucket} dev=${this.embedder.device}${glue ? `/${glue}` : ''}`
+                + (tokens && tokens.length === inputs.length ? ` tok=[${tokens.join(',')}]` : '')
+                + ` chars=[${inputs.map(t => t.length).join(',')}]`;
+        };
+
         // Embed one warmed batch (≤ ROLLING_MAX inputs that all share a seq
         // bucket), pace after the dispatch, and recover from the ORT-Web WebGPU
         // SafeInt overflow via recycle+retry. The session poisons itself once
@@ -545,7 +573,7 @@ export class SearchOrchestrator {
                 // cycle). Unwind instead. Recoverable errors (SafeInt overflow,
                 // 'TIMEOUT', device-lost) fall through to recycle+retry below.
                 if ((e as { code?: string } | null)?.code === 'DISPOSED') throw e;
-                await this.logger.appendError(`embedBatch-recycle:${label}`, e);
+                await this.logger.appendError(`embedBatch-recycle:${label}${dispatchInfo(inputs, bucket, tokens)}`, e);
                 await this.embedder.recycle();
                 embedRecycles++;
                 result = await this.embedder.embedBatch(inputs, bucket);
@@ -563,14 +591,29 @@ export class SearchOrchestrator {
         // without their file-record — a minor inconsistency the next reindex
         // repairs. putBatch asserts chunks.length === vectors.length, so a
         // mis-counted distribution throws here rather than corrupting the index.
+        //
+        // Embed-failure quarantine (issue #4): a file with hadError commits the
+        // chunks that DID embed, and its file-record carries the failure marker
+        // (embedFailedChunks + the plugin version — see FileRecord). The old
+        // behavior (skip the whole file, no record) left the file dirty for every
+        // computeDelta, so a DETERMINISTICALLY-failing chunk re-ran the full
+        // recycle cascade (two iframe teardowns + model reloads) on every
+        // reconcile poll and catch-up drain, and wedged reconcileIdentityInPlace
+        // in 'drained' so the identity never stamped. The marker pins the file
+        // 'clean' until an edit / release bump / full reindex / peer hydrate;
+        // the missing chunk is invisible-not-wrong (content-addressed ids), and
+        // the healthy chunks stay searchable instead of vanishing with it.
         const commitFile = async (fs: FileState): Promise<void> => {
             const commitStart = performance.now();
+            const failed = fs.hadError ? fs.vectors.reduce((n, v) => n + (v === null ? 1 : 0), 0) : 0;
+            const chunks = failed === 0 ? fs.chunks : fs.chunks.filter((_, i) => fs.vectors[i] !== null);
             // Derive both tiers ONCE from the fp32 vectors: int8 rerank (QuantVec)
             // + sign-bit candidate (packed from TRUE fp32 — the fidelity invariant
             // putBatch documents). Feed IDB via putBatchQuantized so the bytes IDB
             // holds and the bytes the sidecar persists are bit-identical (no double
             // quantization, no fp32→int8 drift between the two stores).
-            const fp32 = fs.vectors as Float32Array[];
+            const fp32 = failed === 0 ? fs.vectors as Float32Array[]
+                : fs.vectors.filter((v): v is Float32Array => v !== null);
             // Feed the corpus background accumulators from the committed (known-
             // good) fp32 — the index holds exactly these vectors. Cost: 384 adds
             // + a bounded reservoir insert per vector. Only consumed on a FULL
@@ -581,14 +624,14 @@ export class SearchOrchestrator {
                 reservoir.add(v);
             }
             const derived = fp32.map(v => ({ q: quantizeInt8(v), bin: packSignBits(v) }));
-            await this.store.putBatchQuantized(fs.chunks, derived);
+            await this.store.putBatchQuantized(chunks, derived);
             // Surface the committed rows for the incremental cache path (A1). Done
             // AFTER the IDB write so the sink only ever holds rows that truly landed.
-            if (budget.addsSink) pushDeltaAdds(budget.addsSink, fs.chunks, derived);
+            if (budget.addsSink) pushDeltaAdds(budget.addsSink, chunks, derived);
             if (this.coord.sidecarOn()) {
-                for (let i = 0; i < fs.chunks.length; i++) {
+                for (let i = 0; i < chunks.length; i++) {
                     sidecarPending.push({
-                        id: fs.chunks[i].chunk_id,
+                        id: chunks[i].chunk_id,
                         tiers: { q: derived[i].q.q, s: derived[i].q.s, sign: derived[i].bin },
                         mtime: fs.mtimeMs,
                     });
@@ -601,12 +644,13 @@ export class SearchOrchestrator {
                 // FileState.mtimeMs). Recording the content's true mtime keeps
                 // computeDelta able to detect a mid-index edit on the next pass.
                 mtimeMs: fs.mtimeMs,
-                chunk_ids: fs.chunks.map(c => c.chunk_id),
+                chunk_ids: chunks.map(c => c.chunk_id),
                 contentHash: fs.contentHash,
+                ...(failed > 0 ? { embedFailedChunks: failed, embedFailPluginVersion: PLUGIN_VERSION } : {}),
             });
             commitMs += performance.now() - commitStart;
-            totalChunks += fs.chunks.length;
-            totalVectors += fs.chunks.length;
+            totalChunks += chunks.length;
+            totalVectors += chunks.length;
             perFileWallMs.push(performance.now() - fs.fileStart);
         };
 
@@ -617,16 +661,36 @@ export class SearchOrchestrator {
             p.fs.vectors[p.slot] = vec;
             if (vec === null) p.fs.hadError = true;
             if (--p.fs.remaining > 0) return;
+            const failed = p.fs.hadError ? p.fs.vectors.reduce((n, v) => n + (v === null ? 1 : 0), 0) : 0;
             if (p.fs.hadError) {
-                filesSkippedError++;
-                await this.logger.appendError(`indexFile-incomplete:${p.fs.file.path}`,
-                    new Error('one or more chunks failed to embed'));
-                return;
+                // Quarantine, don't skip (issue #4) — commitFile writes the
+                // partial chunks + the failure-marker record; see its comment.
+                // Counts ride in the CONTEXT so the constant message keeps
+                // deduping across files during a mass-failure storm.
+                await this.logger.appendError(`indexFile-incomplete:${p.fs.file.path} failed=${failed}/${p.fs.chunks.length}`,
+                    new Error('one or more chunks failed to embed — quarantined (retries on edit / new release / full reindex)'));
             }
             try {
                 await commitFile(p.fs);
-                filesCommitted++;
-                committedFilePaths.push(p.fs.file.path);  // real progress for the catch-up drain
+                // Accounting only AFTER the commit landed: a failed commit takes
+                // the catch's single filesSkippedError++, so no file ever counts
+                // twice, and filesQuarantined counts only records actually written
+                // (its documented meaning, and the mass-unwind below relies on it).
+                if (p.fs.hadError) {
+                    // filesSkippedError still counts a quarantined file so the
+                    // index-complete pass gate (>2% skip = fail) keeps its
+                    // meaning: content IS missing.
+                    filesSkippedError++;
+                    filesQuarantined++;
+                    chunksFailedEmbed += failed;
+                    quarantined.push({ path: p.fs.file.path, kept: p.fs.chunks.length - failed });
+                } else {
+                    filesCommitted++;
+                }
+                // Real progress for the catch-up drain — quarantined files too:
+                // their record is written, so they are non-dirty by the drain's
+                // own criterion and must not be re-fed to the embed loop.
+                committedFilePaths.push(p.fs.file.path);
             } catch (ce) {
                 // A closed store (onunload, or an onversionchange from another
                 // instance deleting the DB mid-reindex) makes EVERY subsequent commit
@@ -654,7 +718,13 @@ export class SearchOrchestrator {
             try {
                 vectors = await embedOneBatch(batch.map(p => p.input), bucket, `b${bucket}`, batch.map(p => p.tokens));
             } catch (e) {
-                await this.logger.appendError(`flushBucket:${bucket}`, e);
+                // Intentional teardown must unwind the whole pass, never reach the
+                // solo/quarantine path — a DISPOSED batch's chunks would otherwise
+                // all solo-fail DISPOSED too and quarantine healthy files against
+                // a store that is about to close. Mirrors embedOneBatch's own
+                // DISPOSED contract.
+                if ((e as { code?: string } | null)?.code === 'DISPOSED') throw e;
+                await this.logger.appendError(`flushBucket:${bucket}${dispatchInfo(batch.map(p => p.input), bucket, batch.map(p => p.tokens))}`, e);
             }
             if (vectors) {
                 for (let i = 0; i < batch.length; i++) await resolveChunk(batch[i], vectors[i]);
@@ -664,7 +734,8 @@ export class SearchOrchestrator {
                         const v = await embedOneBatch([p.input], bucket, `b${bucket}-solo`, [p.tokens]);
                         await resolveChunk(p, v[0]);
                     } catch (se) {
-                        await this.logger.appendError(`soloChunk:${p.fs.file.path}`, se);
+                        if ((se as { code?: string } | null)?.code === 'DISPOSED') throw se;
+                        await this.logger.appendError(`soloChunk:${p.fs.file.path}${dispatchInfo([p.input], bucket, [p.tokens])}`, se);
                         await resolveChunk(p, null);
                     }
                 }
@@ -805,6 +876,42 @@ export class SearchOrchestrator {
         // would just throw STORE_NOT_OPENED per bucket; the next reindex repairs.
         if (!this.disposed) for (const bucket of buffers.keys()) {
             while ((buffers.get(bucket)?.length ?? 0) > 0) await flushBucket(bucket);
+        }
+
+        // Mass-failure gate: solo-retry evidence can't distinguish a poisoned
+        // chunk from a wedged ENVIRONMENT (device-lost storm, app backgrounded
+        // mid-pass, model unload race) — both retries share the environment. A
+        // per-release quarantine written during such a storm would silently hide
+        // every affected file from search until the next release. Volume is the
+        // discriminator: genuine content failures are rare (issue #4 = one
+        // file), a storm hits every in-flight file. Over the cap, UNWIND the
+        // markers — deleteFile drops each quarantined record + its partial
+        // chunks, restoring the pre-quarantine behavior for exactly this case:
+        // the files stay dirty and self-heal on the next poll once the
+        // environment recovers. The cap mirrors the pass gate's skip-rate
+        // threshold with an absolute floor so a single bad file in a small
+        // vault still quarantines.
+        const quarantineCap = Math.max(3, Math.ceil(files.length * 0.02));
+        if (filesQuarantined > quarantineCap) {
+            const unwoundPaths = new Set(quarantined.map(q => q.path));
+            for (const q of quarantined) {
+                try {
+                    await this.store.deleteFile(q.path);
+                    totalChunks -= q.kept;
+                    totalVectors -= q.kept;
+                } catch (e) {
+                    if (isStoreClosedError(e)) throw e;
+                    unwoundPaths.delete(q.path);   // record survived — still honestly quarantined
+                    await this.logger.appendError(`quarantine-unwind:${q.path}`, e);
+                }
+            }
+            // Unwound files have no record again → dirty by the drain's own
+            // criterion → must not be reported as committed progress.
+            for (let i = committedFilePaths.length - 1; i >= 0; i--) {
+                if (unwoundPaths.has(committedFilePaths[i])) committedFilePaths.splice(i, 1);
+            }
+            filesQuarantined -= unwoundPaths.size;
+            checksExtra.push(`⚠️ mass embed failure (${quarantined.length} files > cap ${quarantineCap}) — environmental, not content: unwound ${unwoundPaths.size} quarantine record(s); files stay dirty and retry on the next pass`);
         }
         onProgress?.(`Indexed ${filesCommitted} files · ${totalChunks} chunks`);
         await this.emitProgress('embed', files.length, files.length, totalChunks, performance.now() - overallStart);
@@ -953,6 +1060,10 @@ export class SearchOrchestrator {
             const tag = skipRate > SKIP_RATE_FAIL ? '❌' : '⚠️';
             checks.push(`${tag} ${filesSkippedError}/${files.length} file(s) skipped due to error (${(skipRate * 100).toFixed(1)}%) — see error log`);
         }
+        if (filesQuarantined > 0) {
+            checks.push(`⚠️ ${filesQuarantined} file(s) quarantined (${chunksFailedEmbed} chunk(s) failed to embed after solo retry) — healthy chunks committed + searchable; retried on edit / new release / full reindex`);
+        }
+        checks.push(...checksExtra);
         if (totalChunks === 0) checks.push('⚠️ no chunks produced — vault may be empty or all files below min_chunk_chars');
         // WS2.3 invariant surface: splits are normal (every >512-token chunk
         // re-packs); a nonzero overBudget means some input still truncates
@@ -1002,6 +1113,8 @@ export class SearchOrchestrator {
             chunksIndexed: totalChunks,
             vectorsWritten: totalVectors,
             filesSkippedError,
+            filesQuarantined,
+            chunksFailedEmbed,
             filesDeferred: files.length - processedFiles,
             embedRecycles,
             tokenBudgetSplits,
@@ -1102,10 +1215,10 @@ export class SearchOrchestrator {
             // the quarantine field comment), wedging every computeDelta caller.
             if (this.isQuarantined(f.path)) continue;
             const prev = stored.get(f.path);
-            let decision = classifyFileDelta(prev, f.stat.mtime);
+            let decision = classifyFileDelta(prev, f.stat.mtime, undefined, PLUGIN_VERSION);
             if (decision === 'check-bytes') {
                 try {
-                    decision = classifyFileDelta(prev, f.stat.mtime, cyrb53Hex(await this.app.vault.cachedRead(f)));
+                    decision = classifyFileDelta(prev, f.stat.mtime, cyrb53Hex(await this.app.vault.cachedRead(f)), PLUGIN_VERSION);
                 } catch {
                     decision = 'dirty';   // unreadable → let the embed path decide
                     this.quarantineUnreadable(f.path); // give it this one attempt, then back off

@@ -24,7 +24,10 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import type { Chunk, ChunkMetadata } from './types';
-import { enforceTokenBudget, embedInput, overlapSeed, type CountTokens } from './token-budget';
+import {
+    enforceTokenBudget, embedInput, overlapSeed, collapsePadding,
+    PAD_RUN_MIN, MAX_COLLAPSED_CHARS_PER_TOKEN, TOKEN_BUDGET, type CountTokens,
+} from './token-budget';
 import { chunkIdFor } from './chunker';
 import { parseAtoms, type Atom } from './atoms';
 
@@ -384,5 +387,128 @@ describe('dense suffix (frontmatter-into-dense)', () => {
         for (const tag of ['a', 'b', 'c', 'd']) {
             expect(joined).toContain(`${tag}word0`);
         }
+    });
+});
+
+// Issue-#4 defenses (2026-07-06): padding collapse + count gate. The failure
+// class under test: multi-MB whitespace-padded cells took the real tokenizer
+// to ~1.9 GB peak per call and rode an unsplittable table atom into a single
+// 51K-token overBudget chunk retried every pass. The contract:
+//   1. The raw counter NEVER sees a text over the gate, nor one still
+//      containing a PAD_RUN_MIN whitespace run.
+//   2. Stored content is untouched — collapse is dense-channel (counts +
+//      embedInput) only.
+//   3. Space-less oversize blobs (the JWT/base64 class) still split, under
+//      the same gate, with exact coverage.
+describe('padding collapse + count gate (issue #4)', () => {
+    // A counter spy that enforces contract 1 on every call and delegates to
+    // the standard fake.
+    function spyCounter(budget: number) {
+        const gate = budget * MAX_COLLAPSED_CHARS_PER_TOKEN;
+        const seen = { maxLen: 0, calls: 0 };
+        const padRun = new RegExp(`[ \\t]{${PAD_RUN_MIN},}`);
+        const count: CountTokens = async texts => {
+            for (const t of texts) {
+                seen.calls++;
+                seen.maxLen = Math.max(seen.maxLen, t.length);
+                expect(t.length).toBeLessThanOrEqual(gate);
+                expect(padRun.test(t)).toBe(false);
+            }
+            return texts.map(fakeCount);
+        };
+        return { count, seen };
+    }
+
+    it('collapsePadding: runs under PAD_RUN_MIN survive, longer collapse, newlines untouched', () => {
+        const under = `a${' '.repeat(PAD_RUN_MIN - 1)}b`;
+        expect(collapsePadding(under)).toBe(under);
+        expect(collapsePadding(`a${' '.repeat(PAD_RUN_MIN)}b`)).toBe('a b');
+        expect(collapsePadding(`a${'\t'.repeat(PAD_RUN_MIN)}b`)).toBe('a b');
+        expect(collapsePadding(`a${' \t'.repeat(PAD_RUN_MIN)}b`)).toBe('a b');
+        // horizontal only: the padded line collapses, the line structure stays
+        const multi = `a\n${' '.repeat(40)}\nb`;
+        expect(collapsePadding(multi)).toBe('a\n \nb');
+    });
+
+    it('embedInput collapses padding and caps at the lossless char bound', () => {
+        const padded = mkChunk({ content: `x${' '.repeat(100)}y` });
+        expect(embedInput(padded)).toBe(`${padded.title}\n\nx y`);
+        const huge = mkChunk({ content: 'y'.repeat(40_000) });
+        expect(embedInput(huge).length).toBe(TOKEN_BUDGET * MAX_COLLAPSED_CHARS_PER_TOKEN);
+    });
+
+    it('poison table (whitespace-padded cells) passes through as one small-count chunk', async () => {
+        // Scaled issue-#4 shape: header/delimiter rows padded so wide that the
+        // pre-fix splitTableAtom header-bail would have applied, two rows an
+        // order of magnitude wider still.
+        const pad = (n: number) => ' '.repeat(n);
+        const lines = [
+            `| Title${pad(300)} | Location${pad(300)} |`,
+            `| ---${pad(300)} | ---${pad(300)} |`,
+        ];
+        for (let i = 0; i < 2; i++) lines.push(`| Job ${i}${pad(5000)} | Remote${pad(5000)} |`);
+        for (let i = 0; i < 17; i++) lines.push(`| Role ${i}${pad(300)} | Office ${i}${pad(300)} |`);
+        const content = lines.join('\n');
+        const chunk = mkChunk({ content });
+
+        const { count, seen } = spyCounter(512);
+        const r = await enforceTokenBudget([chunk], count, 512);
+
+        // Collapsed, the real content is tiny: one chunk, no splits, in budget.
+        expect(r.chunks.length).toBe(1);
+        expect(r.splits).toBe(0);
+        expect(r.overBudget).toBe(0);
+        expect(r.counts[0]).toBeLessThanOrEqual(512);
+        // Untouched chunks pass through object-identical; stored content keeps
+        // its raw padding (display/BM25 side unaffected by the dense collapse).
+        expect(r.chunks[0]).toBe(chunk);
+        expect(r.chunks[0].content).toBe(content);
+        expect(seen.calls).toBeGreaterThan(0);
+    });
+
+    it('space-less blob over the gate splits under the gate with exact coverage', async () => {
+        const budget = 64; // gate = 4096 — small enough to exercise estimates
+        const blob = 'x'.repeat(20_000);
+        const chunk = mkChunk({ content: blob });
+
+        const { count, seen } = spyCounter(budget);
+        const r = await enforceTokenBudget([chunk], count, budget);
+
+        expect(r.splits).toBe(1);
+        expect(r.overBudget).toBe(0);
+        expect(r.chunks.length).toBeGreaterThan(1);
+        for (let i = 0; i < r.chunks.length; i++) {
+            expect(fakeCount(embedInput(r.chunks[i]))).toBeLessThanOrEqual(budget);
+            expect(r.counts[i]).toBeLessThanOrEqual(budget);
+        }
+        // 'x' has no whitespace for the cut-trim to eat and hard-split pieces
+        // are too big for overlap seeding, so coverage is byte-exact.
+        expect(r.chunks.map(c => c.content).join('')).toBe(blob);
+        // The gate did real work: the 20K-char blob itself was never tokenized.
+        expect(seen.maxLen).toBeLessThanOrEqual(budget * MAX_COLLAPSED_CHARS_PER_TOKEN);
+    });
+
+    it('padded table over budget still splits at row boundaries, header repeated', async () => {
+        const pad = (n: number) => ' '.repeat(n);
+        const header = ['| A | B |', '| --- | --- |'];
+        const rows = Array.from({ length: 200 }, (_, i) =>
+            `| item${i}${pad(50)} | value${i}${pad(50)} |`);
+        const content = [...header, ...rows].join('\n');
+        const chunk = mkChunk({ content });
+        expect(fakeCount(collapsePadding(embedInput(chunk)))).toBeGreaterThan(512);
+
+        const { count } = spyCounter(512);
+        const r = await enforceTokenBudget([chunk], count, 512);
+
+        expect(r.chunks.length).toBeGreaterThan(1);
+        expect(r.overBudget).toBe(0);
+        for (const part of r.chunks) {
+            // each piece is a valid, self-describing table with RAW padding
+            expect(part.content.startsWith(`${header[0]}\n${header[1]}\n`)).toBe(true);
+            expect(part.content).toContain(pad(50));
+        }
+        // every row survives, in order, exactly once (tables never overlap-seed)
+        const emitted = r.chunks.flatMap(c => c.content.split('\n').slice(2));
+        expect(emitted).toEqual(rows);
     });
 });

@@ -40,6 +40,30 @@
 // splits structure-aware — fences re-split at line boundaries with the fence
 // REOPENED on every piece, tables repeat their header+delimiter rows, callouts
 // split at ">"-line boundaries, paragraphs hard-split as before.
+//
+// Padding collapse + count gate (issue #4, 2026-07-06): a 5.9 MB pipe table
+// whose cells were space-padded into ~2M-char lines cost the tokenizer a
+// measured 1.86 GB peak / 9.3 s PER CALL (unigram lattice; padding runs
+// ~127 chars/token vs ~4.5 prose, ~9.4 base64) — a renderer OOM on desktop
+// (surfacing as ORT-wasm's 32-bit SafeInt "Tensor shape is too large" when
+// the arena loses the race instead of V8), and far past the ~1.5 GB iOS
+// jetsam line. Worse, splitTableAtom's header-bail meant the whole file was
+// emitted as ONE 51K-token overBudget chunk, re-tokenized whole on every
+// indexing pass — an eternal-retry churn. Two defenses, both DENSE-CHANNEL
+// ONLY (stored chunk.content, chunk_ids, BM25 and snippets never change —
+// code-block indentation must survive for display):
+//   1. collapsePadding: horizontal-whitespace runs ≥ PAD_RUN_MIN collapse to
+//      one space in every text this module counts and in embedInput itself.
+//      Runs that long are alignment padding, never content — the issue-#4
+//      file's real content is ~460 chars and embeds in 18 ms once collapsed.
+//   2. The count gate (gatedCounter): after collapse no text packs more than
+//      MAX_COLLAPSED_CHARS_PER_TOKEN chars into a token (see the constant's
+//      bound argument), so a text longer than budget × that bound is over
+//      budget BY CONSTRUCTION — answer with a char estimate instead of
+//      tokenizing. The tokenizer never sees an input past the gate; the
+//      estimate only steers oversize-split proportions, and every EMITTED
+//      part is still exact-recounted by the verify loop (under the gate by
+//      then, since its count must land ≤ budget to be emitted).
 
 import type { Chunk } from './types';
 import { chunkIdFor } from './chunker';
@@ -53,6 +77,69 @@ export type CountTokens = (texts: string[]) => Promise<number[]>;
 // The dense embed window: SEQ_BUCKETS' last rung. Mirrored by convention
 // (importing iframe-runner here would drag the template string into tests).
 export const TOKEN_BUDGET = 512;
+
+// Horizontal-whitespace runs at least this long collapse to a single space in
+// the dense channel (embedInput + every gatedCounter text). 16 is past any
+// legitimate code indentation level that carries dense signal and far past
+// prose; runs of 15 and under pass through untouched, so normal chunks'
+// embed inputs — and therefore their vectors and counts — are byte-identical
+// to the pre-collapse pipeline (no CHUNKER_VERSION bump, no fleet reindex).
+export const PAD_RUN_MIN = 16;
+const PAD_RUN_RE = new RegExp(`[ \\t]{${PAD_RUN_MIN},}`, 'g');
+
+// Dense-channel padding collapse. Horizontal only — newlines are never
+// touched, so line structure (atom boundaries, fence/table shapes) survives.
+export function collapsePadding(text: string): string {
+    return text.replace(PAD_RUN_RE, ' ');
+}
+
+// Upper bound on chars-per-token for COLLAPSED text, used by the count gate
+// and the embedInput char cap. The only way past ~10 chars/token with this
+// tokenizer is whitespace runs (measured: padding ~127, base64 ~9.4, prose
+// ~4.5); post-collapse the longest run is PAD_RUN_MIN−1 chars, and no vocab
+// piece approaches 64 chars — so `len > budget × 64 ⇒ count > budget` holds
+// by construction, and the first budget-many tokens of any collapsed text
+// lie inside its first budget × 64 chars (what makes the embedInput cap
+// lossless for the truncation window).
+export const MAX_COLLAPSED_CHARS_PER_TOKEN = 64;
+
+// Estimator for gated (over-the-gate) texts only: same 4.5 chars/token the
+// bucket estimate uses (selectBucket, iframe-runner.ts). It OVERSTATES token
+// counts for the sparse text that gets gated, which is the safe direction —
+// hardSplitByTokens cuts proportionally smaller heads, and the verify loop
+// exact-recounts every emitted part anyway.
+const CHARS_PER_TOKEN_EST = 4.5;
+
+// Wraps the raw counter so that (a) every text is collapsed before the
+// tokenizer sees it and (b) texts still over the gate after collapse are
+// answered with a char estimate instead of being tokenized — the estimate is
+// provably > budget (gate = budget × MAX_COLLAPSED_CHARS_PER_TOKEN and
+// 64 > 4.5), so callers make the same over/under decision they would with an
+// exact count. This is the single choke point: enforceTokenBudget wraps once
+// and every internal countTokens call (units, header, verify, packLines,
+// hardSplitByTokens) inherits both protections.
+function gatedCounter(countTokens: CountTokens, budget: number): CountTokens {
+    const gate = budget * MAX_COLLAPSED_CHARS_PER_TOKEN;
+    return async (texts: string[]): Promise<number[]> => {
+        const out = new Array<number>(texts.length);
+        const passIdx: number[] = [];
+        const pass: string[] = [];
+        for (let i = 0; i < texts.length; i++) {
+            const t = collapsePadding(texts[i]);
+            if (t.length > gate) {
+                out[i] = Math.max(budget + 1, Math.ceil(t.length / CHARS_PER_TOKEN_EST));
+            } else {
+                passIdx.push(i);
+                pass.push(t);
+            }
+        }
+        if (pass.length) {
+            const counts = await countTokens(pass);
+            for (let j = 0; j < pass.length; j++) out[passIdx[j]] = counts[j];
+        }
+        return out;
+    };
+}
 
 // Below this content budget (title nearly fills the window) packing would
 // emit hundred-sliver chunks; treat the title as pathological instead.
@@ -89,7 +176,16 @@ export function embedInput(c: Chunk): string {
     // buildDenseSuffix). Appended LAST so it folds into chunk_id identically
     // (chunkIdFor's tail) and is what splitChunk reserves budget for. Absent on
     // notes with no qualifying values → the bare `title\n\ncontent` as before.
-    return c.denseSuffix ? `${base}\n\n${c.denseSuffix}` : base;
+    const full = c.denseSuffix ? `${base}\n\n${c.denseSuffix}` : base;
+    // Collapse + hard char cap (issue #4 defenses, header comment). The cap is
+    // lossless for the dense channel: post-collapse, 512 tokens always lie
+    // inside the first TOKEN_BUDGET × MAX_COLLAPSED_CHARS_PER_TOKEN chars, so
+    // only content already past the truncation point can be cut. It is only
+    // reachable for overBudget escapes — any part the verify loop emitted
+    // ≤ budget is under the cap, so its counted and embedded bytes stay
+    // identical. Carry-over keys (search.ts F13) call this same function on
+    // both the harvest and lookup sides within one build, so keys agree.
+    return collapsePadding(full).slice(0, TOKEN_BUDGET * MAX_COLLAPSED_CHARS_PER_TOKEN);
 }
 
 export interface TokenBudgetResult {
@@ -110,6 +206,9 @@ export async function enforceTokenBudget(
     countTokens: CountTokens,
     budget = TOKEN_BUDGET,
 ): Promise<TokenBudgetResult> {
+    // Single choke point for the issue-#4 defenses: every count below — here
+    // and throughout splitChunk — goes through the collapsed, gated counter.
+    countTokens = gatedCounter(countTokens, budget);
     const counts = chunks.length ? await countTokens(chunks.map(embedInput)) : [];
     const outChunks: Chunk[] = [];
     const outCounts: number[] = [];

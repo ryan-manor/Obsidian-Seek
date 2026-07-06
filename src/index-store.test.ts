@@ -232,6 +232,43 @@ describe('classifyFileDelta', () => {
         expect(classifyFileDelta(rec(1000, undefined), 2000)).toBe('dirty');
         expect(classifyFileDelta(rec(1000, undefined), 1000)).toBe('clean'); // but only when mtime moved
     });
+
+    // Embed-failure quarantine (issue #4): a record whose embed failed
+    // deterministically pins the file 'clean' at unchanged content (no retry
+    // churn), but retries exactly once per plugin release, and always retries
+    // on a real edit.
+    describe('embed-failure quarantine', () => {
+        const qrec = (version: string) => ({ mtimeMs: 1000, contentHash: 'aaa', embedFailPluginVersion: version });
+
+        it('same-build quarantine holds: unchanged file is clean (THE churn fix)', () => {
+            expect(classifyFileDelta(qrec('1.0.6'), 1000, undefined, '1.0.6')).toBe('clean');
+            expect(classifyFileDelta(qrec('1.0.6'), 2000, 'aaa', '1.0.6')).toBe('clean'); // mtime-only re-stamp
+        });
+
+        it('same-build quarantine with a moved mtime still takes the two-phase hash check', () => {
+            // Phase 1 of computeDelta's call pattern (no bytes yet): the quarantine
+            // rule must defer to check-bytes, not short-circuit either way.
+            expect(classifyFileDelta(qrec('1.0.6'), 2000, undefined, '1.0.6')).toBe('check-bytes');
+        });
+
+        it('a NEWER build retries the quarantined file once (dirty regardless of mtime/hash)', () => {
+            expect(classifyFileDelta(qrec('1.0.5'), 1000, undefined, '1.0.6')).toBe('dirty');
+            expect(classifyFileDelta(qrec('1.0.5'), 2000, 'aaa', '1.0.6')).toBe('dirty');
+        });
+
+        it('an edit retries the quarantined file (normal dirty path)', () => {
+            expect(classifyFileDelta(qrec('1.0.6'), 2000, 'bbb', '1.0.6')).toBe('dirty');
+        });
+
+        it('caller without a live version falls through to the normal rules', () => {
+            expect(classifyFileDelta(qrec('1.0.5'), 1000)).toBe('clean');
+        });
+
+        it('unquarantined records are untouched by the version argument', () => {
+            expect(classifyFileDelta(rec(1000, 'aaa'), 1000, undefined, '1.0.6')).toBe('clean');
+            expect(classifyFileDelta(rec(1000, 'aaa'), 2000, 'bbb', '1.0.6')).toBe('dirty');
+        });
+    });
 });
 
 // planRestoreOps is the one subtle bit of embed-free compaction: in-line-keyed

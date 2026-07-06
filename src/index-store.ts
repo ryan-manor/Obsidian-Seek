@@ -204,6 +204,22 @@ export interface FileRecord {
     // records written before this field shipped lack it and fall back to the
     // mtime-only path, which backfills the hash on their next re-embed.
     contentHash?: string;
+    // ── Embed-failure quarantine (issue #4) ─────────────────────────────────
+    // Set when ≥1 of this file's chunks DETERMINISTICALLY failed to embed: the
+    // failure survived the batch retry AND a solo retry, each behind a fresh-
+    // device recycle. The record commits the chunks that DID embed and pins the
+    // file 'clean' for classifyFileDelta — without it the file has no record,
+    // every computeDelta reports it dirty, and each retry costs two iframe
+    // teardowns + ~250 MB model reloads on every reconcile poll while wedging
+    // reconcileIdentityInPlace in 'drained' (the identity never stamps).
+    // The quarantine lifts when: the content changes (contentHash mismatch), a
+    // full reindex runs (records nuked), a peer's sidecar fully covers the file
+    // (hydrate overwrites this record — hydrate keys candidacy on missing
+    // chunk_ids, so a partial file stays eligible), or the plugin version
+    // advances (rule in classifyFileDelta: one retry per release, so a shipped
+    // embed-path fix un-quarantines the fleet automatically).
+    embedFailedChunks?: number;      // how many chunks are missing from chunk_ids
+    embedFailPluginVersion?: string; // build that recorded the failure
 }
 
 // Referential-integrity orphan finder: chunk_ids present in the index but
@@ -230,11 +246,19 @@ export function findOrphanChunkIds(allChunkIds: string[], referenced: ReadonlySe
 //                   the bytes, hash them, and re-call with `liveHash`.
 export type DeltaDecision = 'dirty' | 'clean' | 'check-bytes';
 export function classifyFileDelta(
-    prev: Pick<FileRecord, 'mtimeMs' | 'contentHash'> | undefined,
+    prev: Pick<FileRecord, 'mtimeMs' | 'contentHash' | 'embedFailPluginVersion'> | undefined,
     liveMtime: number,
     liveHash?: string,
+    livePluginVersion?: string,
 ): DeltaDecision {
     if (prev === undefined) return 'dirty';            // never indexed
+    // Embed-failure quarantine, retry-per-release: a record quarantined by a
+    // DIFFERENT build is dirty regardless of mtime/hash — the new build may have
+    // fixed the embed path, and one attempt per release is bounded. Same-build
+    // quarantine falls through to the normal rules, where the unchanged
+    // mtime/hash reads 'clean' (that IS the quarantine: no retry churn).
+    if (prev.embedFailPluginVersion !== undefined && livePluginVersion !== undefined
+        && prev.embedFailPluginVersion !== livePluginVersion) return 'dirty';
     // Strict equality, not <=: an mtime REGRESSION (file restored from backup /
     // iCloud conflict resolved to the older copy) carries different bytes behind
     // an older stamp — '<=' classified it clean and the index served the phantom

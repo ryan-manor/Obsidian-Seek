@@ -46,7 +46,11 @@ export type Dtype = 'q4f16' | 'q4' | 'q8' | 'fp32';
 // then fails ORT's WebGPU init while the report still reads as GPU-capable.
 // Also LoadEntry.glue — which ort-wasm glue variant actually loaded
 // (previously only recoverable from the `checks` strings).
-export const LOG_SCHEMA_VERSION = 13;
+// v14: IndexCompleteEntry.filesQuarantined / chunksFailedEmbed — embed-failure
+// quarantine accounting (issue #4): files committed WITH a failure marker
+// (deterministically-failing chunks omitted, healthy chunks searchable) vs the
+// old whole-file skip. Additive/forward-only.
+export const LOG_SCHEMA_VERSION = 14;
 
 // ---- chunk model ----
 
@@ -848,6 +852,13 @@ export interface IndexCompleteEntry {
     chunksIndexed: number;
     vectorsWritten: number;
     filesSkippedError: number;
+    // Embed-failure quarantine (v14, issue #4): files committed WITH a failure
+    // marker — some chunks deterministically failed (survived batch + solo
+    // retries, each behind a device recycle) and were omitted; the rest of the
+    // file stays searchable. A quarantined file also counts in
+    // filesSkippedError (content IS missing), keeping the pass gate's meaning.
+    filesQuarantined?: number;
+    chunksFailedEmbed?: number;
     // Incremental budget: files in the input list that were never started because
     // a per-burst budget (maxFiles / budgetMs / shouldContinue) cut the pass short.
     // 0 on a full reindex (always unbounded) and on a delta that ran to completion.

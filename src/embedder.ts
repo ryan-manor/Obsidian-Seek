@@ -136,7 +136,10 @@ export const LOCAL_MODEL = {
 // the define doesn't exist ('typeof' on an undeclared identifier yields
 // 'undefined' without throwing).
 declare const __PLUGIN_VERSION__: string;
-const PLUGIN_VERSION = typeof __PLUGIN_VERSION__ !== 'undefined' ? __PLUGIN_VERSION__ : '0.0.0';
+// Exported for the embed-failure quarantine (index-store.ts classifyFileDelta):
+// a quarantined file record carries the version that failed it, so a release
+// that fixes the embed path retries the file exactly once per version.
+export const PLUGIN_VERSION = typeof __PLUGIN_VERSION__ !== 'undefined' ? __PLUGIN_VERSION__ : '0.0.0';
 
 // Output vector dimension. SINGLE SOURCE OF TRUTH = the active model spec's
 // `dim` (model-registry.ts). The iframe's OUTPUT_DIM and the sidecar record
@@ -154,6 +157,11 @@ export class LocalEmbedder {
     private _device: Device = 'wasm';
     private _dtype: Dtype = 'q4';
     private _loaded = false;
+    // ort-wasm glue variant the current pipeline loaded with (plain/asyncify/jspi),
+    // null before the first successful load. Surfaced in embed-failure forensics —
+    // the wasm CPU path only gained GBQ4 coverage with the plain-glue override
+    // (1.0.5), so failures must be attributable to the exact binary variant.
+    private _glue: string | null = null;
 
     // Memoized iframe-init. onload fires init() un-awaited; a search that races
     // ahead coalesces onto this same promise inside load() (see init()/load()),
@@ -202,6 +210,7 @@ export class LocalEmbedder {
 
     get device(): Device { return this._device; }
     get dtype(): Dtype { return this._dtype; }
+    get glue(): string | null { return this._glue; }
     get loaded(): boolean { return this._loaded; }
     // Model id of the current/last pipeline — what the orchestrator stamps
     // into index meta so a later load can detect model-vs-index drift.
@@ -300,6 +309,7 @@ export class LocalEmbedder {
 
         this._device = result.device;
         this._dtype = result.dtype;
+        this._glue = result.glue ?? null;
         this._loaded = true;
         this.queryEmbedCache.clear();   // vectors are pipeline-specific; new load invalidates them
 
