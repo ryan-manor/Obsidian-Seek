@@ -532,19 +532,38 @@ export class MultiFieldBM25 {
     // them via IndexStore.getBodiesMap only on a (rare) refit; a missing id maps
     // to '' (same as the old `c.content ?? ''`). fromJSON below needs no bodies.
     fit(chunks: ChunkMeta[], bodies: ReadonlyMap<string, string>, opts?: { searchableProperties?: boolean; headingsField?: boolean }): this {
+        const { mini, docs } = this.prepareFit(chunks, bodies, opts);
+        mini.addAll(docs);
+        return this;
+    }
+
+    // fit() with a thread-yield every `sliceSize` docs, for main-thread callers
+    // (the cold-search/warm refit). PROVABLY identical output to fit(): MiniSearch
+    // 7's addAll is a plain per-document add() loop, so slicing preserves insertion
+    // order and therefore internal doc ids, postings, and toJSON byte-for-byte.
+    // The instance is unusable mid-flight (partial index) — callers must assign it
+    // to their cache field only AFTER this resolves, exactly like fit()'s pattern.
+    async fitAsync(chunks: ChunkMeta[], bodies: ReadonlyMap<string, string>, opts: { searchableProperties?: boolean; headingsField?: boolean } | undefined, yieldFn: () => Promise<void>, sliceSize = 500): Promise<this> {
+        const { mini, docs } = this.prepareFit(chunks, bodies, opts);
+        for (let i = 0; i < docs.length; i += sliceSize) {
+            mini.addAll(docs.slice(i, i + sliceSize));
+            if (i + sliceSize < docs.length) await yieldFn();
+        }
+        return this;
+    }
+
+    // Shared front half of fit()/fitAsync(): reset the index and build the docs
+    // in chunk order. Split out so the two paths can never drift on analyzer
+    // options or doc construction. Returns the fresh MiniSearch instance (also
+    // assigned to this.mini) so callers add docs without a nullability dance.
+    private prepareFit(chunks: ChunkMeta[], bodies: ReadonlyMap<string, string>, opts?: { searchableProperties?: boolean; headingsField?: boolean }): { mini: MiniSearch<IndexedDoc>; docs: IndexedDoc[] } {
         this.withProps = opts?.searchableProperties === true;
         this.withHeadings = opts?.headingsField === true;
         this.mapChunkIds(chunks);
-        this.mini = new MiniSearch<IndexedDoc>(this.buildMiniOptions(this.withProps, this.withHeadings));
+        const mini = new MiniSearch<IndexedDoc>(this.buildMiniOptions(this.withProps, this.withHeadings));
+        this.mini = mini;
         this.termUpperBounds.clear();   // fresh index → drop memoized per-term UBs
-
-        const docs: IndexedDoc[] = chunks.map(c => this.buildDoc(c, bodies.get(c.chunk_id) ?? ''));
-        // addAll is ~10x faster than per-doc add() because it defers
-        // internal index rebuilds until the batch completes. At 15k chunks
-        // this matters — single-add fit time was ~600 ms in early dev,
-        // batched is ~80 ms.
-        this.mini.addAll(docs);
-        return this;
+        return { mini, docs: chunks.map(c => this.buildDoc(c, bodies.get(c.chunk_id) ?? '')) };
     }
 
     // Build the MiniSearch document for one chunk + its body, with the field set

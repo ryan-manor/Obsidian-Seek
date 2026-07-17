@@ -169,6 +169,12 @@ export interface LoadResult {
     // Closes the diagnostics gap where the running glue was only ever visible
     // in failure strings.
     glue: string | null;
+    // WASM sessions only: whether the pipeline landed in ort-web's proxy
+    // worker (off-main-thread inference — issue #5). Always false on the
+    // webgpu path (the webgpu EP can't ride the proxy).
+    proxy: boolean;
+    proxyAttempted: boolean;
+    proxyError: string | null;
 }
 
 // Unsolicited iframe→parent push (not an RPC reply): WebGPU device lifecycle
@@ -858,6 +864,9 @@ async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, r
                             warmupSkipped: !!skipWarmup,
                             webgpuAttempted, webgpuError: null,
                             glue: r.glue ?? null,
+                            // The proxy worker is wasm-EP-only (the webgpu EP
+                            // needs its device on the creating thread).
+                            proxy: false, proxyAttempted: false, proxyError: null,
                         };
                     } catch (e) {
                         webgpuError = String(e);
@@ -899,13 +908,45 @@ async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, r
         }
         return e;
     };
+    // Proxy-worker first (issue #5): host the ENTIRE wasm backend — binary
+    // compile, session init (the coldStartMs >= 5000 block), and every
+    // session.run — in ort-web's own proxy worker, so CPU inference stops
+    // sharing the app's main thread. Same glue, same single-threaded kernels
+    // (no crossOriginIsolated either way), so vectors and throughput are
+    // identical; only which thread burns changes. ANY failure — Worker
+    // blocked by CSP, the glue import failing inside the worker, session
+    // create — falls through to the exact pre-proxy ladder below, so the
+    // worst case is precisely the old behavior. proxyError rides the
+    // LoadResult so a fleet-wide silent fallback is visible in reports.
+    let wasmGlue = null;
+    let proxyAttempted = false;
+    let proxyError = null;
+    if (typeof Worker === 'function') {
+        proxyAttempted = true;
+        try {
+            const { createPipeline, env } = await freshTransformers(modelId);
+            wasmGlue = overrideGlueForWasm(env);
+            env.backends.onnx.wasm.proxy = true;
+            pipeline = await createPipeline('feature-extraction', modelId, { device: 'wasm', dtype: requestedDtype, ...(revision ? { revision } : {}) });
+            return {
+                device: 'wasm', dtype: requestedDtype,
+                coldStartMs: performance.now() - t0,
+                warmupMs: null,
+                warmupSkipped: false,
+                webgpuAttempted, webgpuError,
+                glue: wasmGlue,
+                proxy: true, proxyAttempted, proxyError: null,
+            };
+        } catch (e) {
+            proxyError = String(e);
+        }
+    }
     // SIMD retry: transformers.js v3+ requires SIMD in sandboxed iframe /
     // WKWebView contexts; auto-detection can silently report "no available
     // backend" instead of falling back. Catch that case and retry — again on
     // a fresh instance, since the failure just poisoned this one — with SIMD
     // + multithread explicitly disabled (the conservative path the runtime
     // would have picked if detection had worked).
-    let wasmGlue = null;
     try {
         const { createPipeline, env } = await freshTransformers(modelId);
         wasmGlue = overrideGlueForWasm(env);
@@ -934,6 +975,7 @@ async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, r
         warmupSkipped: false,
         webgpuAttempted, webgpuError,
         glue: wasmGlue,
+        proxy: false, proxyAttempted, proxyError,
     };
 }
 

@@ -956,3 +956,53 @@ describe('link_terms fold into the content field (v10)', () => {
         expect(idx.getScores('rapha jersey')[0]).toBeGreaterThan(0);
     });
 });
+
+// fitAsync must be BYTE-IDENTICAL to fit() — it exists purely to yield the main
+// thread during the cold build (issue #5 QoL); any output difference would be a
+// relevance change, which that PR explicitly forbids. Serialized-index equality
+// is the strongest practical check: same postings, same internal ids, same
+// field options ⇒ same scores for every query.
+describe('fitAsync ≡ fit (main-thread-yield refit, issue #5)', () => {
+    const corpus = (n: number) =>
+        Array.from({ length: n }, (_, i) =>
+            makeChunk(`c${i}`, `Note ${i}`, `alpha bravo charlie${i % 7} delta echo ${i % 3 === 0 ? 'foxtrot' : 'golf'} repeated word${i % 11}`,
+                i % 2 === 0 ? ['project'] : [], i % 5 === 0 ? [`alias${i}`] : []));
+
+    async function fitBoth(chunks: ReturnType<typeof makeChunk>[], opts?: { searchableProperties?: boolean; headingsField?: boolean }, sliceSize?: number) {
+        const bodies = new Map(chunks.map(c => [c.chunk_id, c.content]));
+        const sync = new MultiFieldBM25().fit(chunks, bodies, opts);
+        let yields = 0;
+        const async_ = await new MultiFieldBM25().fitAsync(chunks, bodies, opts, () => { yields++; return Promise.resolve(); }, sliceSize);
+        return { sync, async_, yields };
+    }
+
+    it('produces an identical serialized index (multi-slice)', async () => {
+        const { sync, async_, yields } = await fitBoth(corpus(23), undefined, 5);
+        expect(yields).toBe(4);   // 23 docs / 5 per slice → yields between slices only
+        expect(JSON.stringify(async_.toJSON())).toBe(JSON.stringify(sync.toJSON()));
+    });
+
+    it('identical with properties + headings fields on', async () => {
+        const chunks = corpus(17).map((c, i) => ({
+            ...c,
+            heading_path: [`H${i % 4}`],
+            metadata: { ...c.metadata, properties: { status: `s${i % 3}` } },
+        }));
+        const { sync, async_ } = await fitBoth(chunks, { searchableProperties: true, headingsField: true }, 4);
+        expect(JSON.stringify(async_.toJSON())).toBe(JSON.stringify(sync.toJSON()));
+    });
+
+    it('identical scores for a probe query', async () => {
+        const { sync, async_ } = await fitBoth(corpus(40), undefined, 7);
+        const q = 'alpha foxtrot word3';
+        const a = sync.getScoresWithCoverage(q);
+        const b = async_.getScoresWithCoverage(q);
+        expect(b).toEqual(a);
+    });
+
+    it('single slice (docs < sliceSize) never yields', async () => {
+        const { sync, async_, yields } = await fitBoth(corpus(3), undefined, 500);
+        expect(yields).toBe(0);
+        expect(JSON.stringify(async_.toJSON())).toBe(JSON.stringify(sync.toJSON()));
+    });
+});

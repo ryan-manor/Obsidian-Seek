@@ -655,6 +655,17 @@
     font-weight: inherit;
 }
 
+/* Query-term marks painted onto the rendered snippet (decorateSnippetMarks,
+   search-modal.ts). Theme highlight background, but color:inherit keeps the
+   muted snippet tone — the row is single-line context, so the theme's mark
+   foreground would shout over the title above it. */
+.seek-result-snippet .seek-snippet-mark {
+    background-color: var(--text-highlight-bg);
+    color: inherit;
+    padding: 0 1px;
+    border-radius: 2px;
+}
+
 .seek-result-meta {
     display: flex;
     flex-wrap: wrap;
@@ -701,6 +712,64 @@
     margin-top: 4px;
     font-size: 12px;
     color: var(--text-faint);
+}
+
+/* Recent searches (resting state — no active query) */
+.seek-recents {
+    padding: 6px 8px;
+}
+.seek-recent {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-radius: 9px;
+    cursor: pointer;
+    color: var(--text-muted);
+}
+.seek-recent:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+.seek-recent-icon {
+    display: flex;
+    align-items: center;
+    color: var(--text-faint);
+}
+.seek-recent-icon svg {
+    width: 14px;
+    height: 14px;
+}
+.seek-recent-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* The ✕ appears on row hover (kept in the layout, faded, so the text never
+   shifts). Touch has no hover — .seek-mobile keeps it visible outright. */
+.seek-recent-remove {
+    display: flex;
+    align-items: center;
+    padding: 2px;
+    border-radius: 4px;
+    color: var(--text-faint);
+    opacity: 0;
+}
+.seek-recent:hover .seek-recent-remove {
+    opacity: 1;
+}
+.seek-recent-remove:hover {
+    color: var(--text-normal);
+    background: var(--background-modifier-hover);
+}
+.seek-recent-remove svg {
+    width: 14px;
+    height: 14px;
+}
+.seek-mobile .seek-recent-remove {
+    opacity: 1;
 }
 
 /* Cold-start onboarding state (empty index) */
@@ -774,6 +843,14 @@
     background: var(--background-secondary);
     font-size: 11.5px;
     color: var(--text-muted);
+    /* The bar's full complement of hints has an intrinsic width (~740px) wider
+       than common modal widths, which pushed the esc cap over the modal's
+       corner radius. inline-size containment pins the bar to the modal's width
+       so the tiers below (container queries — a media query can't see the
+       MODAL's width) can shed hints as it narrows; overflow:hidden is the
+       no-container-query fallback where clipping beats painting past the edge. */
+    container-type: inline-size;
+    overflow: hidden;
 }
 
 .seek-foot-grp {
@@ -781,6 +858,27 @@
     align-items: center;
     gap: 3px;
     white-space: nowrap;
+}
+
+/* Hint shedding, lowest priority first. navigate/open, copy link (a real
+   action, not a hint) and esc are never shed. Mobile is untouched — it already
+   drops every hint group (see the .seek-mobile rule above).
+
+   Thresholds are measured, not guessed: @container compares the bar's
+   CONTENT-box width (modal width − 28px padding) and each tier fires just
+   before the bar with that hint still present would overflow. Measured groups
+   (macOS labels) sum to 646px content incl. gaps; the widest label variants
+   ("Shift" for ⇧, "new window" for the alt-open hint) add ~45px, so tiers sit
+   at the worst-case sum + margin — at most one hint sheds a few px early on
+   the narrow variants, which beats clipping. Re-measure if hints change. */
+@container (max-width: 700px) {
+    .seek-foot-grp-autosuggest { display: none; }
+}
+@container (max-width: 565px) {
+    .seek-foot-grp-insertlink { display: none; }
+}
+@container (max-width: 435px) {
+    .seek-foot-grp-alt { display: none; }
 }
 
 .seek-foot-spacer {

@@ -33,7 +33,7 @@ import type { App } from 'obsidian';
 import type {
     LogEntry, LogMeta, InitEntry, PlatformEntry,
     IndexCompleteEntry, SearchEntry, ErrorEntry,
-    CrashDetectedEntry, LoadEntry,
+    CrashDetectedEntry, LoadEntry, LongTaskEntry,
 } from './types';
 import { LOG_SCHEMA_VERSION } from './types';
 import { isMobilePlatform } from './platform';
@@ -731,9 +731,31 @@ export class SeekLogger {
             // and corrupt the rest of the section.
             const errText = lastLoad.webgpuError ? lastLoad.webgpuError.replace(/[`\n\r]/g, ' ').slice(0, 300) : null;
             const webgpuNote = errText ? ` · webgpu fell back: \`${errText}\`` : '';
-            lines.push(`- Last model load: ${lastLoad.actualDevice} (dtype=${lastLoad.dtype})${lastLoad.glue ? ` · glue ${lastLoad.glue}` : ''}${webgpuNote}`);
+            // === true guards: rows written by older plugin versions predate the
+            // proxy fields, and undefined must read as "not attempted", not falsy-false.
+            const proxyNote = lastLoad.proxy === true ? ' · proxy worker'
+                : (lastLoad.proxyAttempted === true ? ' · ⚠️ proxy fell back to main thread' : '');
+            lines.push(`- Last model load: ${lastLoad.actualDevice} (dtype=${lastLoad.dtype})${lastLoad.glue ? ` · glue ${lastLoad.glue}` : ''}${proxyNote}${webgpuNote}`);
         }
         lines.push(`- Searches ${searches.length} · index runs ${indexes.length} · errors ${errors.length} · crashes ${crashes.length}`);
+        // Main-thread stall rollup by phase (issue #5): the question every jank
+        // triage starts with — WHAT was Seek doing during the stalls — answered
+        // in the summary instead of via hand-grepping the JSON. 'idle' here
+        // means genuinely outside every Seek phase (pre-1.0.7 rows: unknown).
+        const longTasks = filterByType<LongTaskEntry>(d.entries, 'long-task');
+        if (longTasks.length > 0) {
+            const byCtx = new Map<string, { n: number; totalMs: number; maxMs: number }>();
+            for (const t of longTasks) {
+                const s = byCtx.get(t.context) ?? { n: 0, totalMs: 0, maxMs: 0 };
+                s.n++; s.totalMs += t.durationMs; s.maxMs = Math.max(s.maxMs, t.durationMs);
+                byCtx.set(t.context, s);
+            }
+            const parts = [...byCtx.entries()]
+                .sort((a, b) => b[1].totalMs - a[1].totalMs)
+                .map(([ctx, s]) => `\`${ctx}\` ${s.n}× (${(s.totalMs / 1000).toFixed(1)} s total · max ${(s.maxMs / 1000).toFixed(1)} s)`);
+            lines.push('\n## Main-Thread Stalls (long tasks ≥250 ms, capped sample)');
+            for (const p of parts) lines.push(`- ${p}`);
+        }
         if (crashes.length > 0) {
             const c = crashes[crashes.length - 1];
             lines.push('\n## ⚠️ Last Crash');

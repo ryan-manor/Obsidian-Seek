@@ -281,7 +281,7 @@ export interface SeekSettings {
     // the half-life decay below, so ε is literally the maximum score a
     // brand-new note can gain. The shipped DEFAULT is now 0 — recency ships Off
     // (2026-06-19 settings ratification). The Recency segmented control maps
-    // Off=0 / Default=0.04·180d / High=0.1·270d; the old 0.02 always-on tiebreaker
+    // Off=0 / Default=0.04·180d / High=0.1·90d; the old 0.02 always-on tiebreaker
     // is retired. A non-zero ε ("Default"/"High") is a deliberate recency lean: raising it past
     // ~0.1 lets a fresh note leapfrog a moderately-better older one. CAUTION,
     // not a free lever: the 06-04 click study found 50% of episodic clicks
@@ -296,9 +296,20 @@ export interface SeekSettings {
     // halves. This is the time CONSTANT, orthogonal to the weight above: it
     // reshapes the curve, it does not change how hard recency hits. Shipped
     // DEFAULT 180 (the 06-04 operating point — wide enough that an 83-day-old
-    // median episodic target still carries ~0.73). A SHORT half-life (7–30) is
-    // the other half of a "high recency" mode: it concentrates the boost on the
-    // last days ("what was I just working on"); a long one spreads it gently.
+    // median episodic target still carries ~0.73). The Recency "High" stage
+    // SHORTENS it to 90 (settings-tab.ts RECENCY_VALUE), which is what actually
+    // makes High a lean: ε sets the budget, the half-life decides how much of it
+    // is spent inside the age band a query spans. 90 ≈ the 83d median episodic
+    // click target, i.e. the knee sits on the click mass.
+    // Do NOT chase a shorter one (7–30) for a "browse by date" feel: it wins the
+    // dated-series case but zeroes the far field, and an ε that no longer decays
+    // gently stops behaving like a tiebreaker — on a flat no-opinion pool it is
+    // the only live signal and orders the whole result set by date. That is
+    // exactly the two-stage 30d-cutoff bug this smooth decay replaced. The fix
+    // for genuine browse intent is a conditional regime (detecting that the pool
+    // is a tied set of equivalent dated siblings, not merely flat), NOT a smaller
+    // constant — a scalar cannot separate the two: measured spreads are 0.032
+    // (dated siblings) vs 0.011 (nothing matched), only 3× apart.
     // Undated notes score 0 (neutral — never penalized). Applied per-search
     // (no reindex). Default 180.
     recencyHalfLifeDays: number;
@@ -455,6 +466,20 @@ export interface SeekSettings {
     // Pure presentation; applies to the next time the search modal opens.
     showHotkeyHints: boolean;
 
+    // Where the ALT open gesture sends a result. Opening a result is one of two
+    // gestures: a plain Enter/click replaces the current tab and dismisses the
+    // modal (the quick-switcher contract — never configurable), and an ALT open
+    // (⌘/Ctrl+Enter or ⌘/Ctrl+click) that fans out to a background leaf with the
+    // modal kept open. This picks WHERE that alt leaf goes: 'tab' (default —
+    // the historical background-new-tab), 'split', or 'window', mirroring
+    // workspace.getLeaf()'s PaneType. Coerced to 'tab' on mobile at the use-site
+    // (search-modal.ts altOpenTarget): phones have no splits or popout windows,
+    // and no modifier keys to reach the alt path anyway — the guard covers a
+    // desktop 'split'/'window' choice arriving via synced data.json. Pure
+    // presentation; applies to the next time the search modal opens.
+    altOpenLocation: AltOpenLocation;
+
+
     // NOTE: the compute backend (WebGPU vs WASM) is deliberately NOT a setting.
     // It is a property of the DEVICE, not the vault, and data.json syncs across
     // devices (iCloud / Obsidian Sync) — a toggle here would be shared, so the
@@ -519,6 +544,10 @@ export interface SeekSettings {
 // fusion.ts recencyDate (the single accessor all recency consumers read through).
 export type RecencyKeyChoice = 'created' | 'modified';
 
+// Alt-open destination (⌘/Ctrl+Enter / ⌘/Ctrl+click) — see
+// SeekSettings.altOpenLocation. Values mirror workspace.getLeaf()'s PaneType.
+export type AltOpenLocation = 'tab' | 'split' | 'window';
+
 // Sidecar index folder placement — see SeekSettings.sidecarIndexLocation.
 // 'config'  = hidden literal '.obsidian/plugins/seek/index' (default; covers
 //             iCloud/Syncthing at any config naming + Obsidian Sync uniform config)
@@ -530,8 +559,8 @@ export const DEFAULT_SETTINGS: SeekSettings = {
     navTitleBoost: 0.5,        // Title-bonus "Default" stage (segmented 0=Off / 0.5=Default / 0.8=High); softened from the 0.8 swept knee per the 2026-06-19 settings ratification — see field comment
     recencyKey: 'modified',    // global definition of "recent" (ε-tiebreaker + recency arm + browse sort + before:/after:); mtime is the only universally-present date → the generic default; 'created' (a frontmatter date prop, see createdProp) is an opt-in for true creation-recency
     createdProp: 'created',    // frontmatter property holding the creation date (vault convention; falls back to filename date, then mtime)
-    recencyEpsilon: 0,         // ships Off (Recency segmented Off=ε0 / Default=ε0.04·180d / High=ε0.1·270d); was a 0.02 tiebreaker pre-2026-06-19 ratification — additive ε in final = hybrid + ε·recency + titleBoost (see field comment)
-    recencyHalfLifeDays: 180,  // recency decay HALF-LIFE in days (0.5^(daysOld/HL)); 180 = 06-04 operating point, shorten (7–30) to concentrate on the last days
+    recencyEpsilon: 0,         // ships Off (Recency segmented Off=ε0 / Default=ε0.04·180d / High=ε0.1·90d); was a 0.02 tiebreaker pre-2026-06-19 ratification — additive ε in final = hybrid + ε·recency + titleBoost (see field comment)
+    recencyHalfLifeDays: 180,  // recency decay HALF-LIFE in days (0.5^(daysOld/HL)); 180 = 06-04 operating point. Do NOT shorten to 7–30: it hijacks flat no-opinion pools (see the field comment above — that advice was measured wrong and reversed 2026-07-16). The Recency High stage is the supported lean, at 90.
     fuzzyEnabled: true,        // typo tolerance ON by default (edit dist scales by term length, ≤3 exact; see bm25.ts FUZZY_BY_LENGTH); +3–4/40 gold@1 on typo'd entity queries, ns cost on clean
     prefixLastToken: true,     // last-token prefix expansion ON by default; +0.0064 personal nDCG, stress sets clean; see field comment
     synonymExpansion: true,    // ON (hidden) per the 2026-06-19 ratification; alias-dictionary query expansion (Lr↔Lightroom); BM25-dict refit, no reindex — see field comment
@@ -544,9 +573,10 @@ export const DEFAULT_SETTINGS: SeekSettings = {
     showScores: false,         // OFF by default: per-result score line (Matching % · recency · title); opt-in via Display settings. (Also auto-hidden until the corpus is calibrated — ≥200 notes + full pass.) Default-only flip, no migration: installs that already persisted showScores keep their choice.
     verboseTrace: false,       // OFF: persist only the top-10 ranking trace per search (what the report shows); ON = full 50-deep tail for offline eval. Diagnostic-only, no UI
     showHotkeyHints: true,     // ON: show the modal footer keyboard-hint bar + result counter; OFF = full-results-only modal
+    altOpenLocation: 'tab',    // ⌘/Ctrl open target (tab/split/window); 'tab' preserves the historical background-new-tab fan-out. New key, no migration: Object.assign backfills
     sidecarEnabled: true,      // ON (hidden) per the 2026-06-19 ratification; vault-file index persistence for iOS-eviction survival + cross-device sync; only Index location stays user-facing; seeds on next reindex — see field comment
     sidecarIndexLocation: 'config', // hidden literal '.obsidian/plugins/seek/index'; 'visible' = vault-root 'Seek Index/' for split-config Obsidian Sync; see field comment
-    settingsRev: 8,            // current schema rev; bump alongside a migration in main.ts onload (rev 8 = 2026-06-27 denseWeight 0.80→0.85 re-eval)
+    settingsRev: 9,            // current schema rev; bump alongside a migration in main.ts onload (rev 9 = 2026-07-16 Recency High half-life 270→90)
 };
 
 // One-time settings migrations, keyed on the persisted settingsRev. Applied to the
@@ -612,11 +642,25 @@ export function migrateSettings(raw: Partial<SeekSettings>): Partial<SeekSetting
     // so a pre-bound install whose 0.92 the rev-2 surgery already dropped lands on 0.85
     // too. Score-time only: no reindex/refit (the dense weight is applied at fusion).
     if (fromRev < 8 && raw.denseWeight === 0.80) raw.denseWeight = 0.85;
+    // Rev 9 (2026-07-16 High half-life fix): the Recency "High" stage's half-life moves
+    // 270 → 90. High LENGTHENED the decay past Default's 180, which made it inert at the
+    // episodic-browse case it exists for (measured: newest dated sibling at rank 9 of its
+    // own series; rank 3 at 90). The stage is a value map in settings-tab.ts, so the fix
+    // only reaches an existing High user through their PERSISTED value — recencyStageOf()
+    // snaps the segmented pill on ε alone, so ε=0.1 keeps rendering as "High" while the
+    // stale 270 silently keeps ranking. Without this they'd have to re-pick High to get it.
+    // Gate on the exact 270: settings-tab.ts is the only site that persists this key and
+    // only the High stage ever wrote 270 (Off/Default and DEFAULT_SETTINGS are all 180),
+    // so this is a precise "picked High" signature, not a default-collision. A value hand-
+    // tuned to exactly 270 under an older build that exposed the raw knob is indistinguish-
+    // able and gets moved — same accepted trade as rev 7. Score-time only: no reindex, no
+    // BM25 refit (the half-life is applied at fusion).
+    if (fromRev < 9 && raw.recencyHalfLifeDays === 270) raw.recencyHalfLifeDays = 90;
     // Never DOWNGRADE the stamp: a data.json synced from a device running a newer
-    // Seek (rev 9+) must keep its rev, or this older build stamps it back to 8 and
+    // Seek (rev 10+) must keep its rev, or this older build stamps it back to 9 and
     // the newer device re-runs its migrations on next load (conditional default
     // moves misfire on second application).
-    raw.settingsRev = Math.max(fromRev, 8);
+    raw.settingsRev = Math.max(fromRev, 9);
     return raw;
 }
 
@@ -819,6 +863,14 @@ export interface LoadEntry {
     // WebGPU) or 'plain' (non-WebKit wasm pin — the only ort-wasm build with
     // the CPU GatherBlockQuantized kernel). Previously only in `checks` text.
     glue: string | null;
+    // WASM path only (issue #5): true when the session lives in ort-web's
+    // proxy worker (compile + init + every run off the main thread). false +
+    // proxyAttempted=true + proxyError = the proxy leg failed and we fell
+    // back to in-thread wasm (the pre-1.0.7 behavior) — a fleet-wide silent
+    // fallback here is a diagnosable regression, not an invisible one.
+    proxy: boolean;
+    proxyAttempted: boolean;
+    proxyError: string | null;
     pass: boolean;
     checks: string[];
 }
@@ -1028,6 +1080,7 @@ export interface ClickEntry {
     bm25: number;
     recency: number;
     title_boost: number;
+    titleNavOpen: boolean;   // open landed at doc top via the title-nav intent gate
     dwellMs: number;         // ms between search completion and the click
     shownTop10: string[];    // chunk_ids the user passed over (or chose from)
 }
@@ -1066,7 +1119,11 @@ export interface LongTaskEntry {
     durationMs: number;
     startTimeMs: number;
     attribution: string | null; // PerformanceLongTaskTiming.attribution[0].name when available
-    context: string;            // 'indexing' | 'search' | 'idle' — set by main.ts when wiring observer
+    // Which plugin phase the task overlapped (span attribution — task-context.ts):
+    // 'search' | 'indexing' | 'catchup' | 'model-load' | 'bm25-warm' | 'reconcile',
+    // or 'idle' = genuinely no Seek phase was running (pre-1.0.7 reports labeled
+    // ALL unattributed phases 'idle' — treat old 'idle' rows as unknown).
+    context: string;
 }
 
 // Captured on `visibilitychange` (hidden) and `pagehide`. The user-visible

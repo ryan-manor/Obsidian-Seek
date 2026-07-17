@@ -17,7 +17,7 @@
 import { App, PluginSettingTab, Setting, Notice, setIcon } from 'obsidian';
 import type SeekPlugin from './main';
 import type { IndexStats, ModelStatus } from './main';
-import type { SidecarIndexLocation } from './types';
+import type { AltOpenLocation, SidecarIndexLocation } from './types';
 import { DEFAULT_SETTINGS, MATCH_STRENGTH_MIN_NOTES } from './types';
 import {
     getBackendOverride, setBackendOverride, isWebgpuDemoted, clearWebgpuDemoted,
@@ -66,12 +66,42 @@ function titleStageOf(v: number): Stage {
 }
 
 // Recency bonus maps {recencyEpsilon, recencyHalfLifeDays} onto three stages. Off=ε0
-// (ships Off), Default=0.04·180d, High=0.1·270d (see types.ts recencyEpsilon). ε≤0 is
+// (ships Off), Default=0.04·180d, High=0.1·90d (see types.ts recencyEpsilon). ε≤0 is
 // Off; otherwise snap to the nearer of Default/High by ε.
+//
+// High's half-life SHORTENS past Default (180→90) — it does not lengthen. High shipped
+// at 270d through 2026-07-16, which made it inert at the thing it advertises: ε is the
+// budget, but the half-life decides how much of that budget is spent in the age band
+// the query actually spans. Live-vault measurement ("brian 1x1", ~40 dated siblings,
+// full-series base hybrid+title spread 0.032): the today-vs-36d recency swing is 0.0088
+// at 270d, so the newest sibling sat at rank 9 of its own series; at 90d it is 0.0242 —
+// enough for rank 3, not rank 1, since 0.0242 is still under the series spread (it only
+// has to beat the gap to each competitor, never the full range). ε was never the
+// problem; 0.1 was already enough budget.
+//
+// High IS a lean, deliberately — types.ts recencyEpsilon says so, and that is why it is
+// opt-in rather than the default. Over the competitive 0–100d band the 90d recency range
+// (~0.054) exceeds the 0.032 sibling spread, so inside a dated series date now leads
+// relevance. ranker.ts's "ε must NEVER become a lean" governs the always-on DEFAULT
+// tiebreaker (ε 0.02, now 0), not this opt-in stage. 270 making High *gentler* than
+// Default was the incoherence.
+//
+// 90 is anchored, not swept: the 06-04 click study's MEDIAN episodic click target is 83d
+// old (see types.ts recencyHalfLifeDays), so the decay's knee sits on the click mass.
+// Don't chase shorter. What a short half-life buys is how far a 0-day note outruns the
+// pool's TYPICAL AGE — against a 60d note a brand-new one gains +0.014 at 270d but +0.075
+// at 30d — so the shorter it gets, the more a fresh note overtakes a hybrid deficit it
+// never earned. (The term's total range over 0–730d is ~0.085–0.100 at EVERY half-life,
+// so that number tells you nothing; the advantage over the pool's real age mass is the
+// one that moves ranks.) Swept live on a FLAT no-opinion pool — a query nothing matches:
+// purely topical through 180d, one recent intruder at 120–60d, intruder at rank 2 by 45d,
+// and at 30d today's notes displace the topical results outright, which is the 30d-cutoff
+// bug the smooth decay replaced. A monotonic slide, not a cliff: 90 buys the dated-series
+// fix while a flat pool stays essentially topical. See [[seek-recency-halflife-high-mode]].
 const RECENCY_VALUE: Record<Stage, { eps: number; hl: number }> = {
     Off: { eps: 0, hl: 180 },
     Default: { eps: 0.04, hl: 180 },
-    High: { eps: 0.1, hl: 270 },
+    High: { eps: 0.1, hl: 90 },
 };
 function recencyStageOf(eps: number): Stage {
     if (eps <= 0) return 'Off';
@@ -558,6 +588,27 @@ export class SeekSettingTab extends PluginSettingTab {
             .setName('Keyboard hints bar')
             .setDesc('Displays a keyboard hint bar under results in the results modal.')
             .addToggle(t => t.setValue(this.s.showHotkeyHints).onChange(async v => { this.s.showHotkeyHints = v; await this.save(); }));
+
+        // Alt-open destination. A plain Enter/click always replaces the current
+        // tab (the quick-switcher contract; not configurable) — this picks where
+        // the ⌘/Ctrl alt-open fans out instead. Mobile coerces to a tab at the
+        // use-site (search-modal.ts altOpenTarget), so no per-platform gating here.
+        const ALT_OPEN_VALUE: Record<string, AltOpenLocation> = {
+            'New tab': 'tab', 'New split': 'split', 'New window': 'window',
+        };
+        const ALT_OPEN_LABEL: Record<AltOpenLocation, string> = {
+            tab: 'New tab', split: 'New split', window: 'New window',
+        };
+        const altOpen = new Setting(containerEl)
+            .setName('Open results with Cmd/Ctrl in')
+            .setDesc('Where a result opens when you hold Cmd/Ctrl while clicking or pressing Enter. A plain click or Enter always opens in the current tab.');
+        this.addSegmented(altOpen, Object.keys(ALT_OPEN_VALUE), ALT_OPEN_LABEL[this.s.altOpenLocation], (pick) => {
+            void (async () => {
+                this.s.altOpenLocation = ALT_OPEN_VALUE[pick];
+                await this.save();
+                this.rerender(); // repaint the segmented control's active pill
+            })();
+        });
     }
 
     // ---- Model & performance -------------------------------------------------------

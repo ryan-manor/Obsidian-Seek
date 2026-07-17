@@ -50,9 +50,18 @@ export function maskNonBodyText(content: string): string {
 
 const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-// Find the first in-window occurrence of each query token over a markup-masked,
-// lowercased view of the note and return its [from,to] char offsets into the
+// Per-token cap on collected occurrences. The flash decorates ONE chunk window
+// (~a few hundred words); the cap only bounds pathological repetition from
+// growing the RangeSet, never a normal chunk.
+const MAX_OCCURRENCES = 32;
+
+// Find EVERY in-window occurrence of each query token over a markup-masked,
+// lowercased view of the note and return their [from,to] char offsets into the
 // ORIGINAL `content` (the mask preserves length, so the offsets transfer back).
+// All occurrences, not the first (2026-07-13): the snippet window is now chosen
+// by passage scoring (passage.ts), so the sentence the modal showed may hold
+// the SECOND or LATER occurrence of a token — first-only flashing would open
+// the note with the snippet's own evidence unhighlighted.
 //
 // `\b<tok>\w*` anchors to a word START and extends to the word end, so a token
 // never lands mid-word ("of" can't match inside "professional") and a query
@@ -84,8 +93,12 @@ export function buildHighlightRanges(
         if (tok.length < 2 || stopwords.has(tok)) continue;
         const re = new RegExp(`\\b${escapeRegExp(tok)}\\w*`, 'g');
         re.lastIndex = lineStart;
-        const m = re.exec(masked);
-        if (m && m.index < windowEnd) raw.push([m.index, m.index + m[0].length]);
+        let m: RegExpExecArray | null;
+        let count = 0;
+        while (count < MAX_OCCURRENCES && (m = re.exec(masked)) !== null && m.index < windowEnd) {
+            raw.push([m.index, m.index + m[0].length]);
+            count++;
+        }
     }
 
     raw.sort((a, b) => a[0] - b[0]);

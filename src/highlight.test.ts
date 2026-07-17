@@ -72,6 +72,17 @@ describe('buildHighlightRanges — ordering (out-of-order drift regression)', ()
     });
 });
 
+describe('buildHighlightRanges — all in-window occurrences (passage-window consistency)', () => {
+    it('collects every occurrence of a token, not just the first', () => {
+        // The snippet window is chosen by passage scoring, so the shown sentence
+        // may hold a LATER occurrence — the flash must cover all of them.
+        const src = 'pillars start it, then pillars again, and pillars close it\n';
+        const ranges = buildHighlightRanges(src, ['pillars'], 0, src.length, STOP);
+        expect(ranges.length).toBe(3);
+        for (const r of ranges) expect(src.slice(...r)).toBe('pillars');
+    });
+});
+
 describe('buildHighlightRanges — offset defence', () => {
     it('drops overlapping ranges, keeping a disjoint ascending set', () => {
         // Both tokens' first match resolves to the same "pillars" span → overlap.

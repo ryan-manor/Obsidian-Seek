@@ -40,6 +40,20 @@ function schedulerYield(): Promise<void> | null {
     return typeof s?.yield === 'function' ? s.yield() : null;
 }
 
+// Cheap thread-yield for LATENCY-SENSITIVE paths (the cold-search BM25 fit):
+// gives the compositor/input a turn WITHOUT waiting for a full idle window.
+// CompositorPacer's rIC wait is correct for background work (reindex, catch-up,
+// compaction) where deferring to the user is the point — but on a path the
+// user is actively waiting on, an rIC could stall up to IDLE_TIMEOUT_MS per
+// yield under load. scheduler.yield() is continuation-preserving (our resume
+// runs ahead of other queued tasks); setTimeout(0) is the universal fallback
+// (~1-4 ms). Both bound the added latency to milliseconds per call.
+export function cheapYield(): Promise<void> {
+    const yielded = schedulerYield();
+    if (yielded) return yielded;
+    return new Promise<void>(resolve => window.setTimeout(() => resolve(), 0));
+}
+
 export class CompositorPacer {
     // Idle deadline granted by the most recent rIC callback, else null (never
     // run, or not on the rIC path). timeRemaining() decays toward 0 as the

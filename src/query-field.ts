@@ -59,6 +59,10 @@ export interface PillQueryFieldCallbacks {
     onNavigate: (dir: 1 | -1) => void;
     // Open the selected result (Enter); newTab when ⌘/Ctrl was held.
     onSubmit: (newTab: boolean) => void;
+    // Insert a plain wiki link to the selected result at the active editor
+    // cursor (Shift+Enter; Shift+click on a result row routes directly in the
+    // modal, not through this callback).
+    onInsertLink: () => void;
     // Esc with no dropdown open → close the modal.
     onDismiss: () => void;
     // Does this tag bind to a real vault tag (exact or hierarchical parent)?
@@ -794,6 +798,12 @@ export class PillQueryField {
                 this.refresh();
                 return;
             }
+            return;
+        }
+        if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.metaKey) {
+            if (Platform.isMobile) return;
+            e.preventDefault();
+            this.cb.onInsertLink();
             return;
         }
         if (e.key === 'Enter') {

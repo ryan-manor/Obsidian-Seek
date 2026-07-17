@@ -329,6 +329,11 @@ export class LocalEmbedder {
         // the CPU-kernel-set gap (plain is the only build with the CPU
         // GatherBlockQuantized kernel).
         if (result.glue) checks.push(`ℹ️ ort glue: ${result.glue}`);
+        // Off-main-thread wasm (issue #5). A failed proxy attempt is a
+        // functioning fallback, not a load failure — flag it ⚠️ so reports
+        // surface a fleet drifting back onto the main thread.
+        if (result.proxy) checks.push(`✅ wasm proxy worker (inference off main thread)`);
+        else if (result.proxyAttempted) checks.push(`⚠️ wasm proxy failed — inference on main thread: ${result.proxyError ?? 'unknown'}`);
 
         // Surface the warmup decomposition inline so the report doesn't
         // need a separate parser pass. Three cases:
@@ -394,6 +399,9 @@ export class LocalEmbedder {
             webgpuFailed: result.webgpuAttempted && result.device !== 'webgpu',
             webgpuError: result.webgpuError,
             glue: result.glue ?? null,
+            proxy: result.proxy ?? false,
+            proxyAttempted: result.proxyAttempted ?? false,
+            proxyError: result.proxyError ?? null,
             pass,
             checks,
         };

@@ -15,6 +15,7 @@ import { cleanDenseText } from './dense-clean';
 import { extractBaseDocs } from './base-extractor';
 import { MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, ANALYZER_VERSION, BM25_COVERAGE_POW } from './bm25';
 import { buildSynonymMap, chunkDeclaresAlias, SYNONYM_WEIGHT, type SynonymMap } from './synonyms';
+import { TaskContextTracker } from './task-context';
 import { rank, cosineScores, DEFAULT_RANKING_CONFIG } from './ranker';
 import { browseOrder, recencyDate } from './fusion';
 import { IndexStore, nukeDatabase, classifyFileDelta, findOrphanChunkIds, isStoreClosedError, META_SCHEMA_VERSION, type MetaConfig, type FileRecord } from './index-store';
@@ -35,9 +36,10 @@ import { hydrateFromSidecar, rankAcceptedProducers, probePeerAhead, type ReChunk
 import { pluginIdentity, shouldStampLiveIdentity, identityHealEligibility } from './identity';
 import { gzipString, gunzipToString, gzipAvailable } from './gzip';
 import { IndexCoordinator } from './index-coordinator';
-import { CompositorPacer } from './pacer';
+import { CompositorPacer, cheapYield } from './pacer';
 import { isMobilePlatform, residentInt8Enabled } from './platform';
 import { parseQuery, compileMatcher, excludedNotePaths } from './query-parser';
+import { buildPassageTerms, passageWindow, type PassageTerm } from './passage';
 import { enumerateNumberPropertyNames } from './prop-types';
 
 // Indexing batches via PER-BUCKET ROLLING BUFFERS (2026-06-03 redesign).
@@ -185,6 +187,10 @@ export class SearchOrchestrator {
     // Crash forensics (synchronous breadcrumbs). Null in tests / when the
     // plugin couldn't create it — every use is optional-chained.
     private forensics: Forensics | null;
+    // Long-task attribution spans (owned by the plugin; null in tests). The
+    // orchestrator marks its own main-thread-heavy phases — currently the BM25
+    // cold build — so the longtask observer can attribute their jank.
+    private taskCtx: TaskContextTracker | null;
     private chunker = new MarkdownChunker();
     // Live settings reference (the plugin mutates the same object on settings
     // change, so the orchestrator always reads current values). See types.ts.
@@ -232,13 +238,14 @@ export class SearchOrchestrator {
         if (isNew) console.warn(`[seek] quarantining persistently unreadable file (will retry on backoff / next full reindex): ${path}`);
     }
 
-    constructor(app: App, store: IndexStore, embedder: LocalEmbedder, logger: SeekLogger, settings: SeekSettings, forensics: Forensics | null = null, indexDir: string | null = null) {
+    constructor(app: App, store: IndexStore, embedder: LocalEmbedder, logger: SeekLogger, settings: SeekSettings, forensics: Forensics | null = null, indexDir: string | null = null, taskCtx: TaskContextTracker | null = null) {
         this.app = app;
         this.store = store;
         this.embedder = embedder;
         this.logger = logger;
         this.settings = settings;
         this.forensics = forensics;
+        this.taskCtx = taskCtx;
         this.coord = new IndexCoordinator(indexDir, settings);
         this.binaryWorker = new BinaryScorerWorker();
     }
@@ -1351,9 +1358,9 @@ export class SearchOrchestrator {
         // files this call deletes+re-embeds (slice below — keeps deferred files
         // searchable); budgetMs/shouldContinue are the within-burst aborts passed to
         // the engine. Omitted = unbounded (desktop, flushDirty, reindexAll).
-        // onProgress: surfaced for a bulk delta (a paste/sync mini-reindex) so a
-        // multi-minute embed isn't silent; undefined for an ordinary single-note
-        // flush. embedAndCommitFiles already calls it in 'incremental' mode.
+        // onProgress: optional live-progress stream (embedAndCommitFiles calls it
+        // in 'incremental' mode). No caller wires it to a Notice — indexing toasts
+        // are start + end-summary only; live progress belongs to the settings tab.
         opts: { embed: boolean; maxFiles?: number; budgetMs?: number; shouldContinue?: () => boolean; onProgress?: (msg: string) => void },
     ): Promise<{ deletedPaths: number; deletedChunks: number; embedded: IndexCompleteEntry | null; deferredEmbed: number; sidecarHydrated: number; carriedOver: number; committedPaths: string[] }> {
         // Set inside the mutex by applyDelta; read after to gate the re-warm. A
@@ -2080,7 +2087,17 @@ export class SearchOrchestrator {
             return { ids, complete: false };
         }
         let complete = true;
+        let sinceYield = 0;
         for (const f of this.indexableFiles().filter(f => this.shouldIndex(f.path))) {
+            // Yield the main thread every few files: this whole-vault re-chunk +
+            // tokenizer pass runs at least once per session (any sidecar past the
+            // byte floor reaches the oracle even when nothing is dead) and was a
+            // solid CPU burn with no yields — issue #5-class background jank.
+            // cheapYield (scheduler.yield / setTimeout(0)), NOT the rIC pacer:
+            // this runs inside compactDevice's dir lock, and an rIC wait can
+            // stall up to its 1 s timeout per yield under interaction — starving
+            // a concurrent flush's sidecar append. ~ms-bounded cost instead.
+            if (++sinceYield >= 8) { sinceYield = 0; await cheapYield(); }
             let content: string;
             try {
                 content = await this.app.vault.cachedRead(f);
@@ -2609,7 +2626,7 @@ export class SearchOrchestrator {
                 if (results.length >= topK) break;
             }
             await this.hydrateBodies(results);
-            for (const r of results) r.snippet = makeSnippet(r.content, '', 200);
+            for (const r of results) r.snippet = makeSnippet(r.content, [], 200);
             const entry = this.emptySearchEntry(query, cleanedQuery, filters, topK, searchId, idbReadMs, performance.now() - t0);
             entry.totalChunks = orderedChunks.length;
             entry.candidateUnionSize = matchedChunks.length;
@@ -2893,7 +2910,13 @@ export class SearchOrchestrator {
         }
 
         const snippetStart = performance.now();
-        for (const r of results) r.snippet = makeSnippet(r.content, cleanedQuery, 200);
+        // IDF from the SAME BM25F index that just ranked these results, so the
+        // window chooser weighs terms exactly like the retrieval scorer did
+        // (termDocFraction returns 0 on a missing index/term → uniform default
+        // weight inside buildPassageTerms, never a throw).
+        const passageTerms = buildPassageTerms(
+            cleanedQuery, t => this.bm25Cache?.termDocFraction(t) ?? 0);
+        for (const r of results) r.snippet = makeSnippet(r.content, passageTerms, 200);
         const snippetMs = performance.now() - snippetStart;
 
         // ---- Telemetry ---------------------------------------------------
@@ -3215,19 +3238,34 @@ export class SearchOrchestrator {
             // boostedBm25 boosts the headings field to 4×, which is inert unless
             // the field is actually indexed — so the preset implies heading indexing.
             const headingsEnabled = this.settings.headingsField || this.settings.boostedBm25;
-            // Frame-lite: the resident frame is metadata-only, so a (rare) refit
-            // pulls bodies from the chunk_body store first. This IDB read happens
-            // ONLY on a true fit miss — the persisted-load fast path
-            // (tryLoadPersistedBm25) needs no bodies, and a warm keystroke skips
-            // ensureBm25's refit branch entirely (bm25CacheValid hit above).
-            const bodies = await this.store.getBodiesMap(orderedChunks.map(c => c.chunk_id));
-            // orderedChunks is dense post-filter; BM25 indexes match the
-            // unified frame 1:1. If a later refactor lets holes back in,
-            // BM25 fit will throw — keep this guarantee in the loader, not
-            // here.
-            this.bm25Cache = new MultiFieldBM25().fit(orderedChunks, bodies,
-                { searchableProperties: propsEnabled, headingsField: headingsEnabled });
-            this.stampBm25Cache(orderedChunks.length);
+            // Span the refit: the all-bodies build is the classic cold-start
+            // freeze, and its long tasks previously logged as 'idle' when the
+            // build rode warmCaches instead of a search.
+            this.taskCtx?.push('bm25-warm');
+            try {
+                // Frame-lite: the resident frame is metadata-only, so a (rare) refit
+                // pulls bodies from the chunk_body store first. This IDB read happens
+                // ONLY on a true fit miss — the persisted-load fast path
+                // (tryLoadPersistedBm25) needs no bodies, and a warm keystroke skips
+                // ensureBm25's refit branch entirely (bm25CacheValid hit above).
+                const bodies = await this.store.getBodiesMap(orderedChunks.map(c => c.chunk_id));
+                // orderedChunks is dense post-filter; BM25 indexes match the
+                // unified frame 1:1. If a later refactor lets holes back in,
+                // BM25 fit will throw — keep this guarantee in the loader, not
+                // here.
+                // fitAsync = fit() sliced with cheap yields (scheduler.yield /
+                // setTimeout(0), NOT the rIC pacer — this path can be a search
+                // the user is waiting on, so each yield must cost ~ms, and the
+                // resulting index is provably identical to fit()'s). Assign the
+                // cache only after the build completes — a partially-built index
+                // must never be visible to a concurrent search.
+                const built = await new MultiFieldBM25().fitAsync(orderedChunks, bodies,
+                    { searchableProperties: propsEnabled, headingsField: headingsEnabled }, cheapYield);
+                this.bm25Cache = built;
+                this.stampBm25Cache(orderedChunks.length);
+            } finally {
+                this.taskCtx?.pop('bm25-warm');
+            }
         }
         if (this.settings.synonymExpansion && !this.synonymCache) {
             // O(notes) build, trivially cheap next to fit(); df ceiling reads
@@ -4025,17 +4063,15 @@ function snippetPlainText(md: string): string {
         .replace(/\[([^\]]*?)\]\([^)]*?\)/g, '$1');  // [text](url) → text
 }
 
-function makeSnippet(content: string, query: string, maxLen: number): string {
+// Window selection is passage scoring (passage.ts): BM25 over sentences with
+// the live index's IDF, so the snippet shows the sentence that best explains
+// the LEXICAL half of why this chunk ranked — not the earliest raw substring
+// hit, which anchored on stopwords and mid-word fragments ("not" inside
+// "cannot"). `terms` is built ONCE per query via buildPassageTerms; an empty
+// array (browse / filter-only / dense-only fallback) yields the chunk head.
+function makeSnippet(content: string, terms: PassageTerm[], maxLen: number): string {
     const text = snippetPlainText(content);
-    const lower = text.toLowerCase();
-    const q = query.toLowerCase().split(/\s+/).filter(Boolean);
-    let best = -1;
-    for (const tok of q) {
-        const idx = lower.indexOf(tok);
-        if (idx !== -1 && (best === -1 || idx < best)) best = idx;
-    }
-    const start = best === -1 ? 0 : Math.max(0, best - 40);
-    const end = Math.min(text.length, start + maxLen);
+    const { start, end } = passageWindow(text, terms, maxLen);
     let snippet = text.slice(start, end).replace(/\s+/g, ' ').trim();
     if (start > 0) snippet = '…' + snippet;
     if (end < text.length) snippet = snippet + '…';

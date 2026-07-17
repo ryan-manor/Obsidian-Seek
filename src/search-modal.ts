@@ -1,21 +1,32 @@
 // Seek search modal. A plain Modal (not SuggestModal) with a debounced query,
 // manual result rendering, and a keyboard model layered on top: arrow keys move
-// a selectedIndex, Enter opens it, ⌘/Ctrl+Enter (or ⌘/Ctrl+click) opens in a
-// new tab. The query field is a token/pill input (see PillQueryField) that
-// serializes committed operator pills + free text back to the inline-filter
-// query string the search pipeline already parses.
+// a selectedIndex, Enter opens it, ⌘/Ctrl+Enter (or ⌘/Ctrl+click) opens in the
+// alt-open target — a background new tab by default, or a split/window via the
+// altOpenLocation Display setting — and Shift+Enter (or Shift+click) inserts a
+// plain wiki link at the active editor cursor. The query field is a
+// token/pill input (see
+// PillQueryField) that serializes committed operator pills + free text back to
+// the inline-filter query string the search pipeline already parses.
 
-import { App, Modal, Notice, Platform, TFile, MarkdownView, MarkdownRenderer, Component } from 'obsidian';
+import { App, Modal, Notice, Platform, TFile, MarkdownView, MarkdownRenderer, Component, setIcon } from 'obsidian';
 import type { ScoredChunk, SearchEntry, ClickEntry, SeekSettings } from './types';
+import type { RecentSearches } from './recents';
 import { MATCH_STRENGTH_MIN_NOTES } from './types';
 import type { SearchOrchestrator } from './search';
 import type { SeekLogger } from './logger';
 import { ENGLISH_STOPWORDS } from './bm25';
 import { buildHighlightRanges } from './highlight';
 import { sanitizeSnippet } from './snippet';
+import { buildPassageTerms, markPattern } from './passage';
 import { matchStrength } from './dense-stats';
 import { SuggestEngine } from './suggest';
 import { PillQueryField } from './query-field';
+import {
+    buildNoteLink,
+    insertLinkInEditor,
+    isInsertableMarkdownFile,
+    resolveInsertLinkSubpath,
+} from './insert-link';
 
 // Search debounce. Mobile gets a longer window: the query embed runs on the
 // render thread (iframe = same event loop) and on iOS the stage-1 binary scan is
@@ -42,6 +53,31 @@ const MAX_RESULTS = 50;
 // Reveal the next page this far (px) before the sentinel scrolls fully into
 // view, so the rows are already painted by the time the user reaches them.
 const REVEAL_MARGIN_PX = 300;
+
+// Title-nav intent gate (openResult): a click on a result whose TITLE the query
+// matches this strongly is a known-item lookup — the user wants the DOCUMENT,
+// not the chunk that happened to win fusion — so the open lands at the top of
+// the note instead of scrolling to the matched chunk. Coverage semantics come
+// from fusion.ts coverage(): any nonzero value already means EVERY query token
+// hit the title (full-coverage gate), and the magnitude is precision against
+// the title's token count. 0.5 separates "the query is most of this title"
+// ("seek chunk" → "Seek Chunk-Size Sweep", 2/4) from "my words appear somewhere
+// in a ten-word title" (2/10 task-note matches), and single-token queries only
+// clear it on near-exact titles. Extra tokens beyond the title zero coverage
+// entirely — "seek chunk verdict" keeps the normal chunk jump — so passage
+// intent is protected by construction, not by this threshold.
+export const TITLE_NAV_COVERAGE_MIN = 0.5;
+
+// Recover the raw [0,1] title coverage from the weighted contribution that
+// enters `final`: title_boost is navTitleBoost·coverage (fusion.ts), so divide
+// the configured weight back out. The Off stage (weight 0) zeroes the
+// contribution and coverage isn't recoverable, so it reads 0 — the score line
+// shows 0.00 and the title-nav gate simply never fires. Module-level (with the
+// threshold above) so seek:insert-link in main.ts applies the SAME gate a
+// click would — link targets mirror open behavior.
+export function titleNavCoverage(r: ScoredChunk, navTitleBoost: number): number {
+    return navTitleBoost > 0 ? r.ranking_signals.title_boost / navTitleBoost : 0;
+}
 
 // (sanitizeSnippet lives in ./snippet, and maskNonBodyText / escapeRegExp / the
 // word-boundary range builder in ./highlight, so they can be unit-tested without
@@ -80,6 +116,45 @@ function fmtCreated(iso: string | null): string {
 function noteTitle(notePath: string): string {
     const base = notePath.split('/').pop() ?? notePath;
     return base.replace(/\.md$/i, '');
+}
+
+// Wrap every query-term hit in the RENDERED snippet in a <mark>. Runs on the
+// wrapper AFTER MarkdownRenderer resolves — matching over text nodes keeps the
+// decoration orthogonal to markdown structure (a hit inside a rendered link or
+// inline code still marks cleanly; injecting `==…==` into the snippet STRING
+// before rendering would corrupt whichever construct it landed inside).
+// `re` matches over LOWERCASED text (markPattern contract); offsets transfer
+// back because toLowerCase is length-preserving for vault scripts (same bet as
+// highlight.ts). Nodes are collected before mutation — replaceChild during a
+// live TreeWalker walk would skip siblings. ownerDocument, not the global
+// `document`, so rendering inside a popout window decorates in that window's
+// DOM (the repo-wide popout-safety discipline).
+function decorateSnippetMarks(root: HTMLElement, re: RegExp): void {
+    const doc = root.ownerDocument;
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const textNodes: Text[] = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) textNodes.push(n as Text);
+    for (const node of textNodes) {
+        const s = node.nodeValue ?? '';
+        const lower = s.toLowerCase();
+        re.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        let last = 0;
+        let frag: DocumentFragment | null = null;
+        while ((m = re.exec(lower)) !== null) {
+            frag ??= doc.createDocumentFragment();
+            if (m.index > last) frag.appendChild(doc.createTextNode(s.slice(last, m.index)));
+            const mark = doc.createElement('mark');
+            mark.className = 'seek-snippet-mark';
+            mark.textContent = s.slice(m.index, m.index + m[0].length);
+            frag.appendChild(mark);
+            last = m.index + m[0].length;
+        }
+        if (frag) {
+            if (last < s.length) frag.appendChild(doc.createTextNode(s.slice(last)));
+            node.parentNode?.replaceChild(frag, node);
+        }
+    }
 }
 
 // Status of the embedder model at the time the modal opens. `ready=true` is
@@ -183,6 +258,13 @@ export class SeekSearchModal extends Modal {
     private latestResultsShown: ScoredChunk[] = [];
     private latestSearchCompletedAt = 0;
 
+    // Snippet-mark matcher for the CURRENT query, cached on the cleanedQuery
+    // string (applyRow runs once per row per search — rebuilding the regex per
+    // row would be pure waste). Decoration-only, so the IDF resolver is a
+    // constant: term WEIGHTS pick the window (search.ts), but every window term
+    // gets the same <mark>.
+    private snippetMarkCache: { query: string; re: RegExp | null } | null = null;
+
     // Cold-start onboarding flag: set true once checkIndexState() (run on open)
     // confirms zero indexed chunks. Drives renderNoIndex() in place of the generic
     // "Type to search…" / "No notes match." copy, so a brand-new user is told to
@@ -233,6 +315,10 @@ export class SeekSearchModal extends Modal {
         // Optional seed from a deep link (obsidian://seek?query=…). Empty for the
         // palette command. Applied in onOpen once the field exists.
         private initialQuery = '',
+        // Recent-searches store (per-device localStorage; see recents.ts).
+        // Optional (absent in tests / headless) — null disables both capture
+        // and the resting-state rows.
+        private recents: RecentSearches | null = null,
     ) {
         super(app);
         this.orchestrator = orchestrator;
@@ -292,6 +378,7 @@ export class SeekSearchModal extends Modal {
             onQueryChange: q => this.scheduleSearch(q),
             onNavigate: dir => this.moveSelection(dir),
             onSubmit: newTab => this.openSelected(newTab),
+            onInsertLink: () => this.insertSelectedLink(),
             onDismiss: () => this.close(),
             validateTag: tag => this.tagBinds(tag),
         }, this.settings.recencyEpsilon > 0, dateFieldLabel);
@@ -383,6 +470,13 @@ export class SeekSearchModal extends Modal {
         // guard this flag feeds) assumes "closed" is already visible to any
         // async completion that races this call.
         this.closed = true;
+        // Closing while results are showing is the second commitment signal
+        // (the search was answered by a snippet alone — no result opened).
+        // openResult's plain-open path also lands here after its own capture;
+        // the MRU dedup makes that double-capture a no-op. An escaped query
+        // whose results never rendered (or was cleared) is NOT captured:
+        // currentResults is emptied on clear, so abandonment stays silent.
+        if (this.currentResults.length > 0) this.captureRecent();
         if (this.timer != null) window.clearTimeout(this.timer);
         if (this.settleTimer != null) { window.clearTimeout(this.settleTimer); this.settleTimer = null; }
         // Session ended — trigger the catch-up drain (the backup window to the
@@ -453,18 +547,30 @@ export class SeekSearchModal extends Modal {
     }
 
     // The footer legend: keyboard hints on the left, esc on the right. Each
-    // glyph is a <kbd> cap styled from theme variables.
+    // glyph is a <kbd> cap styled from theme variables. The optional class on
+    // grp() marks a hint the container query in styles.css may shed when the
+    // modal is too narrow for the full bar (priority tiers — see .seek-foot).
     private buildFooter(parent: HTMLElement): void {
         const foot = parent.createDiv({ cls: 'seek-foot' });
-        const grp = (build: (g: HTMLElement) => void): void => {
-            const g = foot.createSpan({ cls: 'seek-foot-grp' });
+        const grp = (build: (g: HTMLElement) => void, cls?: string): void => {
+            const g = foot.createSpan({ cls: cls ? `seek-foot-grp ${cls}` : 'seek-foot-grp' });
             build(g);
         };
         const kbd = (g: HTMLElement, key: string) => g.createEl('kbd', { text: key });
         grp(g => { kbd(g, '↑'); kbd(g, '↓'); g.createSpan({ text: ' navigate' }); });
         grp(g => { kbd(g, '↵'); g.createSpan({ text: ' open' }); });
-        grp(g => { kbd(g, '⌘'); kbd(g, '↵'); g.createSpan({ text: ' new tab' }); });
-        grp(g => { kbd(g, 'tab'); g.createSpan({ text: ' fill autosuggest' }); });
+        // The alt-open hint tracks the configured destination (Display setting),
+        // so the legend never promises "new tab" while ⌘↵ actually splits.
+        const altLabel: Record<'tab' | 'split' | 'window', string> = {
+            tab: ' new tab', split: ' new split', window: ' new window',
+        };
+        grp(g => { kbd(g, '⌘'); kbd(g, '↵'); g.createSpan({ text: altLabel[this.altOpenTarget()] }); }, 'seek-foot-grp-alt');
+        grp(g => { kbd(g, 'tab'); g.createSpan({ text: ' fill autosuggest' }); }, 'seek-foot-grp-autosuggest');
+        if (Platform.isMacOS) {
+            grp(g => { kbd(g, '⇧'); kbd(g, '↵'); g.createSpan({ text: ' insert link' }); }, 'seek-foot-grp-insertlink');
+        } else {
+            grp(g => { kbd(g, 'Shift'); kbd(g, '↵'); g.createSpan({ text: ' insert link' }); }, 'seek-foot-grp-insertlink');
+        }
         // Copy a shareable obsidian://seek deep-link for the CURRENT query. The
         // builder percent-encodes (so a `#tag`/`[k:v]` filter survives the URL
         // fragment delimiter) — the whole reason this exists, since a hand-typed
@@ -605,14 +711,46 @@ export class SeekSearchModal extends Modal {
     }
 
     // Empty the results body without painting a status line — the modal collapses to the
-    // query field (and the banner slot, which self-collapses when empty). clearRows()
-    // already empties the container + resets the row pool; we just drop the loading dim
-    // and the cached result list so a later click can't reference a stale set.
+    // query field (and the banner slot, which self-collapses when empty), plus the
+    // recent-searches rows when any exist. clearRows() already empties the container +
+    // resets the row pool; we just drop the loading dim and the cached result list so a
+    // later click can't reference a stale set.
     private renderResting(): void {
         if (!this.resultsEl) return;
         this.clearRows();
         this.currentResults = [];
         this.resultsEl.removeClass('is-loading');
+        this.renderRecents();
+    }
+
+    // Recent searches, painted only into the resting state (an active query's
+    // clearRows/renderSkeleton wipes them, so they never sit under results).
+    // Each row re-runs its query through field.setQuery — the deep-link seeding
+    // path — so a serialized `#tag`/`[k:v]` query re-pills and fires exactly as
+    // if typed. The ✕ removes just that row; with only RECENTS_CAP stored there
+    // is nothing to backfill, the list simply gets shorter.
+    private renderRecents(): void {
+        const items = this.recents?.list() ?? [];
+        if (!this.resultsEl || items.length === 0) return;
+        const box = this.resultsEl.createDiv({ cls: 'seek-recents' });
+        for (const q of items) {
+            const row = box.createDiv({ cls: 'seek-recent' });
+            setIcon(row.createSpan({ cls: 'seek-recent-icon' }), 'history');
+            row.createSpan({ cls: 'seek-recent-text', text: q });
+            const remove = row.createSpan({ cls: 'seek-recent-remove' });
+            setIcon(remove, 'x');
+            remove.setAttr('aria-label', 'Remove from recent searches');
+            remove.addEventListener('click', e => {
+                e.stopPropagation(); // don't run the row's search
+                this.recents?.remove(q);
+                this.renderResting();
+                this.field?.focus(); // the span click blurred the editable
+            });
+            row.addEventListener('click', () => {
+                this.field?.focus();
+                this.field?.setQuery(q);
+            });
+        }
     }
 
     // Full-replace the results area with a single status line. Resets the row
@@ -888,6 +1026,13 @@ export class SeekSearchModal extends Modal {
         };
         el.addEventListener('click', e => {
             if ((e.target as HTMLElement).closest('a')) return;
+            // Shift+click inserts a wiki link to THIS row (the pointer twin of
+            // Shift+Enter). ⌘/Ctrl wins if both are held — fan-out is the more
+            // deliberate gesture.
+            if (e.shiftKey && !e.metaKey && !e.ctrlKey) {
+                this.insertResultLink(row.data);
+                return;
+            }
             void this.openResult(row.data, this.rows.indexOf(row) + 1, e.metaKey || e.ctrlKey);
         });
         el.addEventListener('mousemove', () => {
@@ -968,16 +1113,26 @@ export class SeekSearchModal extends Modal {
         if (this.settings.showScores && scoresMeaningful && hasTextQuery && strength != null) {
             // Title shown as a normalized [0,1] match strength (1 = full known-item
             // title match), mirroring how recency renders its raw signal rather than
-            // the weighted contribution that enters `final`. title_boost is
-            // navTitleBoost·coverage (fusion.ts), so divide the configured weight
-            // back out to recover coverage; the Off stage (weight 0) zeroes the
-            // contribution and coverage isn't recoverable, so it reads 0.00.
-            const titleWeight = this.settings.navTitleBoost;
-            const titleStrength = titleWeight > 0
-                ? r.ranking_signals.title_boost / titleWeight
-                : 0;
+            // the weighted contribution that enters `final`.
+            //
+            // Both must read 0.00 when their bonus is Off, but they get there by
+            // OPPOSITE routes, because ranking_signals is not uniform: title_boost is
+            // stored WEIGHTED (navTitleBoost · coverage) while recency is stored RAW
+            // (computeRecencyScore is date-only and never sees recencyEpsilon). So:
+            //   · title   — titleNavCoverage divides the weight back out, and GUARDS
+            //               navTitleBoost > 0 first. Off already stores title_boost 0,
+            //               so the guard is what stops 0/0 → the row rendering the
+            //               string "title NaN". It is load-bearing, not a formality.
+            //   · recency — no weight to divide out and no natural zero, so gate the
+            //               display on epsilon explicitly. Without this the row shows a
+            //               live-looking half-life score for a term multiplied by zero.
+            // Raw is the right thing to STORE: the NDJSON trace and click log consume
+            // these signals for offline epsilon A/Bs, which need the unweighted value.
+            // The display is the only layer that owes the user a "why this rank".
+            const titleStrength = this.titleCoverage(r);
+            const recencyStrength = this.settings.recencyEpsilon > 0 ? r.ranking_signals.recency : 0;
             const label = `Matching ${Math.round(strength * 100)}%`
-                + ` · recency ${r.ranking_signals.recency.toFixed(2)}`
+                + ` · recency ${recencyStrength.toFixed(2)}`
                 + ` · title ${titleStrength.toFixed(2)}`;
             if (row.scoreEl.textContent !== label) row.scoreEl.setText(label);
             row.scoreEl.show();
@@ -995,9 +1150,31 @@ export class SeekSearchModal extends Modal {
         // Render into a fresh wrapper rather than snippetEl directly: if a later
         // search supersedes this row and empty()s snippetEl, this (now detached)
         // wrapper absorbs any late async append, so results never interleave.
+        // Term marks are applied to the RENDERED DOM afterwards (text-node walk)
+        // — injecting mark syntax into the snippet STRING would corrupt any
+        // markdown construct it lands inside.
         const wrapper = row.snippetEl.createDiv();
         MarkdownRenderer.render(this.app, snippet, wrapper, r.note_path, this.markdownComponent)
+            .then(() => {
+                const re = this.snippetMarkRe();
+                if (re) decorateSnippetMarks(wrapper, re);
+            })
             .catch(() => wrapper.setText(snippet));
+    }
+
+    // The mark matcher for the current query (see snippetMarkCache). Same term
+    // prep as the window chooser in search.ts — seekTokenize + processQueryTerm
+    // with raw+processed alternates — so what gets marked is exactly the
+    // vocabulary that chose the window.
+    private snippetMarkRe(): RegExp | null {
+        const query = this.latestSearchEntry?.cleanedQuery ?? '';
+        if (this.snippetMarkCache?.query !== query) {
+            this.snippetMarkCache = {
+                query,
+                re: query.trim() ? markPattern(buildPassageTerms(query, () => 0)) : null,
+            };
+        }
+        return this.snippetMarkCache.re;
     }
 
     // ---- keyboard selection model ----
@@ -1039,11 +1216,72 @@ export class SeekSearchModal extends Modal {
         if (r) void this.openResult(r, this.selectedIndex + 1, newTab);
     }
 
+    // The alt-open destination (⌘/Ctrl+Enter / ⌘/Ctrl+click): the user's
+    // Display choice, coerced to 'tab' on mobile — phones have no splits or
+    // popout windows, and no modifier keys to reach the alt path anyway; the
+    // guard covers a desktop 'split'/'window' choice arriving via synced
+    // data.json (e.g. an iPad hardware keyboard sending ⌘↵).
+    private altOpenTarget(): 'tab' | 'split' | 'window' {
+        return Platform.isMobile ? 'tab' : this.settings.altOpenLocation;
+    }
+
+    // Shift+Enter: insert a wiki link to the keyboard-selected result at the
+    // active editor cursor instead of opening it. Deliberately no alias — see
+    // insert-link.ts. Desktop-only (the query field never routes the hotkey
+    // on mobile).
+    private insertSelectedLink(): void {
+        const r = this.currentResults[this.selectedIndex];
+        if (r) this.insertResultLink(r);
+    }
+
+    // Shared by Shift+Enter (selected row) and Shift+click (clicked row — which
+    // may differ from the keyboard selection, so the row's own data is passed).
+    private insertResultLink(r: ScoredChunk): void {
+        const file = this.app.vault.getAbstractFileByPath(r.note_path);
+        if (!(file instanceof TFile) || !isInsertableMarkdownFile(file)) {
+            new Notice('Seek: cannot insert a link to this result');
+            return;
+        }
+
+        // The link target mirrors what a plain click on this row would do
+        // (openResult): a title-nav result opens at the top of the doc → bare
+        // [[Note]]; anything else jumps to the matched section → [[Note#Section]].
+        const titleNav = this.titleCoverage(r) >= TITLE_NAV_COVERAGE_MIN;
+        const link = buildNoteLink(this.app, file, {
+            subpath: resolveInsertLinkSubpath(r.heading_path, titleNav, file.basename),
+        });
+
+        const result = insertLinkInEditor(this.app, link);
+        if (!result.ok) {
+            new Notice('Seek: no active editor');
+            return;
+        }
+        this.close();
+    }
+
+    // Record the current query into recent searches. Called on the two
+    // commitment signals — opening a result, and closing the modal with
+    // results showing — never on debounced keystroke prefixes. lastQuery is
+    // the field's serialized string, so committed pills round-trip.
+    private captureRecent(): void {
+        const q = this.lastQuery.trim();
+        if (q) this.recents?.push(q);
+    }
+
+    private titleCoverage(r: ScoredChunk): number {
+        return titleNavCoverage(r, this.settings.navTitleBoost);
+    }
+
     private async openResult(r: ScoredChunk, rank: number, newTab: boolean): Promise<void> {
+        // Known-item lookup? See TITLE_NAV_COVERAGE_MIN. Decided up front so the
+        // click log records which open behavior the user actually got.
+        const titleNav = this.titleCoverage(r) >= TITLE_NAV_COVERAGE_MIN;
+
         // Emit click event BEFORE opening the file — the file-open switches
         // workspace state and might cancel pending work. We don't await the
         // logger write so click latency stays imperceptible.
-        this.emitClick(r, rank);
+        this.emitClick(r, rank, titleNav);
+        this.captureRecent();
 
         const file = this.app.vault.getAbstractFileByPath(r.note_path);
         if (!(file instanceof TFile)) return;
@@ -1054,13 +1292,13 @@ export class SeekSearchModal extends Modal {
         // rides in heading_path (chunkBase puts it there), so we land on that exact
         // view. A base-level chunk (empty heading_path) has no viewName, so the
         // Bases view opens its default/last-used view. Mirrors the markdown path's
-        // modal semantics: a background new tab keeps the modal open + focused; a
-        // plain open takes the active tab and dismisses.
+        // modal semantics: a background alt-open leaf keeps the modal open +
+        // focused; a plain open takes the active tab and dismisses.
         if (file.extension === 'base') {
             const viewName = r.heading_path?.[r.heading_path.length - 1];
             const state: Record<string, unknown> = viewName ? { file: file.path, viewName } : { file: file.path };
             if (newTab) {
-                const leaf = this.app.workspace.getLeaf('tab');
+                const leaf = this.app.workspace.getLeaf(this.altOpenTarget());
                 await leaf.setViewState({ type: 'bases', active: false, state });
                 this.field?.focus();
                 return;
@@ -1073,17 +1311,24 @@ export class SeekSearchModal extends Modal {
 
         // Native search-style highlight of the matched terms (same transient
         // flash core Search uses), passed via ephemeral state on the open call.
-        const eState = await this.buildMatchHighlight(file, r);
+        // A title-nav open skips it entirely: the match eState makes the view
+        // scroll to its first range (chunk-windowed, i.e. mid-doc), which would
+        // race the top-of-doc landing — and a known-item open wants the plain
+        // wikilink/Quick-Switcher feel anyway, not a passage flash.
+        const eState = titleNav ? undefined : await this.buildMatchHighlight(file, r);
 
         if (newTab) {
-            // ⌘/Ctrl+Enter or ⌘/Ctrl+click → open in a BACKGROUND new tab and
-            // KEEP the modal open + focused, so the user can fan out several
-            // results in one session without the modal dismissing on them.
-            // `active: false` is what stops the new leaf from stealing focus
-            // away from the search field.
-            const leaf = this.app.workspace.getLeaf('tab');
+            // ⌘/Ctrl+Enter or ⌘/Ctrl+click → open in a BACKGROUND leaf (a new
+            // tab by default; a split or popout window via the altOpenLocation
+            // Display setting) and KEEP the modal open + focused, so the user
+            // can fan out several results in one session without the modal
+            // dismissing on them. `active: false` is what stops the new leaf
+            // from stealing focus away from the search field (a popout window
+            // may still take OS focus — that's the window manager, not us).
+            const leaf = this.app.workspace.getLeaf(this.altOpenTarget());
             await leaf.openFile(file, { active: false, eState });
-            this.scrollLeafToChunk(leaf, r);
+            if (titleNav) this.scrollLeafToTop(leaf);
+            else this.scrollLeafToChunk(leaf, r);
             this.field?.focus();
             return;
         }
@@ -1091,7 +1336,8 @@ export class SeekSearchModal extends Modal {
         // Plain open (Enter / click): replace the active tab and dismiss.
         const leaf = this.app.workspace.getLeaf(false);
         await leaf.openFile(file, { eState });
-        this.scrollLeafToChunk(leaf, r);
+        if (titleNav) this.scrollLeafToTop(leaf);
+        else this.scrollLeafToChunk(leaf, r);
         this.close();
     }
 
@@ -1103,9 +1349,11 @@ export class SeekSearchModal extends Modal {
     // there's nothing to highlight so the open call falls back to plain nav.
     //
     // Chunks store only start_line (no char offset), so we resolve the chunk's
-    // first-line offset here and search the chunk window for the query tokens —
-    // the same "earliest matching token in the chunk" logic makeSnippet uses,
-    // so the highlight lands on the text the snippet already showed.
+    // first-line offset here and flash EVERY query-token occurrence in the
+    // chunk window (buildHighlightRanges). All-occurrences is what keeps the
+    // flash consistent with the snippet now that the snippet window is chosen
+    // by passage scoring (passage.ts): the passage shown may contain a LATER
+    // occurrence than the chunk's first.
     private async buildMatchHighlight(file: TFile, r: ScoredChunk): Promise<Record<string, unknown> | undefined> {
         if (r.start_line <= 0) return undefined;
         const tokens = (this.latestSearchEntry?.cleanedQuery ?? '')
@@ -1152,7 +1400,20 @@ export class SeekSearchModal extends Modal {
         }
     }
 
-    private emitClick(r: ScoredChunk, rank: number): void {
+    // Title-nav open: land at the very top of the note. Obsidian restores each
+    // file's last scroll position on open, so merely NOT scrolling to the chunk
+    // would leave a previously-read note wherever the user left it — the top
+    // landing has to be pinned explicitly, same mechanism as scrollLeafToChunk.
+    private scrollLeafToTop(leaf: { view: unknown }): void {
+        const view = leaf.view;
+        if (view instanceof MarkdownView) {
+            const editor = view.editor;
+            editor.setCursor({ line: 0, ch: 0 });
+            editor.scrollIntoView({ from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } }, true);
+        }
+    }
+
+    private emitClick(r: ScoredChunk, rank: number, titleNavOpen: boolean): void {
         const entry = this.latestSearchEntry;
         if (!entry) return; // stale render or no search context — drop
         const dwellMs = this.latestSearchCompletedAt > 0
@@ -1171,6 +1432,7 @@ export class SeekSearchModal extends Modal {
             bm25: r.ranking_signals.bm25,
             recency: r.ranking_signals.recency,
             title_boost: r.ranking_signals.title_boost,
+            titleNavOpen,
             dwellMs: parseFloat(dwellMs.toFixed(0)),
             shownTop10: this.latestResultsShown.slice(0, 10).map(c => c.chunk_id),
         };

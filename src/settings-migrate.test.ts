@@ -6,7 +6,7 @@
 // A hand-tuned value must survive.
 
 import { describe, it, expect } from 'vitest';
-import { migrateSettings, type SeekSettings } from './types';
+import { migrateSettings, DEFAULT_SETTINGS, type SeekSettings } from './types';
 
 describe('migrateSettings — rev 5 defaults ratification', () => {
     it('flips synonym/headings/sidecar ON and remaps old-default numerics for a pre-rev-5 install', () => {
@@ -24,7 +24,7 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         expect(raw.sidecarEnabled).toBe(true);
         expect(raw.navTitleBoost).toBe(0.5); // 0.8 (old default) → 0.5 (new Default stage)
         expect(raw.recencyEpsilon).toBe(0);  // 0.02 (old tiebreaker) → 0 (ships Off)
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('preserves a hand-tuned navTitleBoost / recencyEpsilon (only the exact old default is moved)', () => {
@@ -33,7 +33,7 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         expect(raw.navTitleBoost).toBe(0.7);
         expect(raw.recencyEpsilon).toBe(0.05);
         expect(raw.sidecarEnabled).toBe(true); // the unconditional boolean flips still apply
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('does not re-touch the rev-5 fields of an install already at rev 5 (advances to the latest rev)', () => {
@@ -41,7 +41,7 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         migrateSettings(raw);
         expect(raw.navTitleBoost).toBe(0.8);    // not remapped — already past rev 5
         expect(raw.sidecarEnabled).toBe(false); // not forced — already past rev 5
-        expect(raw.settingsRev).toBe(8);        // later clauses (rev-6 rename, rev-7 props) still advance the rev
+        expect(raw.settingsRev).toBe(9);        // later clauses (rev-6 rename, rev-7 props) still advance the rev
     });
 
     it('gives a fresh/empty data.json (treated as rev 1) the rev-5 baseline', () => {
@@ -52,7 +52,7 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         expect(raw.sidecarEnabled).toBe(true);
         expect(raw.navTitleBoost).toBe(0.5); // undefined → new default
         expect(raw.recencyEpsilon).toBe(0);
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('still applies the rev-2 denseWeight surgery for a pre-bound install (plus the rev-5 flips)', () => {
@@ -61,7 +61,7 @@ describe('migrateSettings — rev 5 defaults ratification', () => {
         expect(raw.denseWeight).toBeUndefined(); // empirical-max value dropped → rev-2 default takes over
         expect(raw.navTitleBoost).toBe(0.5);     // rev-5 flips also apply (rev 1 < 5)
         expect(raw.synonymExpansion).toBe(true);
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('mutates and returns the same object (onload relies on the mutation)', () => {
@@ -79,14 +79,14 @@ describe('migrateSettings — rev 6 debugMode→showScores rename', () => {
         migrateSettings(raw);
         expect(raw.showScores).toBe(false);
         expect((raw as { debugMode?: boolean }).debugMode).toBeUndefined(); // orphan key dropped
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('carries debugMode:true into showScores:true', () => {
         const raw = { settingsRev: 5, debugMode: true } as Partial<SeekSettings>;
         migrateSettings(raw);
         expect(raw.showScores).toBe(true);
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('does not clobber an already-persisted showScores with the legacy key', () => {
@@ -100,7 +100,7 @@ describe('migrateSettings — rev 6 debugMode→showScores rename', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 5 };
         migrateSettings(raw);
         expect(raw.showScores).toBeUndefined(); // falls through to DEFAULT_SETTINGS.showScores in onload
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 });
 
@@ -111,21 +111,21 @@ describe('migrateSettings — rev 7 searchableProperties default ON', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 6, searchableProperties: false };
         migrateSettings(raw);
         expect(raw.searchableProperties).toBe(true);
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('turns it ON for an install that never persisted the key', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 6 };
         migrateSettings(raw);
         expect(raw.searchableProperties).toBe(true);
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('does not re-flip an install already at rev 7 (a deliberate later OFF survives)', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 7, searchableProperties: false };
         migrateSettings(raw);
         expect(raw.searchableProperties).toBe(false); // past rev 7 — the user's choice is preserved
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 });
 
@@ -136,37 +136,101 @@ describe('migrateSettings — rev 8 denseWeight 0.80→0.85 re-eval', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 7, denseWeight: 0.80 };
         migrateSettings(raw);
         expect(raw.denseWeight).toBe(0.85);
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('preserves a hand-tuned denseWeight (only the exact old default 0.80 is moved)', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 7, denseWeight: 0.90 };
         migrateSettings(raw);
         expect(raw.denseWeight).toBe(0.90);
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('leaves an unpersisted denseWeight undefined (→ new DEFAULT_SETTINGS 0.85 in onload)', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 7 };
         migrateSettings(raw);
         expect(raw.denseWeight).toBeUndefined();
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('does not re-move a deliberate later 0.80 for an install already at rev 8', () => {
         const raw: Partial<SeekSettings> = { settingsRev: 8, denseWeight: 0.80 };
         migrateSettings(raw);
         expect(raw.denseWeight).toBe(0.80); // past rev 8 — the user's choice is preserved
-        expect(raw.settingsRev).toBe(8);
+        expect(raw.settingsRev).toBe(9);
     });
 
     it('never DOWNGRADES the rev stamp of a data.json written by a newer Seek', () => {
-        // Cross-device sync hazard: a rev-9+ data.json loaded by this older build
+        // Cross-device sync hazard: a rev-10+ data.json loaded by this older build
         // must keep its stamp, or the newer device re-runs its migrations on next
         // load (conditional default moves misfire on second application).
-        const raw: Partial<SeekSettings> = { settingsRev: 9, denseWeight: 0.70 };
+        const raw: Partial<SeekSettings> = { settingsRev: 10, denseWeight: 0.70, recencyHalfLifeDays: 270 };
         migrateSettings(raw);
-        expect(raw.settingsRev).toBe(9);    // not stamped back to 8
-        expect(raw.denseWeight).toBe(0.70); // and no rev<9 migration re-fired
+        expect(raw.settingsRev).toBe(10);            // not stamped back to 9
+        expect(raw.denseWeight).toBe(0.70);          // and no rev<8 migration re-fired
+        expect(raw.recencyHalfLifeDays).toBe(270);   // nor the rev-9 half-life move
+    });
+});
+
+describe('migrateSettings — rev 9 Recency High half-life 270→90', () => {
+    it('moves a persisted 270 (the old High stage) to 90 for a pre-rev-9 install', () => {
+        // The silent no-op the migration prevents: High is a value map in settings-tab.ts,
+        // so a High user's fix lives entirely in their persisted data.json. recencyStageOf()
+        // snaps the pill on ε alone, so ε=0.1 keeps rendering "High" while the stale 270
+        // keeps ranking — the mode would look correct and stay broken.
+        const raw: Partial<SeekSettings> = { settingsRev: 8, recencyEpsilon: 0.1, recencyHalfLifeDays: 270 };
+        migrateSettings(raw);
+        expect(raw.recencyHalfLifeDays).toBe(90);
+        expect(raw.recencyEpsilon).toBe(0.1); // ε was never the problem — untouched
+        expect(raw.settingsRev).toBe(9);
+    });
+
+    it('leaves Off/Default installs (180) alone — only the exact old High value moves', () => {
+        const raw: Partial<SeekSettings> = { settingsRev: 8, recencyEpsilon: 0.04, recencyHalfLifeDays: 180 };
+        migrateSettings(raw);
+        expect(raw.recencyHalfLifeDays).toBe(180);
+        expect(raw.settingsRev).toBe(9);
+    });
+
+    it('leaves an unpersisted half-life undefined (→ DEFAULT_SETTINGS 180 in onload)', () => {
+        const raw: Partial<SeekSettings> = { settingsRev: 8 };
+        migrateSettings(raw);
+        expect(raw.recencyHalfLifeDays).toBeUndefined();
+        expect(raw.settingsRev).toBe(9);
+    });
+
+    it('does not re-move a deliberate later 270 for an install already at rev 9', () => {
+        const raw: Partial<SeekSettings> = { settingsRev: 9, recencyHalfLifeDays: 270 };
+        migrateSettings(raw);
+        expect(raw.recencyHalfLifeDays).toBe(270); // past rev 9 — the user's choice is preserved
+        expect(raw.settingsRev).toBe(9);
+    });
+
+    it('leaves a pre-rev-5 install that hits BOTH the rev-5 eps clause and this one coherent', () => {
+        // A raw-knob-era install can carry hl=270 with the OLD 0.02 tiebreaker eps, so a
+        // single migrateSettings pass runs rev-5 (eps 0.02 -> 0, i.e. Off) AND rev-9
+        // (hl 270 -> 90). The result reads oddly — Off with a High-shaped half-life — but
+        // is inert by construction, and this test pins WHY: the half-life only ever reaches
+        // the score through the eps product (ranker.ts `eps * recency[i]`), so eps=0 makes
+        // it unobservable. topByRecency/browseOrder read recencyDate, never halfLifeDays.
+        // It self-heals on the next stage pick, since the segmented control writes both
+        // fields together. If a future consumer reads halfLifeDays OUTSIDE the eps product,
+        // this combination becomes a real bug and this test is where it should surface.
+        const raw: Partial<SeekSettings> = { settingsRev: 4, recencyEpsilon: 0.02, recencyHalfLifeDays: 270 };
+        migrateSettings(raw);
+        expect(raw.recencyEpsilon).toBe(0);       // rev-5: retires the always-on tiebreaker
+        expect(raw.recencyHalfLifeDays).toBe(90); // rev-9: still fires — inert while eps is 0
+        expect(raw.settingsRev).toBe(9);
+    });
+});
+
+describe('migrateSettings — rev stamp invariant', () => {
+    it('stamps exactly DEFAULT_SETTINGS.settingsRev on a fresh install', () => {
+        // Couples the Math.max() target in migrateSettings to DEFAULT_SETTINGS.settingsRev.
+        // Without this, bumping one and not the other leaves every other test green while
+        // the two silently disagree — and the whole rev scheme rests on them matching.
+        const raw: Partial<SeekSettings> = {};
+        migrateSettings(raw);
+        expect(raw.settingsRev).toBe(DEFAULT_SETTINGS.settingsRev);
     });
 });

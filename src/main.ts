@@ -27,14 +27,23 @@ import { DEFAULT_SETTINGS, migrateSettings } from './types';
 import { IndexStore, indexDbPrefix } from './index-store';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
+import { RecentSearches } from './recents';
 import { SearchOrchestrator, driftRecoveryDecision, type RecencyOverride } from './search';
-import { SeekSearchModal, type IndexBanner } from './search-modal';
+import { SeekSearchModal, TITLE_NAV_COVERAGE_MIN, titleNavCoverage, type IndexBanner } from './search-modal';
+import {
+    buildNoteLink,
+    insertLinkInEditor,
+    isInsertableMarkdownFile,
+    resolveInsertLinkAlias,
+    resolveInsertLinkSubpath,
+} from './insert-link';
 import { indexBannerSpec, INDEX_STALE_MSG, INDEX_SYNCING_MSG, INDEX_PEER_AHEAD_MSG, type DegradedReason } from './index-notice';
 import { SeekSettingTab } from './settings-tab';
 import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash } from './platform';
 import { CompositorPacer } from './pacer';
 import { shouldUnloadEmbedder, type UnloadGateState } from './embedder-lifecycle';
 import { drainCatchUp, CATCHUP_MAX_FILES_PER_BURST, CATCHUP_BURST_BUDGET_MS } from './catchup';
+import { TaskContextTracker, type TaskContext } from './task-context';
 import type { LongTaskEntry, MemoryPressureEntry, StorageSnapshotEntry, EvictionSuspectedEntry, AppLocalFetchEntry } from './types';
 
 // Long-task threshold. PerformanceObserver fires for any task ≥50 ms by spec,
@@ -67,6 +76,13 @@ const STRUCT_FLUSH_MS = 1500;
 // timer counts as `pending`), not by the relative size of these constants.
 // Checked on a coarse interval — a minute of slack on a 3-minute idle is fine.
 const IDLE_UNLOAD_MS = 3 * 60 * 1000;
+
+// Sidecar compaction: how many 'incomplete-rechunk' verdicts (each = a full
+// vault re-chunk that found an unreadable/untokenizable file) to tolerate per
+// session before latching compaction off until the next session. 3 gives a
+// genuinely transient failure (file mid-sync) two more polls to clear while
+// capping the pathological case at ~15 minutes of exposure.
+const SIDECAR_COMPACT_MAX_INCOMPLETE_RETRIES = 3;
 const UNLOAD_CHECK_MS = 60 * 1000;
 
 // A delta larger than this isn't an edit — it's a bulk import (paste, vault sync,
@@ -133,24 +149,24 @@ export default class SeekPlugin extends Plugin {
     // next plugin reload and we end up with duplicate logging on every hot
     // reload during development.
     private longTaskObserver: PerformanceObserver | null = null;
-    // Task context as a STACK, not a scalar (audit R2 #9): contexts overlap —
-    // opening the search modal during a running reindex used to stomp the
-    // scalar back to 'idle' in openSearchModal's finally, and the mobile
-    // idle-unload gate (the only one covering reindexAll) would then tear the
-    // embedder down mid-build (DISPOSED rethrow aborts the pass). Writers
-    // push/pop their own context; the read is the top of the stack. Pop
-    // removes the LAST occurrence of the caller's context so interleaved
-    // async lifetimes (reindex outliving a modal open) unwind correctly.
-    private taskContextStack: Array<LongTaskEntry['context']> = [];
-    private get currentTaskContext(): LongTaskEntry['context'] {
-        return this.taskContextStack[this.taskContextStack.length - 1] ?? 'idle';
+    // Task contexts as SPANS, not a scalar (audit R2 #9 kept the overlap
+    // tolerance; issue #5 forced the span upgrade): contexts overlap — opening
+    // the search modal during a running reindex used to stomp the scalar back
+    // to 'idle' — and, worse, the longtask observer delivers entries only
+    // AFTER a task ends, so a read-at-delivery stack labeled the final task of
+    // every phase (and every un-wrapped path) 'idle'. The tracker records
+    // push/pop as timestamped spans and attributes each longtask by interval
+    // overlap; current() preserves the old top-of-stack read for the
+    // behavioral consumers (isIndexing, the mobile unload gate).
+    private readonly taskCtx = new TaskContextTracker();
+    private get currentTaskContext(): TaskContext | 'idle' {
+        return this.taskCtx.current();
     }
-    private pushTaskContext(c: LongTaskEntry['context']): void {
-        this.taskContextStack.push(c);
+    private pushTaskContext(c: TaskContext): void {
+        this.taskCtx.push(c);
     }
-    private popTaskContext(c: LongTaskEntry['context']): void {
-        const i = this.taskContextStack.lastIndexOf(c);
-        if (i !== -1) this.taskContextStack.splice(i, 1);
+    private popTaskContext(c: TaskContext): void {
+        this.taskCtx.pop(c);
     }
     private onError: ((e: ErrorEvent) => void) | null = null;
     private onUnhandledRejection: ((e: PromiseRejectionEvent) => void) | null = null;
@@ -164,6 +180,9 @@ export default class SeekPlugin extends Plugin {
     // Crash forensics (see forensics.ts). Created in onload once the vault
     // scope (appId) is known; null only during the first lines of onload.
     private forensics: Forensics | null = null;
+    // Recent searches (see recents.ts) — per-device localStorage, same
+    // manifest-id + vault scoping as forensics. Null only during early onload.
+    private recents: RecentSearches | null = null;
 
     // Incremental indexing state (see wireIncrementalIndexing). The queues hold
     // paths touched THIS session; the durable dirty signal is always on-disk
@@ -226,6 +245,10 @@ export default class SeekPlugin extends Plugin {
     // `Done` latches on any DEFINITIVE outcome (an incomplete re-chunk leaves it open to
     // retry); `Running` guards re-entrancy.
     private sidecarCompactDone = false;
+    // Bounded retries for the 'incomplete-rechunk' verdict (see periodicReconcile):
+    // each retry costs a whole-vault re-chunk, so a persistent failure must not
+    // grind every 5-minute poll for the session.
+    private sidecarCompactIncompleteRetries = 0;
     private sidecarCompactRunning = false;
 
     // True while a reindex / incremental embed is running. currentTaskContext is
@@ -234,7 +257,14 @@ export default class SeekPlugin extends Plugin {
     get isIndexing(): boolean { return this.currentTaskContext === 'indexing'; }
     private searchActiveTimestamp: number | null = null;   // null = no live query session; else the ms timestamp of the last activity ping (modal open / keystroke) — pauses the catch-up drain so embedding never competes with the user's search
     private static readonly SEARCH_ACTIVE_MAX_AGE_MS = 60_000;
-    private queryInFlight = false;               // modal-reported: a query embed/search is actually running right now (onQueryInFlight). Distinct from the keystroke-timed searchActive — it falls only when the query COMPLETES, so indexing waits for the query, not just for typing to pause.
+    // Count of query embeds/searches actually running right now (onQueryInFlight).
+    // Distinct from the keystroke-timed searchActive — it falls only when the query
+    // COMPLETES, so indexing waits for the query, not just for typing to pause.
+    // A COUNT, not a boolean: the modal emits balanced 0↔1 edges for its own
+    // queries, and each headless query (CLI handlers, deep-link open) contributes
+    // one balanced true/false pair — so overlapping callers can't clear each
+    // other's signal the way a shared boolean would.
+    private queryInFlightCount = 0;
     // Self-healing read of searchActive. A modal torn down without onClose (teardown
     // exception, dev hot-reload) would otherwise latch the flag true forever and
     // permanently starve catch-up (runCatchUp/drainCatchUp early-return on it, so
@@ -255,7 +285,7 @@ export default class SeekPlugin extends Plugin {
     // second term is what makes indexing wait for the query to COMPLETE rather than
     // resuming 1.5 s after the last keystroke while a slow mobile embed still runs.
     private get indexingBlocked(): boolean {
-        return this.searchActive || this.queryInFlight;
+        return this.searchActive || this.queryInFlightCount > 0;
     }
 
     async onload() {
@@ -310,6 +340,10 @@ export default class SeekPlugin extends Plugin {
         // plugin id as well, so a co-installed build's breadcrumbs can't be
         // misread as this build's crash.
         this.forensics = new Forensics(`${this.manifest.id}:${vaultScope}`, this.logger.deviceId, this.logger.sessionId);
+        // Recent searches share the forensics scope: plugin id keeps a
+        // co-installed build's history separate, vault scope keeps two vaults
+        // on one iOS origin from bleeding queries into each other.
+        this.recents = new RecentSearches(`${this.manifest.id}:${vaultScope}`);
         const crash = this.forensics.bootInspect();
         if (crash) {
             // Forensics: always persist the classified crash to the per-device
@@ -385,7 +419,7 @@ export default class SeekPlugin extends Plugin {
         // The pre-rev-4 path (active-override-relative). Used only to migrate an
         // existing index off it into the literal path on upgrade.
         const legacySidecarDir = this.manifest.dir ? `${this.manifest.dir}/index` : null;
-        this.orchestrator = new SearchOrchestrator(this.app, this.store, this.embedder, this.logger, this.settings, this.forensics, sidecarIndexDir);
+        this.orchestrator = new SearchOrchestrator(this.app, this.store, this.embedder, this.logger, this.settings, this.forensics, sidecarIndexDir, this.taskCtx);
         // The orchestrator is pull-based; this is its one injected outbound edge — it
         // fires when persistent frame/BM25 drift survives the cooldown, and we drive the
         // embed-free recovery ladder from the plugin (which owns scheduling + gating).
@@ -620,7 +654,10 @@ export default class SeekPlugin extends Plugin {
                         asJson ? JSON.stringify({ error: msg, results: [] }) : `Seek error: ${msg}`;
 
                     if (!query) return fail('query is required');
-                    if (!this.orchestrator) return fail('Seek not initialized — plugin still loading');
+                    // Captured for the withQueryInFlight closure below (a `this.`
+                    // null-check doesn't narrow across the closure boundary).
+                    const orchestrator = this.orchestrator;
+                    if (!orchestrator) return fail('Seek not initialized — plugin still loading');
 
                     const parsedLimit = typeof args.limit === 'string' ? parseInt(args.limit, 10) : NaN;
                     const topK = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 10;
@@ -649,11 +686,17 @@ export default class SeekPlugin extends Plugin {
                             : undefined;
 
                     try {
-                        // No modal here to overlap the cold-start, so block on the
-                        // model load (3–10 s first call) before querying — otherwise
-                        // the orchestrator embeds against an unloaded model.
-                        await this.ensureModelLoaded();
-                        const { results } = await this.orchestrator.search(query, topK, recencyOverride);
+                        // Under the query-in-flight gate: a running catch-up drain
+                        // or bulk flush yields at its next batch boundary instead of
+                        // making this call wait out the whole indexing pass (the
+                        // modal gets the same preemption via its own edges).
+                        const { results } = await this.withQueryInFlight(async () => {
+                            // No modal here to overlap the cold-start, so block on the
+                            // model load (3–10 s first call) before querying — otherwise
+                            // the orchestrator embeds against an unloaded model.
+                            await this.ensureModelLoaded();
+                            return orchestrator.search(query, topK, recencyOverride);
+                        });
 
                         // ---- format=json: programmatic / piped callers ---------
                         if (asJson) {
@@ -693,6 +736,59 @@ export default class SeekPlugin extends Plugin {
                         return lines.join('\n').replace(/\n+$/, '');
                     } catch (err) {
                         return fail(err instanceof Error ? err.message : String(err));
+                    }
+                },
+            );
+
+            registerCliHandler.call(
+                this,
+                'seek:insert-link',
+                'Seek search and insert a link to a result at the active editor cursor',
+                {
+                    query: { value: '<text>', description: 'Search query (supports inline filters: #tag, tag:, path:, [k:v], dates)', required: true },
+                    rank: { value: '<n>', description: '1-based result rank to link (default: 1)', required: false },
+                    alias: { value: '<text>', description: 'Optional link display text ([[note|alias]])', required: false },
+                },
+                async (args: Record<string, string | boolean | undefined>): Promise<string> => {
+                    const query = typeof args.query === 'string' ? args.query : '';
+                    if (!query) return 'Seek error: query is required';
+                    // Captured for the withQueryInFlight closure (null-check narrowing).
+                    const orchestrator = this.orchestrator;
+                    if (!orchestrator) return 'Seek error: Seek not initialized — plugin still loading';
+
+                    const parsedRank = typeof args.rank === 'string' ? parseInt(args.rank, 10) : NaN;
+                    const rank = Number.isFinite(parsedRank) && parsedRank > 0 ? parsedRank : 1;
+                    const explicitAlias = typeof args.alias === 'string' && args.alias.trim()
+                        ? args.alias.trim()
+                        : undefined;
+                    const alias = resolveInsertLinkAlias(explicitAlias);
+
+                    try {
+                        // Under the query-in-flight gate, same as seek:search: a
+                        // running drain/flush yields at its next batch boundary.
+                        const { results } = await this.withQueryInFlight(async () => {
+                            await this.ensureModelLoaded();
+                            return orchestrator.search(query, rank);
+                        });
+                        const hit = results[rank - 1];
+                        if (!hit) return `Seek error: no result at rank ${rank} for "${query}"`;
+                        const file = this.app.vault.getAbstractFileByPath(hit.note_path);
+                        if (!(file instanceof TFile) || !isInsertableMarkdownFile(file)) {
+                            return `Seek error: result is not a markdown note (${hit.note_path})`;
+                        }
+                        // Same gate a click on this row would take (search-modal
+                        // openResult): title-nav hit → [[Note]], section hit →
+                        // [[Note#Section]].
+                        const titleNav = titleNavCoverage(hit, this.settings.navTitleBoost) >= TITLE_NAV_COVERAGE_MIN;
+                        const link = buildNoteLink(this.app, file, {
+                            subpath: resolveInsertLinkSubpath(hit.heading_path, titleNav, file.basename),
+                            alias,
+                        });
+                        const inserted = insertLinkInEditor(this.app, link);
+                        if (!inserted.ok) return `Seek error: ${inserted.reason}`;
+                        return link;
+                    } catch (err) {
+                        return `Seek error: ${err instanceof Error ? err.message : String(err)}`;
                     }
                 },
             );
@@ -852,6 +948,9 @@ export default class SeekPlugin extends Plugin {
         // competitive on desktop). iOS: skip WebGPU entirely — see the iOS
         // skip rationale at the load() call below.
         this.modelLoadPromise = (async () => {
+            // Span the load: wasm compile + session init + shader warmup are
+            // main-thread-heavy and used to log as 'idle' long tasks.
+            this.pushTaskContext('model-load');
             try {
                 // Warm the frame + BM25 caches in the model-load shadow. warmCaches
                 // reads the store (not the model), so it overlaps the cold model load
@@ -981,6 +1080,8 @@ export default class SeekPlugin extends Plugin {
                 this.modelLoadPromise = null; // allow retry
                 await this.logger.appendError('ensureModelLoaded', e);
                 throw e;
+            } finally {
+                this.popTaskContext('model-load');
             }
         })();
         return this.modelLoadPromise;
@@ -1162,6 +1263,13 @@ export default class SeekPlugin extends Plugin {
     // desktop publishes a matching sidecar; otherwise the normal dir-signature-gated
     // catch-up. Wired to the 5-min interval.
     private async periodicReconcile(): Promise<void> {
+        // Span the whole poll: the sidecar reconcile, orphan sweep, and sidecar
+        // compaction (a whole-vault re-chunk + tokenizer pass) all run here, and
+        // none of their jank was attributed before (issue #5's 'idle' long-tasks).
+        // Also load-bearing for the mobile unload gate: `busy` now covers the
+        // compaction window, so the idle-unload can't tear the tokenizer down
+        // mid-collectLiveIds (which read as a transient incomplete-rechunk).
+        this.pushTaskContext('reconcile');
         try {
             // Never poll while a build/delta is in flight: assessing identity or
             // hydrating a sidecar would race a writer whose meta is mid-stamp. The
@@ -1202,11 +1310,25 @@ export default class SeekPlugin extends Plugin {
                         // corruption breadcrumb (invisible on mobile without it).
                         if (r.shed > 0) await this.logger.appendError('sidecar-compaction-shed', new Error(`shed ${r.shed} corrupt/unreadable record(s)`)).catch(() => {});
                     } else if (r && r.reason === 'incomplete-rechunk') {
-                        /* intentionally empty: an incomplete re-chunk is transient — leave sidecarCompactDone unlatched below so the next poll retries */
+                        // Transient in principle (a file mid-sync failed to read, a
+                        // tokenizer hiccup) — but each retry re-runs the WHOLE-VAULT
+                        // re-chunk + tokenizer pass, and a persistently unreadable
+                        // file (an un-downloaded iCloud original) turned that into a
+                        // full-vault CPU burn every 5-minute poll for the entire
+                        // session (issue #5's "unresponsive every couple of
+                        // minutes"). Bound it: a few retries this session, then
+                        // latch and say so — the next session starts fresh, and a
+                        // full reindex still compacts unconditionally.
+                        this.sidecarCompactIncompleteRetries++;
+                        if (this.sidecarCompactIncompleteRetries >= SIDECAR_COMPACT_MAX_INCOMPLETE_RETRIES) {
+                            this.sidecarCompactDone = true;
+                            await this.logger.appendError('sidecar-compaction-retry-cap', new Error(
+                                `live-id re-chunk incomplete ${this.sidecarCompactIncompleteRetries}× — a file is persistently unreadable or the tokenizer keeps failing (see collectLiveIds-* errors); deferring compaction to the next session`)).catch(() => {});
+                        }
                     }
-                    // Latch on any definitive verdict; an incomplete re-chunk is transient,
-                    // so leave it open to retry. null = sidecar off → don't latch (it may
-                    // be enabled later this session).
+                    // Latch on any definitive verdict; an incomplete re-chunk retries
+                    // (bounded above). null = sidecar off → don't latch (it may be
+                    // enabled later this session).
                     if (r && r.reason !== 'incomplete-rechunk') this.sidecarCompactDone = true;
                 } catch (e) {
                     // A hard failure (disk full, write error) would otherwise re-run the
@@ -1220,6 +1342,8 @@ export default class SeekPlugin extends Plugin {
             }
         } catch (e) {
             await this.logger.appendError('periodic-reconcile', e).catch(() => {});
+        } finally {
+            this.popTaskContext('reconcile');
         }
     }
 
@@ -1386,6 +1510,9 @@ export default class SeekPlugin extends Plugin {
         }
         if (this.dirtyQueue.size === 0 && this.deletedQueue.size === 0) return;
         this.flushing = true;
+        // Span the whole drain: the incremental path was the biggest un-wrapped
+        // jank source (issue #5 — all its long tasks logged as 'idle').
+        this.pushTaskContext('indexing');
         const orchestrator = this.orchestrator;
         try {
             const dirty = [...this.dirtyQueue];
@@ -1419,21 +1546,23 @@ export default class SeekPlugin extends Plugin {
             if (!deferEmbed) await this.ensureModelLoaded();
 
             if (bulk) {
-                // Mini-reindex path. Progress goes on the same sticky Notice the
-                // full reindex uses (deferred embeds have nothing to show). A live
-                // query preempts the embed (shouldContinue → break within one file,
-                // releasing the write mutex so the query runs); the interrupted or
-                // deferred remainder keeps its old searchable chunks and stays dirty
-                // (no file-record advance) for the drain to reconcile.
-                const notice = deferEmbed ? null : new Notice('Seek: indexing new notes…', 0);
-                try {
-                    await orchestrator.reindexDelta(dirty, deleted, {
-                        embed: !deferEmbed,
-                        shouldContinue: () => !this.indexingBlocked,
-                        onProgress: notice ? (msg) => notice.setMessage(`Seek: ${msg}`) : undefined,
-                    });
-                } finally {
-                    notice?.hide();
+                // Mini-reindex path. One toast at the start, one summary at the end
+                // — no live-updating sticky Notice (progress is watchable from the
+                // settings Index status card; deferred embeds have nothing to show).
+                // A live query preempts the embed (shouldContinue → break within one
+                // file, releasing the write mutex so the query runs); the interrupted
+                // or deferred remainder keeps its old searchable chunks and stays
+                // dirty (no file-record advance) for the drain to reconcile.
+                if (!deferEmbed) new Notice(`Seek: indexing ${dirty.length} changed notes…`, 4000);
+                const result = await orchestrator.reindexDelta(dirty, deleted, {
+                    embed: !deferEmbed,
+                    shouldContinue: () => !this.indexingBlocked,
+                });
+                // Summary counts what actually committed — an embed preempted by a
+                // query reports the partial total honestly; the drain finishes the
+                // rest silently. No toast on throw (flushDirty's catch logs it).
+                if (!deferEmbed && result.embedded) {
+                    new Notice(`Seek: indexed ${result.embedded.committedFilePaths.length} files · ${result.embedded.chunksIndexed} chunks`, 5000);
                 }
                 // Reconcile whatever the embed left undone (deferred cold, or
                 // preempted by a query). runCatchUp is self-guarding (no-op while
@@ -1470,6 +1599,7 @@ export default class SeekPlugin extends Plugin {
         } catch (e) {
             await this.logger.appendError('flushDirty', e).catch(() => {});
         } finally {
+            this.popTaskContext('indexing');
             this.flushing = false;
         }
     }
@@ -1484,6 +1614,7 @@ export default class SeekPlugin extends Plugin {
     // force applies, since the model is typically already warm by then.
     private async reconcileOnLoad(): Promise<void> {
         if (!this.orchestrator) return;
+        this.pushTaskContext('reconcile');
         try {
             const { dirty, deleted } = await this.orchestrator.computeDelta();
             if (dirty.length === 0 && deleted.length === 0) return;
@@ -1491,6 +1622,8 @@ export default class SeekPlugin extends Plugin {
             if (dirty.length > 0) this.catchUpPending = true;
         } catch (e) {
             await this.logger.appendError('reconcileOnLoad', e).catch(() => {});
+        } finally {
+            this.popTaskContext('reconcile');
         }
     }
 
@@ -1505,15 +1638,34 @@ export default class SeekPlugin extends Plugin {
         if (!active) { this.runCatchUp(); this.runDriftRecovery(); }
     }
 
-    // Hard query-lifecycle signal from the modal: true the moment a query embed
-    // starts, false when its results paint (ref-counted modal-side across the cold
-    // path). Held in indexingBlocked so a preempted/deferred reindex resumes only
-    // AFTER the query completes — the note's "make indexing wait for the query".
-    // The false edge is a drain trigger, exactly like onSearchActivity(false).
+    // Hard query-lifecycle signal: true the moment a query embed starts, false
+    // when its results settle. The modal emits balanced edges (ref-counted
+    // modal-side across the cold path); headless queries emit balanced pairs via
+    // withQueryInFlight. Held in indexingBlocked so a preempted/deferred reindex
+    // resumes only AFTER the query completes — the note's "make indexing wait for
+    // the query". The last-caller-out edge is a drain trigger, exactly like
+    // onSearchActivity(false). Max(0,·) self-heals an unbalanced false (e.g. a
+    // torn-down modal's reset firing when nothing was counted).
     private onQueryInFlight(inFlight: boolean): void {
-        this.queryInFlight = inFlight;
-        // Query complete = a safe window — same dual drive as onSearchActivity(false).
-        if (!inFlight) { this.runCatchUp(); this.runDriftRecovery(); }
+        this.queryInFlightCount = Math.max(0, this.queryInFlightCount + (inFlight ? 1 : -1));
+        // All queries complete = a safe window — same dual drive as onSearchActivity(false).
+        if (this.queryInFlightCount === 0) { this.runCatchUp(); this.runDriftRecovery(); }
+    }
+
+    // Run a headless query (CLI handler, deep-link open) under the same
+    // query-in-flight gate the modal honors. Raising the flag makes a running
+    // catch-up drain or bulk flush yield at its next batch boundary
+    // (indexingBlocked → shouldContinue/isSearchActive), so the query's embed
+    // isn't queued behind minutes of indexing — previously a CLI search on a
+    // cold install waited out the entire initial drain. The finally edge
+    // restarts whatever was preempted.
+    private async withQueryInFlight<T>(fn: () => Promise<T>): Promise<T> {
+        this.onQueryInFlight(true);
+        try {
+            return await fn();
+        } finally {
+            this.onQueryInFlight(false);
+        }
     }
 
     // Open the Seek search modal, optionally seeded with a query (the `seek-search`
@@ -1577,6 +1729,7 @@ export default class SeekPlugin extends Plugin {
                 (inFlight) => this.onQueryInFlight(inFlight),
                 () => this.indexNotice(),
                 initialQuery,
+                this.recents,
             ).open();
         } catch (e) {
             // Synchronous failure path (rare — only if the Modal ctor or
@@ -1596,15 +1749,21 @@ export default class SeekPlugin extends Plugin {
     // the normal modal so a malformed link still does something useful.
     private async openTopResult(query: string): Promise<void> {
         if (!query.trim()) { this.openSearchModal(); return; }
-        if (!this.orchestrator) { new Notice('Seek: still loading — try again in a moment'); return; }
+        // Captured for the withQueryInFlight closure (null-check narrowing).
+        const orchestrator = this.orchestrator;
+        if (!orchestrator) { new Notice('Seek: still loading — try again in a moment'); return; }
         const notice = new Notice(`Seek: searching “${query}”…`, 0);
         this.pushTaskContext('search');
         try {
-            // No modal to overlap the cold-start, so block on the model load
-            // (3–10 s first call) before querying — same as the CLI handler.
-            await this.ensureModelLoaded();
-            // topK=1 — we only open the single best hit.
-            const { results } = await this.orchestrator.search(query, 1);
+            // Under the query-in-flight gate, same as the seek:search CLI handler:
+            // a running drain/flush yields at its next batch boundary.
+            const { results } = await this.withQueryInFlight(async () => {
+                // No modal to overlap the cold-start, so block on the model load
+                // (3–10 s first call) before querying — same as the CLI handler.
+                await this.ensureModelLoaded();
+                // topK=1 — we only open the single best hit.
+                return orchestrator.search(query, 1);
+            });
             notice.hide();
             const top = results[0];
             if (!top) { new Notice(`Seek: no results for “${query}”`); return; }
@@ -1639,6 +1798,7 @@ export default class SeekPlugin extends Plugin {
         const mobile = isMobilePlatform();
         const pacer = new CompositorPacer();
         void (async () => {
+            this.pushTaskContext('catchup');
             try {
                 const { pending } = await drainCatchUp({
                     computeDelta: () => orchestrator.computeDelta(),
@@ -1654,6 +1814,7 @@ export default class SeekPlugin extends Plugin {
                 await this.logger.appendError('runCatchUp', e).catch(() => {});
                 this.catchUpPending = true;  // unknown state — let a later trigger retry
             } finally {
+                this.popTaskContext('catchup');
                 this.catchUpRunning = false;
             }
         })();
@@ -1809,16 +1970,15 @@ export default class SeekPlugin extends Plugin {
             }
         }
 
-        const notice = new Notice('Seek: full reindex starting…', 0);
+        // Start toast + end summary only — no live-updating sticky Notice. Live
+        // progress still streams to opts.onProgress (the settings tab's reindex
+        // button renders it inline; that's where "watch it go" lives).
+        new Notice('Seek: full reindex starting…', 4000);
         this.pushTaskContext('indexing');
         try {
             await this.ensureModelLoaded();
             this.orchestrator.invalidateBm25Cache();
-            const result = await this.orchestrator.reindexAll(msg => {
-                notice.setMessage(`Seek: ${msg}`);
-                opts?.onProgress?.(msg);
-            });
-            notice.hide();
+            const result = await this.orchestrator.reindexAll(opts?.onProgress);
             const summary = [
                 result.pass ? '✅' : '❌',
                 `${result.filesIndexed} files`,
@@ -1843,7 +2003,6 @@ export default class SeekPlugin extends Plugin {
             this.identityHealNotified = false;
             return true;
         } catch (e) {
-            notice.hide();
             await this.logger.appendError('seek-full-reindex', e);
             // One end-toast whether it passed or failed (the recap). Detail → console + log.
             new Notice('Seek reindex: ❌ failed — see the logging report (Settings → Seek).', 10000);
@@ -2028,7 +2187,11 @@ export default class SeekPlugin extends Plugin {
                         durationMs: parseFloat(entry.duration.toFixed(2)),
                         startTimeMs: parseFloat(entry.startTime.toFixed(2)),
                         attribution,
-                        context: this.currentTaskContext,
+                        // Attribute by span overlap at TASK time, not delivery
+                        // time — the observer fires only after the task ends,
+                        // so a top-of-stack read here mislabels every task
+                        // whose phase popped before delivery (issue #5).
+                        context: this.taskCtx.attribute(entry.startTime, entry.duration),
                     };
                     this.logger.append(logEntry).catch(() => {});
                 }
