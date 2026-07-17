@@ -14,6 +14,7 @@ import {
     bm25PathFor,
     bulkAppend,
     clearDevice,
+    coalesceSmallShards,
     compactDevice,
     decodeRecord,
     deviceShardBytes,
@@ -32,6 +33,7 @@ import {
     sidecarDirSignature,
     staleSidecarFormat,
     sweepOrphanTmpFiles,
+    withDirLock,
     MAX_VECTORS_PER_SHARD,
     Q_BYTES,
     SIGN_BYTES,
@@ -142,7 +144,7 @@ function tiersEqual(a: TierBytes, b: TierBytes): boolean {
 
 // Append one logical record via the production bulkAppend writer. The fixtures
 // below exercise resolution semantics one record at a time; this shim keeps them
-// readable while routing through the real append path (pickActiveShard →
+// readable while routing through the real append path (fresh-shard rotation →
 // encodeRecord → writeBinaryAtomic → appendJsonlLine).
 async function appendOne(a: DataAdapter, dir: string, dev: string, id: string, t: TierBytes, mtime: number) {
     const [ref] = await bulkAppend(a, dir, dev, [{ id, tiers: t, mtime }]);
@@ -694,6 +696,45 @@ describe('device meta', () => {
         expect(await readDeviceMeta(a, DIR, 'desktop-aaa')).toBeNull();
     });
 
+    it('writeDeviceMeta preserves a seqFloor the caller does not pass, and honors an explicit one', async () => {
+        const a = adapter();
+        await writeDeviceMeta(a, DIR, { ...META, seqFloor: 7 });
+        // The per-flush F8 meta rewrite constructs a fresh object every pass
+        // without knowing the floor — it must ride along, or the first flush
+        // after an orphan reclaim erases it and reopens the seq-reuse hole.
+        await writeDeviceMeta(a, DIR, META);
+        expect((await readDeviceMeta(a, DIR, 'desktop-aaa'))?.seqFloor).toBe(7);
+        // An explicit floor wins (a caller that DOES know it can move it).
+        await writeDeviceMeta(a, DIR, { ...META, seqFloor: 9 });
+        expect((await readDeviceMeta(a, DIR, 'desktop-aaa'))?.seqFloor).toBe(9);
+        // Sanitization: a hand-edited/torn value degrades to "no floor", not NaN.
+        await a.write(`${DIR}/meta.desktop-aaa.json`, JSON.stringify({ ...META, seqFloor: 'bogus' }));
+        expect((await readDeviceMeta(a, DIR, 'desktop-aaa'))?.seqFloor).toBeUndefined();
+    });
+
+    it('writeDeviceMeta serializes on the dir lock, so an in-lock floor raise cannot be clobbered', async () => {
+        const a = adapter();
+        // The F8 race: writeDeviceMeta's preserve-read is a read-modify-write on
+        // the meta file. If it ran unlocked, this interleaving — read (no floor) →
+        // a fold raises the floor in-lock → write (no floor) — would erase the
+        // floor at the moment it is the only guard against seq reuse. Holding the
+        // lock while "the fold" writes floor 5 must therefore BLOCK the meta write
+        // until release, after which the preserved floor must survive.
+        let release!: () => void;
+        let metaDone = false;
+        const held = withDirLock(DIR, async () => {
+            await new Promise<void>(r => { release = r; });
+            await a.write(metaPathFor(DIR, 'desktop-aaa'), JSON.stringify({ deviceId: 'desktop-aaa', seqFloor: 5 }));
+        });
+        const metaWrite = writeDeviceMeta(a, DIR, META).then(() => { metaDone = true; });
+        await new Promise(r => setTimeout(r, 0)); // an unlocked write would complete here
+        expect(metaDone).toBe(false);             // still queued behind the held lock
+        release();
+        await held;
+        await metaWrite;
+        expect((await readDeviceMeta(a, DIR, 'desktop-aaa'))?.seqFloor).toBe(5);
+    });
+
     it('readDeviceMeta refuses a meta missing deviceId (which routes shard/jsonl reads)', async () => {
         const a = adapter();
         await a.write(
@@ -956,5 +997,335 @@ describe('compactDevice', () => {
         await appendOne(a, DIR, DEV, 'c2', tiers(2), 100);
         expect(await deviceShardBytes(a, DIR, DEV)).toBe(2 * VEC_BYTES);
         expect(await deviceShardBytes(a, DIR, 'nobody')).toBe(0);
+    });
+});
+
+// ---- append-only shards (1A) ----
+// The write-amplification fix: every bulkAppend flush lands in FRESH shard
+// file(s) — an existing shard is never read or rewritten. These cases pin the
+// mechanism (existing bytes untouched, seq monotonicity through crash leaks),
+// the reader contract (union across many small shards, cross-shard supersede),
+// and the two halves of the cleanup story (crash-orphan reclaim + the
+// generational compaction that coalesces small shards back into dense ones).
+describe('append-only shards (1A)', () => {
+    const DEV = 'desktop-aaa';
+
+    it('each flush writes a FRESH shard and never touches existing shard bytes', async () => {
+        const a = adapter();
+        await bulkAppend(a, DIR, DEV, [{ id: 'a1', tiers: tiers(1), mtime: 1 }, { id: 'a2', tiers: tiers(2), mtime: 1 }]);
+        const shard0 = new Uint8Array((await a.readBinary(shardPathFor(DIR, DEV, 0))).slice(0)); // snapshot
+        const r2 = await bulkAppend(a, DIR, DEV, [{ id: 'b1', tiers: tiers(3), mtime: 2 }]);
+        const r3 = await bulkAppend(a, DIR, DEV, [{ id: 'c1', tiers: tiers(4), mtime: 3 }, { id: 'c2', tiers: tiers(5), mtime: 3 }]);
+
+        // Rotation: three flushes → three shards, offsets restart at 0 per shard.
+        const shards = await listDeviceShards(a, DIR, DEV);
+        expect(shards.map(s => s.seq)).toEqual([0, 1, 2]);
+        expect(shards.map(s => s.size)).toEqual([2 * VEC_BYTES, 1 * VEC_BYTES, 2 * VEC_BYTES]);
+        expect(r2[0]).toEqual({ seq: 1, off: 0 });
+        expect(r3.map(r => r.off)).toEqual([0, VEC_BYTES]);
+        // The 1A payoff, pinned byte-for-byte: later flushes left shard 0 alone.
+        expect(new Uint8Array(await a.readBinary(shardPathFor(DIR, DEV, 0)))).toEqual(shard0);
+    });
+
+    it('readers union many small shards, and a re-append supersedes across shards', async () => {
+        const a = adapter();
+        for (let f = 0; f < 5; f++) {
+            await bulkAppend(a, DIR, DEV, [{ id: `n${f}`, tiers: tiers(f), mtime: f }]);
+        }
+        await bulkAppend(a, DIR, DEV, [{ id: 'n0', tiers: tiers(99), mtime: 10 }]); // supersede n0
+
+        const scan = await scanJsonl(a, [jsonlPathFor(DIR, DEV)]);
+        expect(scan.map.size).toBe(5);
+        expect(scan.map.get('n0')!.seq).toBe(5);              // latest shard wins
+        for (let f = 1; f < 5; f++) {
+            const got = await readRecordAt(a, DIR, scan.map.get(`n${f}`)!);
+            expect(got && tiersEqual(got, tiers(f))).toBe(true);
+        }
+        const n0 = await readRecordAt(a, DIR, scan.map.get('n0')!);
+        expect(n0 && tiersEqual(n0, tiers(99))).toBe(true);
+    });
+
+    it('a crash between the shard write and the jsonl append leaves a reclaimable orphan, and its seq is never reused', async () => {
+        const a = adapter();
+        const fake = a as unknown as { append(p: string, d: string): Promise<void>; write(p: string, d: string): Promise<string> };
+        // Drive the crash through the PRODUCTION path: the shard lands (binary
+        // tmp+rename, untouched by these patches), then every jsonl text channel
+        // fails (fresh-file write AND append AND the read-modify-write fallback)
+        // — bulkAppend rejects with shard 0 on disk and zero lines referencing
+        // it. That is the exact post-crash disk state.
+        const realAppend = fake.append.bind(fake);
+        const realWrite = fake.write.bind(fake);
+        const boom = async () => { throw new Error('EIO: simulated crash at jsonl append'); };
+        fake.append = boom;
+        fake.write = boom as unknown as typeof realWrite;
+        await expect(bulkAppend(a, DIR, DEV, [{ id: 'lost', tiers: tiers(1), mtime: 1 }])).rejects.toThrow(/simulated crash/);
+        fake.append = realAppend;
+        fake.write = realWrite;
+
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0]);
+        expect((await scanJsonl(a, [jsonlPathFor(DIR, DEV)])).map.size).toBe(0);  // no torn read
+
+        // Next flush must NOT reuse the orphan's seq (the never-reuse invariant).
+        await bulkAppend(a, DIR, DEV, [{ id: 'b1', tiers: tiers(2), mtime: 2 }]);
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0, 1]);
+
+        // compactDevice's crash-leak reclaim deletes the unreferenced shard even
+        // when every other gate declines (below-floor here).
+        const r = await compactDevice(a, DIR, DEV, async () => ({ ids: new Set(['b1']), complete: true }));
+        expect(r.compacted).toBe(false);
+        expect(r.reason).toBe('below-floor');
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([1]);
+        const scan = await scanJsonl(a, [jsonlPathFor(DIR, DEV)]);
+        const b1 = await readRecordAt(a, DIR, scan.map.get('b1')!);
+        expect(b1 && tiersEqual(b1, tiers(2))).toBe(true);
+    });
+
+    it('compaction coalesces accumulated small shards into one dense shard and reports the census', async () => {
+        const a = adapter();
+        // 8 flushes re-appending the same 3 ids: 8 tiny shards, 24 raw records, 3 live.
+        for (let f = 0; f < 8; f++) {
+            await bulkAppend(a, DIR, DEV, [0, 1, 2].map(k => ({ id: `x${k}`, tiers: tiers(f * 10 + k), mtime: f })));
+        }
+        expect((await listDeviceShards(a, DIR, DEV)).length).toBe(8);
+
+        const r = await compactDevice(a, DIR, DEV,
+            async () => ({ ids: new Set(['x0', 'x1', 'x2']), complete: true }),
+            { minDeadRatio: 0.5, minShardBytes: 0 });
+        expect(r.compacted).toBe(true);
+        expect(r).toMatchObject({ recordsBefore: 24, recordsAfter: 3, shardsBefore: 8, shardsAfter: 1, bytesAfter: 3 * VEC_BYTES });
+
+        // One dense fresh shard (seq 8 — generational, above every old seq), old
+        // shards deleted, and every surviving vector still reads back exactly.
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => ({ seq: s.seq, size: s.size }))).toEqual([{ seq: 8, size: 3 * VEC_BYTES }]);
+        const scan = await scanJsonl(a, [jsonlPathFor(DIR, DEV)]);
+        expect(scan.recordCount).toBe(3);
+        for (const k of [0, 1, 2]) {
+            const got = await readRecordAt(a, DIR, scan.map.get(`x${k}`)!);
+            expect(got && tiersEqual(got, tiers(70 + k))).toBe(true);   // the f=7 (latest) generation
+        }
+    });
+
+    it('reclaiming a max-seq crash orphan persists a seq floor, so the seq is never reused even after deletion', async () => {
+        const a = adapter();
+        const fake = a as unknown as { append(p: string, d: string): Promise<void>; write(p: string, d: string): Promise<string> };
+        await bulkAppend(a, DIR, DEV, [{ id: 'b1', tiers: tiers(1), mtime: 1 }]);   // seq 0, referenced
+        // Crash-flush: the orphan lands at seq 1 — the HIGHEST seq, which is the
+        // only ordering a single crashed flush can produce (fresh shards always
+        // sit above everything referenced) and the one where reclaim lowers the
+        // on-disk max. The earlier crash test's ordering (live shard above the
+        // orphan) cannot exercise this.
+        const realAppend = fake.append.bind(fake);
+        const realWrite = fake.write.bind(fake);
+        const boom = async () => { throw new Error('EIO: simulated crash at jsonl append'); };
+        fake.append = boom;
+        fake.write = boom as unknown as typeof realWrite;
+        await expect(bulkAppend(a, DIR, DEV, [{ id: 'lost', tiers: tiers(2), mtime: 2 }])).rejects.toThrow(/simulated crash/);
+        fake.append = realAppend;
+        fake.write = realWrite;
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0, 1]);
+
+        const r = await compactDevice(a, DIR, DEV, async () => ({ ids: new Set(['b1']), complete: true }));
+        expect(r.reason).toBe('below-floor');
+        expect(r.bytesAfter).toBe(r.bytesBefore);   // early returns report the true (unchanged) after-state
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0]);  // orphan reclaimed
+
+        // The next flush must allocate ABOVE the reclaimed seq: a peer may still
+        // hold the orphan embeddings.<dev>.1.bin, and iCloud has no cross-file
+        // ordering — republishing seq 1 with different bytes would let that peer
+        // resolve fresh jsonl refs against stale bytes (records carry no id
+        // binding, so the CRC passes and the wrong vector hydrates silently).
+        await bulkAppend(a, DIR, DEV, [{ id: 'c1', tiers: tiers(3), mtime: 3 }]);
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0, 2]);
+        const scan = await scanJsonl(a, [jsonlPathFor(DIR, DEV)]);
+        const c1 = await readRecordAt(a, DIR, scan.map.get('c1')!);
+        expect(c1 && tiersEqual(c1, tiers(3))).toBe(true);
+    });
+
+    it('compacting to empty (every id dead) retires the whole seq range instead of resurrecting it', async () => {
+        const a = adapter();
+        for (let f = 0; f < 3; f++) await bulkAppend(a, DIR, DEV, [{ id: `n${f}`, tiers: tiers(f), mtime: f }]);   // seqs 0..2
+        const r = await compactDevice(a, DIR, DEV, async () => ({ ids: new Set<string>(), complete: true }), { minDeadRatio: 0.5, minShardBytes: 0 });
+        expect(r).toMatchObject({ compacted: true, reason: 'done', recordsBefore: 3, recordsAfter: 0, shardsBefore: 3, shardsAfter: 0, bytesAfter: 0 });
+        expect((await listDeviceShards(a, DIR, DEV)).length).toBe(0);
+        // No fresh shard was written by the rewrite, so the on-disk max is gone —
+        // only the persisted floor keeps the next flush off the retired seqs.
+        await bulkAppend(a, DIR, DEV, [{ id: 'fresh', tiers: tiers(9), mtime: 9 }]);
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([3]);
+    });
+
+    it('clearDevice before a rebuild preserves the seq floor in the kept meta; the reap path removes everything', async () => {
+        const a = adapter();
+        await writeDeviceMeta(a, DIR, meta(DEV));   // a full reindex starts with a current meta on disk
+        for (let f = 0; f < 3; f++) await bulkAppend(a, DIR, DEV, [{ id: `n${f}`, tiers: tiers(f), mtime: f }]);
+
+        await clearDevice(a, DIR, DEV, { preserveSeqFloor: true });
+        expect((await listDeviceShards(a, DIR, DEV)).length).toBe(0);
+        expect(await a.exists(jsonlPathFor(DIR, DEV))).toBe(false);
+        // The meta survives as the floor's carrier — and because it still passes
+        // metaAccepts (current identity), a peer's dead-identity reap keeps it,
+        // which is what protects the floor until the rebuild's first flush.
+        expect((await readDeviceMeta(a, DIR, DEV))?.seqFloor).toBe(3);
+        // The rebuild's flushes land above every seq a peer might still hold.
+        await bulkAppend(a, DIR, DEV, [{ id: 'rebuilt', tiers: tiers(5), mtime: 5 }]);
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([3]);
+
+        // Reap (no flag): total removal, floor included — a retired device id
+        // never writes again, so nothing needs preserving (and a lingering meta
+        // would re-surface the device every reap forever).
+        await clearDevice(a, DIR, DEV);
+        expect(await a.exists(metaPathFor(DIR, DEV))).toBe(false);
+        expect((await listDeviceShards(a, DIR, DEV)).length).toBe(0);
+    });
+});
+
+// ---- small-shard coalesce (oracle-free shard-count hygiene) ----
+// The other half of 1A's cleanup story: compactDevice's byte floor is weeks away
+// at per-flush accrual rates while the directory gains one small file per flush.
+// coalesceSmallShards folds the small tail into dense shard(s) with no vault
+// oracle — superseded duplicates and fragmentation are provable from the
+// single-writer jsonl alone — and must leave dense shards byte-untouched.
+describe('coalesceSmallShards', () => {
+    const DEV = 'desktop-aaa';
+    // 600 records × 444 B ≈ 260 KB — crosses the 256 KB default small threshold.
+    const BIG_N = 600;
+
+    async function buildMixedSidecar(a: DataAdapter) {
+        // One dense shard (seq 0) from a bulk pass…
+        await bulkAppend(a, DIR, DEV, Array.from({ length: BIG_N }, (_, i) => ({ id: `big${i}`, tiers: tiers(i % 90), mtime: 1 })));
+        // …then per-flush smalls (seqs 1-4): a supersede INTO the dense shard's id
+        // space, a new id, a supersede within the smalls, and another new id.
+        await bulkAppend(a, DIR, DEV, [{ id: 'big0', tiers: tiers(91), mtime: 2 }]);
+        await bulkAppend(a, DIR, DEV, [{ id: 's1', tiers: tiers(92), mtime: 3 }]);
+        await bulkAppend(a, DIR, DEV, [{ id: 's1', tiers: tiers(93), mtime: 4 }]);
+        await bulkAppend(a, DIR, DEV, [{ id: 's2', tiers: tiers(94), mtime: 5 }]);
+    }
+
+    it('folds the small tail into one dense shard, leaves big shards byte-untouched, and collapses superseded lines', async () => {
+        const a = adapter();
+        await buildMixedSidecar(a);
+        const bigBytes = new Uint8Array((await a.readBinary(shardPathFor(DIR, DEV, 0))).slice(0)); // snapshot
+
+        const r = await coalesceSmallShards(a, DIR, DEV, { minSmallShards: 3 });
+        expect(r).toMatchObject({ coalesced: true, reason: 'done', smallShards: 4, shardsBefore: 5, shardsAfter: 2, bytesMoved: 3 * VEC_BYTES, shed: 0 });
+
+        // Disk: the dense source shard + ONE fresh dense fold at a generational seq.
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => ({ seq: s.seq, size: s.size })))
+            .toEqual([{ seq: 0, size: BIG_N * VEC_BYTES }, { seq: 5, size: 3 * VEC_BYTES }]);
+        expect(new Uint8Array(await a.readBinary(shardPathFor(DIR, DEV, 0)))).toEqual(bigBytes);
+
+        // The jsonl collapsed to exactly the live set — raw lines === resolved ids —
+        // with big-shard refs untouched and moved refs pointing at the fold.
+        const scan = await scanJsonl(a, [jsonlPathFor(DIR, DEV)]);
+        expect(scan.map.size).toBe(BIG_N + 2);
+        expect(scan.recordCount).toBe(BIG_N + 2);
+        expect(scan.map.get('big1')).toMatchObject({ seq: 0, off: 1 * VEC_BYTES });
+        expect(scan.map.get('big0')!.seq).toBe(5);
+        expect(scan.map.get('s1')!.seq).toBe(5);
+        // mtime must survive the rewrite VERBATIM on both moved and in-place
+        // lines: it drives cross-device resolution (crossDeviceWins) and peers'
+        // re-hydration skip — a zeroed mtime lets a peer's stale record beat the
+        // fresh moved one; a bumped mtime makes peers re-hydrate the whole fold.
+        expect(scan.map.get('big0')!.mtime).toBe(2);
+        expect(scan.map.get('s1')!.mtime).toBe(4);
+        expect(scan.map.get('big1')!.mtime).toBe(1);
+        expect(scan.map.get('big0')!.dim).toBe(scan.map.get('big1')!.dim);
+
+        // Every vector still reads back exactly, including both supersedes.
+        const big0 = await readRecordAt(a, DIR, scan.map.get('big0')!);
+        expect(big0 && tiersEqual(big0, tiers(91))).toBe(true);
+        const s1 = await readRecordAt(a, DIR, scan.map.get('s1')!);
+        expect(s1 && tiersEqual(s1, tiers(93))).toBe(true);
+        const big7 = await readRecordAt(a, DIR, scan.map.get('big7')!);
+        expect(big7 && tiersEqual(big7, tiers(7))).toBe(true);
+
+        // The next flush allocates above the fold — never back into retired seqs.
+        await bulkAppend(a, DIR, DEV, [{ id: 'later', tiers: tiers(9), mtime: 9 }]);
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0, 5, 6]);
+    });
+
+    it('below the count gate it is a listing-only no-op', async () => {
+        const a = adapter();
+        await bulkAppend(a, DIR, DEV, [{ id: 'x', tiers: tiers(1), mtime: 1 }]);
+        await bulkAppend(a, DIR, DEV, [{ id: 'y', tiers: tiers(2), mtime: 2 }]);
+        const jsonlBefore = await a.read(jsonlPathFor(DIR, DEV));
+        const r = await coalesceSmallShards(a, DIR, DEV, { minSmallShards: 3 });
+        expect(r).toMatchObject({ coalesced: false, reason: 'below-count', smallShards: 2, shardsBefore: 2, shardsAfter: 2 });
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0, 1]);
+        expect(await a.read(jsonlPathFor(DIR, DEV))).toBe(jsonlBefore);
+    });
+
+    it('smalls holding zero live records are retired, not resurrected (floor covers the fold-to-nothing case)', async () => {
+        const a = adapter();
+        for (let f = 0; f < 3; f++) await bulkAppend(a, DIR, DEV, [{ id: 'x', tiers: tiers(f), mtime: f }]); // seqs 0-2
+        await appendTombstone(a, DIR, DEV, 'x', 10); // latest for x = delete → zero live records
+        const r = await coalesceSmallShards(a, DIR, DEV, { minSmallShards: 3 });
+        expect(r).toMatchObject({ coalesced: true, smallShards: 3, shardsAfter: 0, bytesMoved: 0 });
+        expect((await listDeviceShards(a, DIR, DEV)).length).toBe(0);
+        // No dense shard was written, so only the persisted floor keeps the next
+        // flush off the retired seqs (a peer may still hold shards 0-2).
+        await bulkAppend(a, DIR, DEV, [{ id: 'fresh', tiers: tiers(9), mtime: 20 }]);
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([3]);
+    });
+
+    it('a crash at the jsonl swap leaves the old state authoritative and the fold as a reclaimable orphan', async () => {
+        const a = adapter();
+        const fake = a as unknown as { write(p: string, d: string): Promise<void> };
+        await buildMixedSidecar(a);
+
+        // Fail every TEXT write: the dense fold shard lands (binary tmp+rename,
+        // untouched), then the jsonl swap throws — the commit point is never
+        // crossed, exactly a crash between the two.
+        const realWrite = fake.write.bind(fake);
+        fake.write = async () => { throw new Error('EIO: simulated crash at jsonl swap'); };
+        await expect(coalesceSmallShards(a, DIR, DEV, { minSmallShards: 3 })).rejects.toThrow(/simulated crash/);
+        fake.write = realWrite;
+
+        // Old jsonl + old shards authoritative: everything resolves as before.
+        const scan = await scanJsonl(a, [jsonlPathFor(DIR, DEV)]);
+        expect(scan.map.size).toBe(BIG_N + 2);
+        expect(scan.map.get('s1')!.seq).toBe(3);   // still the pre-fold ref
+        const s1 = await readRecordAt(a, DIR, scan.map.get('s1')!);
+        expect(s1 && tiersEqual(s1, tiers(93))).toBe(true);
+        // The orphaned fold shard (seq 5) is on disk, unreferenced — the crash-leak
+        // class compactDevice reclaims, floor-first, so its seq is never reused.
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0, 1, 2, 3, 4, 5]);
+        await compactDevice(a, DIR, DEV, async () => ({ ids: new Set<string>(), complete: true }));
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0, 1, 2, 3, 4]);
+        await bulkAppend(a, DIR, DEV, [{ id: 'later', tiers: tiers(9), mtime: 9 }]);
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([0, 1, 2, 3, 4, 6]);
+    });
+
+    it('a mid-fold write failure rolls back landed dest shards FLOOR-FIRST, so their seqs are never reused', async () => {
+        const a = adapter();
+        // 16 small flushes totaling more records than one shard holds, so the fold
+        // needs TWO dest shards — the only shape where a later write can fail after
+        // an earlier dest shard has already landed (and possibly synced out).
+        const PER = Math.ceil((MAX_VECTORS_PER_SHARD + 100) / 16);
+        for (let f = 0; f < 16; f++) {
+            await bulkAppend(a, DIR, DEV, Array.from({ length: PER }, (_, i) => ({ id: `n${f}-${i}`, tiers: tiers((f * PER + i) % 90), mtime: f + 1 })));
+        }
+        const seqsBefore = (await listDeviceShards(a, DIR, DEV)).map(s => s.seq);
+        expect(seqsBefore).toEqual(Array.from({ length: 16 }, (_, i) => i));
+        const jsonlBefore = await a.read(jsonlPathFor(DIR, DEV));
+
+        // Fail the SECOND dest-shard write; the first lands and is renamed into place.
+        const fake = a as unknown as { writeBinary(p: string, b: ArrayBuffer): Promise<void> };
+        const realWriteBinary = fake.writeBinary.bind(fake);
+        let binWrites = 0;
+        fake.writeBinary = async (p: string, b: ArrayBuffer) => {
+            if (++binWrites === 2) throw new Error('ENOSPC: simulated failure at dest shard 2');
+            return realWriteBinary(p, b);
+        };
+        await expect(coalesceSmallShards(a, DIR, DEV, { smallShardBytes: 1024 * 1024, minSmallShards: 16 })).rejects.toThrow(/ENOSPC/);
+        fake.writeBinary = realWriteBinary;
+
+        // Old state authoritative: sources intact, jsonl untouched, landed dest
+        // shard (seq 16) rolled back.
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual(seqsBefore);
+        expect(await a.read(jsonlPathFor(DIR, DEV))).toBe(jsonlBefore);
+        // The rollback burned seq 16 — it may have synced out between its rename
+        // and its remove — so the floor must keep every later writer above it.
+        await bulkAppend(a, DIR, DEV, [{ id: 'later', tiers: tiers(1), mtime: 99 }]);
+        expect((await listDeviceShards(a, DIR, DEV)).map(s => s.seq)).toEqual([...seqsBefore, 17]);
     });
 });

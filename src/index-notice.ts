@@ -47,6 +47,11 @@ export interface IndexBannerSpec {
 export const INDEX_STALE_MSG = 'Index change detected. Search results may be inaccurate. Please reindex.';
 export const INDEX_SYNCING_MSG = 'A newer index is syncing from another device. Results may be inaccurate.';
 export const INDEX_PEER_AHEAD_MSG = 'Another device has a newer index. Update Seek on this device to use it.';
+// Shown (rate-limited) when index commits fail with QuotaExceededError — device
+// storage is full. The un-committed files stay dirty by the drain's own criterion,
+// so once space frees up the normal catch-up path heals them without a manual
+// reindex; the copy promises exactly that and nothing more.
+export const INDEX_QUOTA_MSG = 'Seek: device storage is full — some notes could not be indexed. Free up space and Seek will catch up automatically.';
 
 // `peerSyncPending` = a peer device's CURRENT-version sidecar is present but hasn't
 // finished syncing down (set only at the version-stale branch, from peerSidecarPresent()).

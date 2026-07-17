@@ -407,26 +407,6 @@ export async function listDeviceShards(adapter: DataAdapter, indexDir: string, d
     return out;
 }
 
-interface ActiveShardPick {
-    seq: number;
-    path: string;
-    existingSize: number;
-}
-
-// Pick the shard the next write targets, rotating to a fresh seq when the current
-// active shard wouldn't fit `neededBytes`.
-async function pickActiveShard(adapter: DataAdapter, indexDir: string, deviceId: string, neededBytes: number): Promise<ActiveShardPick> {
-    const shards = await listDeviceShards(adapter, indexDir, deviceId);
-    if (shards.length === 0) {
-        return { seq: 0, path: shardPathFor(indexDir, deviceId, 0), existingSize: 0 };
-    }
-    const last = shards[shards.length - 1];
-    if (last.size + neededBytes <= SHARD_CAP_BYTES) {
-        return { seq: last.seq, path: last.path, existingSize: last.size };
-    }
-    return { seq: last.seq + 1, path: shardPathFor(indexDir, deviceId, last.seq + 1), existingSize: 0 };
-}
-
 // ---- JSONL reader + resolver ----
 
 // Strips a trailing partial line (no newline) — protects against truncated writes.
@@ -629,15 +609,19 @@ export async function sweepOrphanTmpFiles(adapter: DataAdapter, root: string, de
 //
 // NON-GOAL: cross-process writers on the SAME physical device. deviceId is stable
 // per install, so two Obsidian processes opening the same vault on one machine map
-// to the same index.<deviceId> files with independent in-process locks. Since every
-// write is read-concat-write-whole-shard, concurrent flushes can lose the loser's
-// records (last-rename-wins on the shard) — tmp+rename still prevents a *torn* file,
-// just not a lost one. This is accepted: Obsidian is single-instance per vault, and
-// two distinct machines get distinct deviceIds (no collision). The cost of a
-// collision is re-embed on the next reconcile, never a corrupt live index.
+// to the same index.<deviceId> files with independent in-process locks. Concurrent
+// flushes can both pick the same fresh seq (each lists shards, sees the same max)
+// and last-rename-wins on that shard file — the loser's jsonl lines then resolve
+// against the winner's bytes (lost or misread records; tmp+rename still prevents a
+// *torn* file). This is accepted: Obsidian is single-instance per vault, and two
+// distinct machines get distinct deviceIds (no collision). The cost of a collision
+// is re-embed on the next reconcile, never a corrupt live index.
 const dirLocks = new Map<string, Promise<unknown>>();
 
-async function withDirLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+// Exported for sidecar-meta's writeDeviceMeta (whose seqFloor preserve-read must
+// not interleave with an in-lock floor raise) and for tests. NOT re-entrant —
+// never call it while already inside a locked section for the same dir.
+export async function withDirLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
     const prior = dirLocks.get(dir) ?? Promise.resolve();
     let release!: () => void;
     const myCompletion = new Promise<void>(resolve => {
@@ -679,8 +663,63 @@ export async function appendTombstone(adapter: DataAdapter, indexDir: string, de
     });
 }
 
-// Bulk append. Splits across as many shards as needed when the batch would
-// overflow the active shard's cap; each shard write is bounded at SHARD_CAP_BYTES.
+// ---- persisted seq floor (never-reuse, across deletion) ----
+// The one real invariant (see compactDevice's header) is that a (deviceId, seq)
+// shard FILENAME, once used, is never republished with different bytes: a peer
+// may hold any historical shard file, and iCloud offers no cross-file ordering,
+// so a reused name lets fresh jsonl refs resolve against stale bytes — and
+// records carry no id binding, so the CRC passes and the wrong vector hydrates
+// silently. Deriving the next seq from the on-disk max alone holds this only
+// while every historical shard is still on disk; any path that deletes a
+// max-seq shard with no higher seq left (crash-orphan reclaim, compact-to-empty,
+// pre-rebuild clearDevice) must therefore persist a floor FIRST, so allocation
+// can never dip back into retired seqs. The floor lives as `seqFloor` in
+// meta.<deviceId>.json, read/written RAW here (sidecar-meta imports from this
+// module, and the floor must survive in metas readDeviceMeta rejects, e.g. the
+// stale-format leftover clearDevice keeps). Monotone by construction; every
+// caller already holds the dir lock.
+async function readSeqFloorRaw(adapter: DataAdapter, indexDir: string, deviceId: string): Promise<number> {
+    try {
+        const v = (JSON.parse(await adapter.read(metaPathFor(indexDir, deviceId))) as { seqFloor?: unknown }).seqFloor;
+        return typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+    } catch {
+        return 0; // no meta yet / torn json → no floor recorded
+    }
+}
+
+// Raise (never lower) the persisted floor. Deliberately NOT error-swallowed:
+// deleters call this BEFORE removing shards, and if the floor can't be persisted
+// the deletion must not happen either (fail-closed) — a lost floor plus a
+// completed deletion is exactly the reuse window this exists to close.
+async function raiseSeqFloorRaw(adapter: DataAdapter, indexDir: string, deviceId: string, floor: number): Promise<void> {
+    let obj: Record<string, unknown> = {};
+    try {
+        const parsed: unknown = JSON.parse(await adapter.read(metaPathFor(indexDir, deviceId)));
+        if (parsed && typeof parsed === 'object') obj = parsed as Record<string, unknown>;
+    } catch { /* absent/torn meta → write a floor-only stub; readDeviceMeta rejects it as a version gate, which is correct — only the floor needs to survive */ }
+    const prev = typeof obj.seqFloor === 'number' && Number.isFinite(obj.seqFloor) ? (obj.seqFloor as number) : 0;
+    if (floor <= prev) return;
+    obj.seqFloor = floor;
+    if (typeof obj.deviceId !== 'string') obj.deviceId = deviceId;
+    await writeTextAtomic(adapter, metaPathFor(indexDir, deviceId), JSON.stringify(obj, null, 2));
+}
+
+// Bulk append — APPEND-ONLY (1A): every flush lands in FRESH shard file(s), at
+// seqs above every existing seq. An existing shard is never read or rewritten,
+// so a K-record flush costs O(K·VEC_BYTES) of IO instead of a read-merge-rewrite
+// of up to a full SHARD_CAP_BYTES shard (a one-chunk edit near a full 4 MB shard
+// re-uploaded ~9,000× its payload through iCloud). This is safe because nothing
+// in the format assumes shard fullness: readers resolve per-record (seq, off)
+// through the jsonl and union shards by seq (scanJsonl), and compactDevice's
+// generational rewrite later coalesces the accumulated small shards into dense
+// ones AND reclaims superseded bytes — the same editing churn that proliferates
+// shards also raises the dead-record ratio that triggers it. Never reusing a
+// (seq, off) is the one real invariant (see compactDevice's header), and fresh
+// seqs preserve it by construction. Crash-safety: each shard is written
+// tmp+rename BEFORE the jsonl lines referencing it are appended, so a crash
+// between the two leaves an unreferenced shard — exactly the orphan class
+// compactDevice's crash-leak reclaim deletes. Batches larger than
+// SHARD_CAP_BYTES split across consecutive fresh shards.
 export async function bulkAppend(
     adapter: DataAdapter,
     indexDir: string,
@@ -690,27 +729,29 @@ export async function bulkAppend(
     if (records.length === 0) return [];
     return withDirLock(indexDir, async () => {
         await ensureDir(adapter, indexDir);
+        // One listing (for the max seq) — includes crash-orphaned shards, which is
+        // exactly right: their seqs must not be reused while they are on disk. The
+        // persisted floor covers the other half — seqs whose shards were DELETED
+        // (reclaim / compaction / clearDevice) but may still exist on a peer.
+        const shards = await listDeviceShards(adapter, indexDir, deviceId);
+        const floor = await readSeqFloorRaw(adapter, indexDir, deviceId);
+        let nextSeq = Math.max(shards.length > 0 ? shards[shards.length - 1].seq + 1 : 0, floor);
         const refs: Array<{ seq: number; off: number }> = [];
         const lines: string[] = [];
         let cursor = 0;
         while (cursor < records.length) {
-            const active = await pickActiveShard(adapter, indexDir, deviceId, VEC_BYTES);
-            const room = SHARD_CAP_BYTES - active.existingSize;
-            const maxVecs = Math.floor(room / VEC_BYTES);
-            if (maxVecs <= 0) throw new Error(`no room in shard seq=${active.seq} (size=${active.existingSize})`);
-            const take = Math.min(maxVecs, records.length - cursor);
-            const existing = active.existingSize > 0 ? await adapter.readBinary(active.path) : new ArrayBuffer(0);
-            const merged = new Uint8Array(active.existingSize + take * VEC_BYTES);
-            merged.set(new Uint8Array(existing), 0);
-            let localCursor = active.existingSize;
+            const take = Math.min(MAX_VECTORS_PER_SHARD, records.length - cursor);
+            const buf = new Uint8Array(take * VEC_BYTES);
+            let off = 0;
             for (let i = 0; i < take; i++) {
                 const { id, tiers, mtime } = records[cursor + i];
-                merged.set(encodeRecord(tiers), localCursor);
-                refs.push({ seq: active.seq, off: localCursor });
-                lines.push(JSON.stringify({ id, dim: DIM, shard: deviceId, seq: active.seq, off: localCursor, mtime }));
-                localCursor += VEC_BYTES;
+                buf.set(encodeRecord(tiers), off);
+                refs.push({ seq: nextSeq, off });
+                lines.push(JSON.stringify({ id, dim: DIM, shard: deviceId, seq: nextSeq, off, mtime }));
+                off += VEC_BYTES;
             }
-            await writeBinaryAtomic(adapter, active.path, merged.buffer);
+            await writeBinaryAtomic(adapter, shardPathFor(indexDir, deviceId, nextSeq), buf.buffer);
+            nextSeq++;
             cursor += take;
         }
         if (lines.length > 0) await appendJsonlLine(adapter, jsonlPathFor(indexDir, deviceId), lines.join('\n') + '\n');
@@ -718,24 +759,39 @@ export async function bulkAppend(
     });
 }
 
-// Drop ALL of `deviceId`'s sidecar artifacts — shards, jsonl, meta, AND the bm25
-// blob. Two callers: the start of a FULL reindex (so the run REPLACES this device's
-// vectors rather than appending to / doubling the prior pass) and the dead-identity
-// reap (which must FULLY reclaim a stale device — leaving meta/bm25 behind would let
-// it re-surface every reap forever, the leak listSidecarDeviceIds exists to end).
+// Drop `deviceId`'s sidecar artifacts. Two caller classes with different needs:
+// - A device that will WRITE AGAIN under this id (the start of a FULL reindex, or
+//   an own-device stale-format wipe) passes preserveSeqFloor: true — the meta file
+//   is KEPT and its seqFloor raised past every deleted shard, so the rebuild's
+//   flushes can never republish a filename a peer may still hold (see
+//   raiseSeqFloorRaw). Keeping the full meta (not a bare floor stub) also shields
+//   the floor from a peer's dead-identity reap: a current-identity meta passes
+//   metaAccepts, a stub would not and would be reaped with the floor inside it.
+// - The dead-identity reap omits the flag: it must FULLY reclaim a stale device
+//   (leaving meta/bm25 behind would let it re-surface every reap forever, the leak
+//   listSidecarDeviceIds exists to end), and a retired device id never writes
+//   again, so there is no floor worth preserving.
 // Other devices' files are untouched.
-export async function clearDevice(adapter: DataAdapter, indexDir: string, deviceId: string): Promise<void> {
+export async function clearDevice(adapter: DataAdapter, indexDir: string, deviceId: string, opts: { preserveSeqFloor?: boolean } = {}): Promise<void> {
     return withDirLock(indexDir, async () => {
         if (!(await exists(adapter, indexDir))) return;
-        for (const s of await listDeviceShards(adapter, indexDir, deviceId)) {
+        const shards = await listDeviceShards(adapter, indexDir, deviceId);
+        if (opts.preserveSeqFloor && shards.length > 0) {
+            // BEFORE any deletion, fail-closed: if the floor can't be persisted,
+            // the clear throws and nothing is removed this attempt.
+            await raiseSeqFloorRaw(adapter, indexDir, deviceId, shards[shards.length - 1].seq + 1);
+        }
+        for (const s of shards) {
             await adapter.remove(s.path).catch(() => {});
         }
-        // Remove every per-device artifact so a full reindex (or a dead-identity
-        // reap) fully replaces this device: jsonl log, version meta, and the cross-
-        // device BM25 blob. Previously only the shards + jsonl were cleared, so
-        // meta.<id>.json + bm25.<id>.json.gz lingered (gated out as stale, but
-        // accumulating across reindexes).
-        for (const p of [jsonlPathFor(indexDir, deviceId), metaPathFor(indexDir, deviceId), bm25PathFor(indexDir, deviceId)]) {
+        // Remove the per-device artifacts: jsonl log and the cross-device BM25
+        // blob always; the version meta only on the full-reclaim (reap) path —
+        // the preserve path keeps it as the floor's carrier. Previously only the
+        // shards + jsonl were cleared, so meta.<id>.json + bm25.<id>.json.gz
+        // lingered (gated out as stale, but accumulating across reindexes).
+        const doomed = [jsonlPathFor(indexDir, deviceId), bm25PathFor(indexDir, deviceId)];
+        if (!opts.preserveSeqFloor) doomed.push(metaPathFor(indexDir, deviceId));
+        for (const p of doomed) {
             if (await exists(adapter, p)) await adapter.remove(p).catch(() => {});
         }
     });
@@ -762,6 +818,11 @@ export interface CompactResult {
     bytesBefore: number;   // total shard bytes before
     bytesAfter: number;    // total shard bytes after
     shed: number;          // own-shard records dropped as unreadable/corrupt (expected 0)
+    // Shard-file counts (post orphan-reclaim / post rewrite). The watch signal for
+    // append-only flush proliferation (1A): if shardsBefore trends high while the
+    // gates keep declining, the compaction trigger needs tightening.
+    shardsBefore: number;
+    shardsAfter: number;
 }
 
 // Compact `deviceId`'s OWN sidecar in place: rewrite its jsonl + shards to hold only
@@ -802,38 +863,56 @@ export async function compactDevice(
     const minDeadRatio = opts.minDeadRatio ?? 0.5;
     const minShardBytes = opts.minShardBytes ?? 2 * 1024 * 1024;
     return withDirLock(indexDir, async () => {
-        const nil: CompactResult = { compacted: false, recordsBefore: 0, recordsAfter: 0, bytesBefore: 0, bytesAfter: 0, shed: 0 };
+        const nil: CompactResult = { compacted: false, recordsBefore: 0, recordsAfter: 0, bytesBefore: 0, bytesAfter: 0, shed: 0, shardsBefore: 0, shardsAfter: 0 };
         if (!(await exists(adapter, indexDir))) return nil;
 
         let shardsBefore = await listDeviceShards(adapter, indexDir, deviceId);
 
-        // Crash-leak reclaim: a shard whose seq is referenced by ZERO jsonl lines
-        // (not even a dead/superseded one) can only be a leftover from a PRIOR
-        // compaction that crashed between the atomic jsonl swap (the single commit
-        // point, above) and the old-shard delete that follows it — the swapped-in
-        // jsonl already points solely at fresh seqs, so nothing on disk can ever
-        // reference the stale ones again. This must run BEFORE the below-floor /
-        // below-ratio / nothing-dead gates below: those compare record counts
-        // within the CURRENT (already-compacted) jsonl, see nothing dead, and
-        // return early — if the leak check were gated behind them too, a crash
-        // right after the swap would leak the old shards permanently (the fast
-        // path can never "see" bytes the jsonl no longer mentions at all).
+        // Zero-reference reclaim: a shard whose seq is referenced by ZERO jsonl
+        // lines (not even a dead/superseded one) is provably unreachable — the
+        // jsonl is the only pointer store, so nothing on disk can resolve into it
+        // again. Three origins: a compaction/coalesce that crashed between the
+        // atomic jsonl swap (the single commit point) and the old-shard delete
+        // that follows it; a bulkAppend flush that crashed between the shard
+        // rename and its jsonl append (1A — always the highest seq on disk); and
+        // a dense shard whose every record was superseded and whose stale refs a
+        // coalesce rewrite then collapsed away — so an orphan is NOT necessarily
+        // crash debris, nor necessarily the disk max. Deleting at any seq is safe
+        // because the floor raise below runs BEFORE the removes. This must run
+        // BEFORE the below-floor / below-ratio / nothing-dead gates below: those
+        // compare record counts within the CURRENT (already-compacted) jsonl, see
+        // nothing dead, and return early — if the leak check were gated behind
+        // them too, a crash right after the swap would leak the old shards
+        // permanently (the fast path can never "see" bytes the jsonl no longer
+        // mentions at all).
         const { records: rawRecords } = await readJsonl(adapter, jsonlPathFor(indexDir, deviceId));
         const referencedSeqs = new Set<number>();
         for (const r of rawRecords) if (!isTombstone(r)) referencedSeqs.add(r.seq);
         const orphanShards = shardsBefore.filter(s => !referencedSeqs.has(s.seq));
         if (orphanShards.length > 0) {
+            // Persist the floor BEFORE deleting: a crash orphan is by construction
+            // the HIGHEST seq on disk (bulkAppend writes fresh max-seq shards, so a
+            // crashed flush's leftovers sit above everything referenced). Deleting
+            // it without a floor would drop the on-disk max back, and the next
+            // flush would republish the same filename with different bytes — the
+            // stale-resolve hole described at raiseSeqFloorRaw. Fail-closed: if
+            // the floor write throws, nothing is deleted this pass.
+            await raiseSeqFloorRaw(adapter, indexDir, deviceId, orphanShards[orphanShards.length - 1].seq + 1);
             for (const s of orphanShards) await adapter.remove(s.path).catch(() => {});
             shardsBefore = shardsBefore.filter(s => referencedSeqs.has(s.seq));
         }
 
         const bytesBefore = shardsBefore.reduce((sum, s) => sum + s.size, 0);
-        if (bytesBefore < minShardBytes) return { ...nil, reason: 'below-floor', bytesBefore };
+        const shardCount = shardsBefore.length;
+        // Early returns report bytesAfter = bytesBefore (nothing changed) — the
+        // sidecar-compact census beat logs both, and `...nil`'s bytesAfter: 0
+        // would read as a wipe on exactly the below-floor sessions it watches.
+        if (bytesBefore < minShardBytes) return { ...nil, reason: 'below-floor', bytesBefore, bytesAfter: bytesBefore, shardsBefore: shardCount, shardsAfter: shardCount };
 
         // Snapshot the live-id oracle UNDER the lock (excludes concurrent appends), only
         // once past the floor (so a small sidecar never pays the re-chunk).
         const { ids: keepIds, complete } = await liveIds();
-        if (!complete) return { ...nil, reason: 'incomplete-rechunk', bytesBefore };
+        if (!complete) return { ...nil, reason: 'incomplete-rechunk', bytesBefore, bytesAfter: bytesBefore, shardsBefore: shardCount, shardsAfter: shardCount };
 
         // This device alone → scanJsonl's cross-device step is trivial and supersedes
         // collapse to the latest record per id.
@@ -841,7 +920,7 @@ export async function compactDevice(
         const recordsBefore = scan.recordCount;
         const keep: ResolvedEntry[] = [];
         for (const e of scan.map.values()) if (keepIds.has(e.id)) keep.push(e);
-        const base = { ...nil, recordsBefore, recordsAfter: keep.length, bytesBefore, bytesAfter: bytesBefore };
+        const base = { ...nil, recordsBefore, recordsAfter: keep.length, bytesBefore, bytesAfter: bytesBefore, shardsBefore: shardCount, shardsAfter: shardCount };
         if (recordsBefore === 0 || keep.length >= recordsBefore) return { ...base, reason: 'nothing-dead' };
         if ((recordsBefore - keep.length) / recordsBefore < minDeadRatio) return { ...base, reason: 'below-ratio' };
 
@@ -851,7 +930,10 @@ export async function compactDevice(
         const newLines: string[] = [];
         const newShardPaths: string[] = [];
         let shed = 0;
-        let destSeq = maxSeq + 1;
+        // Honor the persisted floor: after an orphan reclaim (above), the floor can
+        // sit ABOVE the surviving on-disk max, and fresh shards must not collide
+        // with the reclaimed seqs a peer may still hold.
+        let destSeq = Math.max(maxSeq + 1, await readSeqFloorRaw(adapter, indexDir, deviceId));
         let destBuf = new Uint8Array(SHARD_CAP_BYTES);
         let destLen = 0;
         let srcSeq = -1;
@@ -885,16 +967,183 @@ export async function compactDevice(
             }
             await flushDest();
         } catch (err) {
-            // Roll back the fresh shards; the old jsonl + old shards remain authoritative.
-            for (const p of newShardPaths) await adapter.remove(p).catch(() => {});
+            // Roll back the fresh shards — FLOOR-FIRST (see coalesceSmallShards's
+            // identical rollback): a landed shard may have synced out before this
+            // remove, so its seq is burned; if the floor write fails, leave the
+            // shards as orphans for the floor-first reclaim instead of deleting.
+            if (newShardPaths.length > 0) {
+                try {
+                    await raiseSeqFloorRaw(adapter, indexDir, deviceId, destSeq);
+                    for (const p of newShardPaths) await adapter.remove(p).catch(() => {});
+                } catch { /* left as orphans; reclaimed floor-first later */ }
+            }
             throw err;
         }
 
         // Commit: atomic swap to the new jsonl (now pointing only at fresh shards).
         await writeTextAtomic(adapter, jsonlPathFor(indexDir, deviceId), newLines.length ? newLines.join('\n') + '\n' : '');
+        // Raise the floor past every seq this rewrite retires, BEFORE deleting
+        // them. Redundant when fresh shards were written (the on-disk max already
+        // exceeds the retired seqs) but load-bearing for compact-to-empty: keep=[]
+        // writes no fresh shard, so the delete below would otherwise drop the
+        // on-disk max to nothing and the next flush would resurrect seq 0.
+        await raiseSeqFloorRaw(adapter, indexDir, deviceId, destSeq);
         // Reclaim: delete the OLD shards (seq ≤ maxSeq); fresh shards (> maxSeq) stay.
         for (const s of shardsBefore) await adapter.remove(s.path).catch(() => {});
 
-        return { compacted: true, reason: 'done', recordsBefore, recordsAfter: newLines.length, bytesBefore, bytesAfter: newLines.length * VEC_BYTES, shed };
+        return { compacted: true, reason: 'done', recordsBefore, recordsAfter: newLines.length, bytesBefore, bytesAfter: newLines.length * VEC_BYTES, shed, shardsBefore: shardCount, shardsAfter: newShardPaths.length };
+    });
+}
+
+export interface CoalesceResult {
+    coalesced: boolean;
+    reason?: 'below-count' | 'done';
+    smallShards: number;  // small shards found (and, on 'done', deleted)
+    shardsBefore: number;
+    shardsAfter: number;
+    bytesMoved: number;   // live bytes copied into dense shards
+    shed: number;         // corrupt/unreadable source records dropped (expected 0)
+    // Torn/unparseable jsonl lines the rewrite dropped (expected 0). Surfaced
+    // because the swap permanently removes them: the caller should log the
+    // breadcrumb before the on-disk evidence is gone.
+    skippedLines: number;
+}
+
+// Shard-count hygiene for the append-only writer (1A): fold accumulated SMALL
+// shards — bulkAppend leaves one per flush — into dense fresh shard(s). This is
+// the ORACLE-FREE half of reclamation: compactDevice needs the whole-vault
+// re-chunk because only the vault can prove an id is dead (orphaned), but two
+// kinds of waste are provable from the jsonl alone — superseded duplicates (a
+// newer record for the same id exists in this same single-writer file) and
+// fragmentation (live records scattered across per-flush files). So this pass
+// byte-copies the latest record per id out of every small shard into dense
+// shard(s), swaps the jsonl atomically, and deletes the merged smalls; records
+// already in dense (≥ smallShardBytes) shards keep their (seq, off) untouched,
+// so cost is proportional to the small tail, not the corpus. No liveness
+// decision is made: every resolved id survives. Cheap enough to gate on shard
+// COUNT and run every reconcile poll, closing the gap where compactDevice's
+// byte floor is weeks away while the directory gains a file per flush.
+//
+// A coalesced output below smallShardBytes counts as small next round and gets
+// re-copied into the next fold — deliberate (an LSM-lite level-0 merge): each
+// byte is re-copied at most ~smallShardBytes/(minSmallShards·avg-flush) times
+// before its snowball graduates past the threshold, trivial at these sizes.
+//
+// Side effect on compactDevice's trigger: collapsing superseded lines lowers
+// the raw-line dead ratio it gates on, so after a coalesce only orphaned-id
+// waste counts toward minDeadRatio — correct (the superseded waste is already
+// reclaimed), but it means the oracle pass is reached mostly via the byte
+// floor once this runs regularly.
+//
+// Safety is compactDevice's generational pattern exactly: dense shards land at
+// fresh seqs (above the on-disk max AND the persisted floor) via tmp+rename
+// BEFORE the jsonl swap (the single commit point); the floor is raised past
+// every retired seq BEFORE the smalls are deleted (fail-closed). A crash
+// before the swap leaves the old jsonl authoritative and the dense shard as a
+// reclaimable orphan; a crash after it leaves the smalls unreferenced — the
+// same orphan class, reclaimed by the next pass. Tombstone lines are dropped
+// with the superseded lines they mask (a tombstone only ever masks THIS
+// device's records, and the rewrite drops every masked line — peers resolve
+// identically with or without it).
+export async function coalesceSmallShards(
+    adapter: DataAdapter,
+    indexDir: string,
+    deviceId: string,
+    opts: { smallShardBytes?: number; minSmallShards?: number } = {},
+): Promise<CoalesceResult> {
+    const smallShardBytes = opts.smallShardBytes ?? 256 * 1024;
+    const minSmallShards = opts.minSmallShards ?? 16;
+    return withDirLock(indexDir, async () => {
+        const nil: CoalesceResult = { coalesced: false, smallShards: 0, shardsBefore: 0, shardsAfter: 0, bytesMoved: 0, shed: 0, skippedLines: 0 };
+        if (!(await exists(adapter, indexDir))) return nil;
+        const shards = await listDeviceShards(adapter, indexDir, deviceId);
+        const small = shards.filter(s => s.size < smallShardBytes);
+        if (small.length === 0 || small.length < minSmallShards) {
+            return { ...nil, reason: 'below-count', smallShards: small.length, shardsBefore: shards.length, shardsAfter: shards.length };
+        }
+
+        const smallSeqs = new Set(small.map(s => s.seq));
+        const scan = await scanJsonl(adapter, [jsonlPathFor(indexDir, deviceId)]);
+        const move: ResolvedEntry[] = [];
+        const newLines: string[] = [];
+        for (const e of scan.map.values()) {
+            if (smallSeqs.has(e.seq)) move.push(e);
+            else newLines.push(JSON.stringify({ id: e.id, dim: e.dim, shard: deviceId, seq: e.seq, off: e.off, mtime: e.mtime }));
+        }
+
+        const maxSeq = shards[shards.length - 1].seq;
+        move.sort((a, b) => (a.seq - b.seq) || (a.off - b.off)); // each source shard read once
+        const newShardPaths: string[] = [];
+        let shed = 0;
+        let bytesMoved = 0;
+        let destSeq = Math.max(maxSeq + 1, await readSeqFloorRaw(adapter, indexDir, deviceId));
+        // Dest buffers are sized to the REMAINING move set (capped at a shard), not
+        // a flat SHARD_CAP_BYTES: the typical fold moves a few hundred KB, and a
+        // 4 MB allocation every 5-minute trigger is real pressure inside an iOS
+        // WKWebView — the environment whose eviction the sidecar exists to survive.
+        let copied = 0; // move entries consumed (moved or shed) — sizes the next buffer
+        const nextBuf = () => new Uint8Array(Math.min((move.length - copied) * VEC_BYTES, SHARD_CAP_BYTES));
+        let destBuf = nextBuf();
+        let destLen = 0;
+        let srcSeq = -1;
+        let srcBuf: ArrayBuffer | null = null;
+        const flushDest = async (): Promise<void> => {
+            if (destLen === 0) return;
+            const path = shardPathFor(indexDir, deviceId, destSeq);
+            await writeBinaryAtomic(adapter, path, destBuf.slice(0, destLen).buffer);
+            newShardPaths.push(path);
+            destSeq++;
+            destBuf = nextBuf();
+            destLen = 0;
+        };
+        try {
+            for (const e of move) {
+                if (e.seq !== srcSeq) {
+                    srcSeq = e.seq;
+                    srcBuf = await adapter.readBinary(shardPathFor(indexDir, deviceId, e.seq)).catch(() => null);
+                }
+                // Same shed semantics as compactDevice: a record whose source bytes
+                // are missing/corrupt is already dead-on-read at hydrate, so dropping
+                // its line costs nothing; non-zero shed is a corruption breadcrumb.
+                if (!srcBuf || !isOffsetInRange(srcBuf.byteLength, e.off)) { shed++; copied++; continue; }
+                try { decodeRecord(srcBuf, e.off, e.dim); } catch { shed++; copied++; continue; }
+                if (destLen + VEC_BYTES > destBuf.length) await flushDest();
+                destBuf.set(new Uint8Array(srcBuf, e.off, VEC_BYTES), destLen);
+                newLines.push(JSON.stringify({ id: e.id, dim: e.dim, shard: deviceId, seq: destSeq, off: destLen, mtime: e.mtime }));
+                destLen += VEC_BYTES;
+                bytesMoved += VEC_BYTES;
+                copied++;
+            }
+            await flushDest();
+        } catch (err) {
+            // Roll back the fresh shards — FLOOR-FIRST: a landed shard may already
+            // have synced out in its rename→remove window, burning its seq exactly
+            // as if it were referenced; deleting it without a floor would let the
+            // next flush republish the filename with different bytes. If the floor
+            // write itself fails, delete nothing — the shards stay as unreferenced
+            // orphans for the floor-first crash-leak reclaim.
+            if (newShardPaths.length > 0) {
+                try {
+                    await raiseSeqFloorRaw(adapter, indexDir, deviceId, destSeq);
+                    for (const p of newShardPaths) await adapter.remove(p).catch(() => {});
+                } catch { /* left as orphans; reclaimed floor-first later */ }
+            }
+            throw err;
+        }
+
+        // Commit: atomic swap. Dense-shard refs are unchanged; small-shard refs now
+        // point at the fresh dense shard(s); superseded/tombstone lines are gone.
+        await writeTextAtomic(adapter, jsonlPathFor(indexDir, deviceId), newLines.length ? newLines.join('\n') + '\n' : '');
+        // Floor past every retired seq BEFORE deleting (see raiseSeqFloorRaw) —
+        // load-bearing when the smalls held zero live records (no dense shard was
+        // written, so deletion would otherwise lower the on-disk max).
+        await raiseSeqFloorRaw(adapter, indexDir, deviceId, destSeq);
+        for (const s of small) await adapter.remove(s.path).catch(() => {});
+
+        return {
+            coalesced: true, reason: 'done', smallShards: small.length,
+            shardsBefore: shards.length, shardsAfter: shards.length - small.length + newShardPaths.length,
+            bytesMoved, shed, skippedLines: scan.skippedLines,
+        };
     });
 }

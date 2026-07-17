@@ -904,6 +904,12 @@ export interface IndexCompleteEntry {
     chunksIndexed: number;
     vectorsWritten: number;
     filesSkippedError: number;
+    // The subset of filesSkippedError whose commit failed with QuotaExceededError
+    // (device storage full). Split out because the remedy is environmental (free
+    // disk space), not content- or code-shaped — the pass-end gate surfaces it as
+    // its own check line + Notice instead of the generic "see error log". Optional:
+    // absent on entries written before this field existed.
+    filesSkippedQuota?: number;
     // Embed-failure quarantine (v14, issue #4): files committed WITH a failure
     // marker — some chunks deterministically failed (survived batch + solo
     // retries, each behind a device recycle) and were omitted; the rest of the

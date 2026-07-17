@@ -7,7 +7,7 @@
 // three v0 commands.
 
 import type { App } from 'obsidian';
-import { TFile } from 'obsidian'; // value import: reindexDelta uses `instanceof TFile`
+import { Notice, TFile } from 'obsidian'; // value imports: reindexDelta uses `instanceof TFile`; the quota gate toasts
 import type { Chunk, ChunkMeta, ScoredChunk, SearchEntry, IndexCompleteEntry, IndexProgressEntry, ResetEntry, QueryFilters, FilterContext, SeekSettings, MemorySnapshot } from './types';
 import { snapshotMemory, memoryDelta, distributionStats } from './types';
 import { MarkdownChunker, cyrb53Hex } from './chunker';
@@ -18,7 +18,8 @@ import { buildSynonymMap, chunkDeclaresAlias, SYNONYM_WEIGHT, type SynonymMap } 
 import { TaskContextTracker } from './task-context';
 import { rank, cosineScores, DEFAULT_RANKING_CONFIG } from './ranker';
 import { browseOrder, recencyDate } from './fusion';
-import { IndexStore, nukeDatabase, classifyFileDelta, findOrphanChunkIds, isStoreClosedError, META_SCHEMA_VERSION, type MetaConfig, type FileRecord } from './index-store';
+import { IndexStore, nukeDatabase, classifyFileDelta, findOrphanChunkIds, isStoreClosedError, isQuotaError, META_SCHEMA_VERSION, type MetaConfig, type FileRecord } from './index-store';
+import { INDEX_QUOTA_MSG } from './index-notice';
 import { LocalEmbedder, EMBEDDING_DIM, LEGACY_ENGLISH_MODEL_ID, MODEL_ID, PLUGIN_VERSION } from './embedder';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
@@ -30,10 +31,10 @@ import { poolCaps, POOL_FLOORS } from './pool';
 import { BinaryScorerWorker, binaryCandidatesAsync } from './binary-scorer';
 import { quantizeInt8, dequantizeInt8, type QuantVec } from './quant';
 import { VecReservoir, denseBgStats, calibratedConfidence, BG_RESERVOIR, MIN_BG_SAMPLE } from './dense-stats';
-import { bulkAppend, clearDevice, sidecarDirSignature, shouldReconcileSidecar, staleSidecarFormat, SIDECAR_FORMAT, bm25PathFor, writeBytesAtomic, ensureDir, listSidecarDeviceIds, compactDevice, type CompactResult, type TierBytes } from './sidecar';
+import { bulkAppend, clearDevice, sidecarDirSignature, shouldReconcileSidecar, staleSidecarFormat, SIDECAR_FORMAT, bm25PathFor, writeBytesAtomic, ensureDir, listSidecarDeviceIds, listDeviceShards, compactDevice, coalesceSmallShards, type CompactResult, type CoalesceResult, type TierBytes } from './sidecar';
 import { writeDeviceMeta, readDeviceMeta, metaAccepts, expectationFor, type SidecarMeta, type MetaExpectation } from './sidecar-meta';
 import { hydrateFromSidecar, rankAcceptedProducers, probePeerAhead, type ReChunkedNote, type HydrateResult, type HydrateDeps } from './sidecar-sync';
-import { pluginIdentity, shouldStampLiveIdentity, identityHealEligibility } from './identity';
+import { pluginIdentity, shouldStampLiveIdentity, identityHealEligibility, type IndexIdentity } from './identity';
 import { gzipString, gunzipToString, gzipAvailable } from './gzip';
 import { IndexCoordinator } from './index-coordinator';
 import { CompositorPacer, cheapYield } from './pacer';
@@ -96,6 +97,30 @@ const PROGRESS_EVERY = 25;
 // longer than this while files are committing (see the cadence comment at
 // the emit site — two healthy iPhone WASM runs were force-quit as "stalled").
 const PROGRESS_MAX_SILENCE_MS = 2500;
+
+// Full-reindex soft preempt: while the user is typing in the search modal or a
+// query embed is in flight (budget.shouldContinue → false), a FULL pass pauses
+// between files instead of competing for the iframe/GPU — then resumes; it never
+// aborts (a full reindex must finish; the incremental path is the one that breaks
+// and defers to catch-up). Poll cadence is coarse on purpose — the wait itself
+// holds no resources, and 250 ms is well under a typing session's decay window.
+// The per-episode cap is a wedge guard only: searchActive self-heals after 60 s
+// (SEARCH_ACTIVE_MAX_AGE_MS), so the cap should never bind in a healthy session.
+const FULL_PREEMPT_POLL_MS = 250;
+const FULL_PREEMPT_MAX_WAIT_MS = 2 * 60_000;
+// Consecutive episode-cap expiries (with the signal never once observed true)
+// before the pass treats the preempt signal as wedged and stops pausing. One
+// expiry can be a genuinely busy user refreshing searchActive; three in a row
+// (6 min, zero true observations) cannot — searchActive self-heals at 60 s, so
+// only a leaked query-in-flight count holds the signal false that long. Without
+// this, "give up after 2 min" is per FILE, not per pass: a wedged signal turns
+// a large full reindex into hours while holding the write mutex.
+const FULL_PREEMPT_WEDGE_EPISODES = 3;
+
+// Minimum spacing between "storage full" toasts. Quota exhaustion re-surfaces on
+// every retried pass (catch-up bursts re-fire), and the condition can persist for
+// hours — one Notice per pass would be a toast storm saying the same thing.
+const QUOTA_NOTICE_MIN_INTERVAL_MS = 5 * 60_000;
 
 // ---- Stage-1 candidate-gen caps (Seek Retrieval Relevance & Query §Two-Stage
 // ANN → Rerank, the [!done] callout). The union of the three arms feeds the fp32
@@ -179,6 +204,20 @@ export interface RecencyOverride {
     halfLifeDays?: number;
 }
 
+// 1C: an index pass's deferred sidecar flush. embedAndCommitFiles always runs
+// inside the write mutex; instead of flushing the sidecar there (pure file IO the
+// IDB index never depends on), it packages everything the flush needs and the
+// pass runs it via flushSidecarAfterPass once the mutex has released. All fields
+// are captured in the critical section, so the flush writes exactly what the
+// pass indexed regardless of when the job actually runs.
+interface SidecarFlushJob {
+    pending: Array<{ id: string; tiers: TierBytes; mtime: number }>;
+    mode: 'full' | 'incremental';
+    bgMean: number | undefined;
+    bgStd: number | undefined;
+    identity: IndexIdentity;
+}
+
 export class SearchOrchestrator {
     private app: App;
     private store: IndexStore;
@@ -225,6 +264,17 @@ export class SearchOrchestrator {
     private static readonly UNREADABLE_QUARANTINE_MS = 30 * 60 * 1000; // 30 min
     private unreadableQuarantine = new Map<string, number>();
 
+    // Last time the "storage full" Notice was shown (epoch ms). Rate-limits the
+    // toast across passes (see QUOTA_NOTICE_MIN_INTERVAL_MS); the check line +
+    // forensics beat still record every affected pass.
+    private lastQuotaNoticeAt = 0;
+
+    // S4 tripwire instrumentation: how often (and why) applyDelta declined the
+    // incremental patch and forced a full O(corpus) cache rebuild this session.
+    // Read nowhere yet — the counts ride each 'delta-fallback' forensics beat so
+    // live sessions reveal whether fallback churn is worth engineering against.
+    private readonly deltaFallbackCounts = new Map<string, number>();
+
     private isQuarantined(path: string): boolean {
         const until = this.unreadableQuarantine.get(path);
         return until !== undefined && Date.now() < until;
@@ -270,23 +320,172 @@ export class SearchOrchestrator {
     }
 
     // True while a reindex/delta/cold-build critical section is running under the
-    // write mutex. The reconcile poll consults this to avoid healing an index that
-    // is still being built (a long reindex outliving the 5-min poll). See main.ts.
+    // write mutex, OR while a pass's off-mutex sidecar flush (1C) is still in
+    // flight. Every consumer (the reconcile poll's busy gate, the identity-heal
+    // guard, runFullReindex's stacking guard — see main.ts) wants the conservative
+    // reading: without the flush half, a second full reindex could pass the
+    // stacking guard in the seconds-long window between the mutex releasing and
+    // the whole-corpus flush landing, and the first pass's chained flush would
+    // then append the entire prior corpus as litter behind the second's
+    // clearDevice. Searches and deltas never consult this, so folding the flush
+    // in does not re-serialize what 1C unlocked.
     isWriting(): boolean {
-        return this.coord.isWriting();
+        return this.coord.isWriting() || this.sidecarFlushesInFlight > 0;
     }
 
     // Full reindex. Drops the database, walks all markdown, re-embeds everything.
     // Serialized against deltas via the write mutex (a delta mid-nuke would throw).
-    async reindexAll(onProgress?: (msg: string) => void): Promise<IndexCompleteEntry> {
-        const result = await this.coord.runExclusive(() => this.reindexAllInner(onProgress));
+    async reindexAll(onProgress?: (msg: string) => void, opts: { shouldContinue?: () => boolean } = {}): Promise<IndexCompleteEntry> {
+        let result: IndexCompleteEntry;
+        try {
+            const inner = await this.coord.runExclusive(() => this.reindexAllInner(onProgress, opts.shouldContinue));
+            result = inner.entry;
+            // 1C: the pass only PACKAGED its sidecar flush; run it now that the
+            // mutex has released, still awaited so "reindexAll resolved ⇒ sidecar
+            // flushed" holds for every caller.
+            await this.flushSidecarAfterPass(inner.sidecarJob);
+        } catch (e) {
+            // Pass-level quota (S2): the per-file classifier only sees commitFile's
+            // catch; on a truly full disk the pass's OWN writes (the post-nuke
+            // setMeta, the end-of-pass meta stamp) can quota-throw too — the
+            // highest-stakes case, since the nuke already dropped the previous
+            // index. Surface the same actionable signal, then rethrow: the pass
+            // still failed and the caller's generic handler still reports it.
+            if (isQuotaError(e)) {
+                this.forensics?.beat('index-quota-exhausted', { files: 0, mode: 'full-pass-write' });
+                this.quotaToast();
+            }
+            throw e;
+        }
         // Off the mutex: re-warm reads the committed index; a search arriving
         // first just does the same build itself (see warmCaches).
         void this.warmCaches('full-reindex');
         return result;
     }
 
-    private async reindexAllInner(onProgress?: (msg: string) => void): Promise<IndexCompleteEntry> {
+    // Rate-limited (5 min) storage-full toast — catch-up bursts re-trip the quota
+    // gate for as long as the disk stays full, and one actionable message is
+    // signal where a toast-per-burst is noise.
+    private quotaToast(): void {
+        if (Date.now() - this.lastQuotaNoticeAt < QUOTA_NOTICE_MIN_INTERVAL_MS) return;
+        this.lastQuotaNoticeAt = Date.now();
+        new Notice(INDEX_QUOTA_MSG, 10000);
+    }
+
+    // ── 1C: off-mutex sidecar flush ─────────────────────────────────────────
+    // An index pass no longer flushes the sidecar inside its write-mutex critical
+    // section: embedAndCommitFiles packages a SidecarFlushJob and the pass runs it
+    // here AFTER runExclusive releases, so searches (ensureFrame waiting on
+    // currentDelta) and queued deltas stop paying for sidecar file IO. Callers
+    // still await the flush before resolving — the public contract ("pass
+    // resolved ⇒ sidecar flushed") is unchanged; only the lock hold shrinks.
+    //
+    // Jobs are chained strictly FIFO. File-level safety already comes from the
+    // sidecar dir lock (bulkAppend / writeDeviceMeta / clearDevice / compact /
+    // coalesce all serialize on it, and bulkAppend holds it across its whole
+    // shard+jsonl span, so a reconcile compaction overlapping an in-flight flush
+    // can never mistake a half-flushed shard for a crash orphan). What the dir
+    // lock does NOT order is two whole read-meta → write-meta → append sequences:
+    // with the mutex released before flushing, pass B's critical section can
+    // complete while pass A's flush is still in flight, and unchained jobs could
+    // interleave so A's meta write (older lastFullReindex / bg calibration) lands
+    // after B's. The chain removes that class within this process; cross-process
+    // ordering was never the mutex's to give (iCloud offers none) and stays with
+    // the sidecar protocol's mtime-keyed resolution. The one remaining
+    // same-process interleave is a FULL pass's in-mutex pass-START clearDevice
+    // racing a prior delta's in-flight flush: clear-then-flush leaves pre-nuke
+    // records as reclaimable litter (ids that survive the re-chunk resolve
+    // identically; changed ids are compactDevice-oracle orphans; the seq floor is
+    // preserved by both paths), flush-then-clear just wipes records the rebuild
+    // is about to replace. Benign either way.
+    private sidecarFlushChain: Promise<void> = Promise.resolve();
+    // Jobs enqueued or running. Folded into isWriting() so the busy/stacking
+    // guards treat an in-flight flush as "still indexing" (see isWriting).
+    private sidecarFlushesInFlight = 0;
+
+    private flushSidecarAfterPass(job: SidecarFlushJob | null): Promise<void> {
+        if (!job) return Promise.resolve();
+        this.sidecarFlushesInFlight++;
+        // The .catch is load-bearing twice over, NOT belt-and-braces: runSidecarFlush
+        // is written to never reject, but that rests on a non-local invariant (its
+        // own catch handler's logging), and a single rejected link would (a) wedge
+        // the chain so no future flush ever runs and (b) leak the stale error into
+        // every later pass — reindexDelta's .finally would replace a SUCCESSFUL
+        // critical section's result with it. Swallow here so both the chain and the
+        // promise callers await are structurally rejection-free.
+        const run = this.sidecarFlushChain
+            .then(() => this.runSidecarFlush(job))
+            .catch(() => {})
+            .finally(() => { this.sidecarFlushesInFlight--; });
+        this.sidecarFlushChain = run;
+        return run;
+    }
+
+    // The flush body, moved verbatim from embedAndCommitFiles (1C). Best-effort:
+    // a sidecar failure must never fail the (already-committed) IDB index — it
+    // just means cross-device/eviction durability lags a pass.
+    private async runSidecarFlush(job: SidecarFlushJob): Promise<void> {
+        // A disposed orchestrator must not write: a queued job outliving onunload
+        // would keep appending after a plugin disable, and across a disable→
+        // re-enable the NEW instance serializes on a fresh module-scoped dir-lock
+        // map — the detached writer and the new pass's clearDevice/bulkAppend
+        // would no longer mutually exclude, and a last-rename-wins collision could
+        // republish a shard seq with different bytes (the #91 invariant). Skipping
+        // is the documented-safe direction: a durability lag hydrate self-heals.
+        if (this.disposed) return;
+        // Re-read the live setting: it can toggle off between the pass and this flush.
+        if (!this.coord.sidecarOn()) return;
+        try {
+            const adapter = this.app.vault.adapter;
+            // Create the sidecar dir up front. The F8 ordering writes meta FIRST,
+            // and writeDeviceMeta (→ writeTextAtomic) does not create parents — so
+            // on a fresh install the meta write would ENOENT and the catch below
+            // would abort the WHOLE flush before bulkAppend (which ensures the dir
+            // itself) ever runs, leaving no sidecar at all. ensureDir here makes the
+            // dir exist before any write, independent of which write lands first.
+            await ensureDir(adapter, this.coord.dir!);
+            // F8: write/refresh meta BEFORE appending shard+jsonl. These three
+            // writes aren't one transaction; ordering meta first means a crash
+            // between them leaves meta-without-data (metaAccepts refuses cleanly;
+            // the records re-embed next pass) instead of data-without-meta — a
+            // fully-written sidecar the null-meta gate refuses, un-hydratable
+            // until a full reindex, defeating the eviction-recovery the sidecar
+            // exists for.
+            const prior = await readDeviceMeta(adapter, this.coord.dir!, this.logger.deviceId);
+            // A SIDECAR_FORMAT bump alone (no chunker/model/dim change) never forces
+            // a full reindex — identityMatches deliberately excludes it (identity.ts).
+            // An ordinary INCREMENTAL flush landing here after such a bump would
+            // otherwise write the CURRENT format into meta below while every untouched
+            // note's shard bytes are still in the PRIOR record stride — a lie that
+            // later misleads this device's own compactOwnSidecar (and any peer
+            // hydrating from it) into decoding stale-stride bytes as corrupt. A full
+            // pass already clearDevice()'d at its start (prior reads null here), so
+            // this only fires for the incremental case: wipe first so the meta write
+            // below is never untrue relative to what's actually on disk.
+            if (staleSidecarFormat(prior, job.identity.sidecarFormat)) {
+                await clearDevice(adapter, this.coord.dir!, this.logger.deviceId, { preserveSeqFloor: true });
+            }
+            await writeDeviceMeta(adapter, this.coord.dir!, {
+                // Canonical version slice (modelId/revision/chunkerVersion/dim)
+                // from the single identity source — NOT embedder.modelId, which
+                // is '' until a model load. format gates the cross-device protocol.
+                ...expectationFor(job.identity),
+                format: job.identity.sidecarFormat,
+                deviceId: this.logger.deviceId,
+                lastFullReindex: job.mode === 'full' ? new Date().toISOString() : (prior?.lastFullReindex ?? null),
+                bgMean: job.bgMean,
+                bgStd: job.bgStd,
+            });
+            await bulkAppend(adapter, this.coord.dir!, this.logger.deviceId, job.pending);
+        } catch (e) {
+            // Guarded so a logging failure can't turn into a rejection of this
+            // method — the chain in flushSidecarAfterPass swallows anyway, but the
+            // "never rejects" contract should hold locally, not by rescue.
+            await this.logger.appendError('sidecar-commit', e).catch(() => {});
+        }
+    }
+
+    private async reindexAllInner(onProgress?: (msg: string) => void, shouldContinue?: () => boolean): Promise<{ entry: IndexCompleteEntry; sidecarJob: SidecarFlushJob | null }> {
         const overallStart = performance.now();
         const memBefore = await snapshotMemory();
 
@@ -344,7 +543,11 @@ export class SearchOrchestrator {
         files.sort((a, b) => b.stat.mtime - a.stat.mtime);
         await this.emitProgress('scan', 0, files.length, 0, performance.now() - overallStart);
 
-        const result = await this.embedAndCommitFiles(files, 'full', onProgress, overallStart, memBefore);
+        // shouldContinue in full mode = the soft preempt (pause/resume between
+        // files while the user searches — see embedAndCommitFiles' budget comment).
+        // The engine's sidecar flush comes back PACKAGED (1C) and rides through to
+        // reindexAll, which runs it after the mutex releases.
+        const result = await this.embedAndCommitFiles(files, 'full', onProgress, overallStart, memBefore, { shouldContinue });
 
         // Bump dataGeneration on COMPLETION. main.ts invalidates once BEFORE the
         // reindex, but a search firing during the rebuild then caches the frame /
@@ -372,13 +575,16 @@ export class SearchOrchestrator {
         onProgress: ((msg: string) => void) | undefined,
         overallStart: number,
         memBefore: MemorySnapshot,
-        // Per-burst budget — applied ONLY in 'incremental' mode (a full reindex is
-        // always unbounded). The per-burst FILE cap is enforced by the caller
-        // (reindexDelta slices its dirty list), so the engine only needs the
+        // Per-burst budget. budgetMs applies ONLY in 'incremental' mode (a full
+        // reindex is never time-bounded). The per-burst FILE cap is enforced by the
+        // caller (reindexDelta slices its dirty list), so the engine only needs the
         // within-burst aborts: budgetMs = wall-clock ceiling for one pathological
-        // huge note; shouldContinue = live abort (returns false once the app is
-        // hidden / the user resumed searching). Both optional; an empty object =
-        // unbounded (the existing behavior for desktop + reindexAll).
+        // huge note; shouldContinue = the live user-activity signal (false while the
+        // app is hidden / a search is live). Mode decides what shouldContinue MEANS:
+        // 'incremental' ABORTS the burst (files stay dirty; catch-up re-fires later),
+        // 'full' PAUSES between files and resumes when the activity clears — a full
+        // pass must finish, so it yields the iframe/GPU without giving up (3A).
+        // All optional; an empty object = unbounded (the existing behavior).
         // addsSink (Seek scaling A1): when present, commitFile pushes each
         // ACTUALLY-committed chunk's {chunk, q, bin} into it — the add half of the
         // change-set reindexDelta's incremental cache path consumes. Driven off
@@ -392,7 +598,7 @@ export class SearchOrchestrator {
         // that hydrated some files and mis-decide sawWholeCorpus. One snapshot, one
         // source. Omitted (reindexAll) = false, harmless since mode==='full' dominates.
         budget: { budgetMs?: number; shouldContinue?: () => boolean; addsSink?: DeltaAdd[]; storeWasEmpty?: boolean } = {},
-    ): Promise<IndexCompleteEntry> {
+    ): Promise<{ entry: IndexCompleteEntry; sidecarJob: SidecarFlushJob | null }> {
         // Per-bucket rolling-buffer embed. Each chunk lands in the buffer for
         // its own seq bucket; a buffer flushes as one warmed per-bucket-sized
         // dispatch the instant it fills, carrying the remainder across files.
@@ -405,6 +611,10 @@ export class SearchOrchestrator {
         let embedMs = 0;
         let commitMs = 0;
         let filesSkippedError = 0;
+        let filesSkippedQuota = 0;   // subset of filesSkippedError: commit hit QuotaExceededError (disk full)
+        let preemptWaitMs = 0;       // full-mode only: total time paused for live search activity (3A)
+        let preemptExpiries = 0;     // consecutive episode-cap expiries with the signal never true
+        let preemptWedged = false;   // signal judged stuck-false — no more pauses this pass
         let embedRecycles = 0;
         let filesCommitted = 0;
         // The paths whose file-record was ACTUALLY written (commitFile succeeded) — NOT
@@ -455,19 +665,26 @@ export class SearchOrchestrator {
         let bgN = 0;
         const reservoir = new VecReservoir(BG_RESERVOIR);
         // Sidecar accumulator: derived (int8 + sign-bit) tiers for every committed
-        // chunk, flushed in ONE bulkAppend after the embed loop (per-file appends
-        // would be O(n²) read-concat-write on a growing shard). A FULL reindex
-        // first drops this device's own sidecar files (clearDevice) so the run
-        // REPLACES them rather than doubling; an INCREMENTAL delta legitimately
-        // appends without clearing, so superseded/deleted records accumulate in
-        // this device's jsonl/shards and are reclaimed only by the next full
-        // reindex (there is no compaction). The growth is bounded and read-safe:
-        // hydrate re-chunks the live vault and intersects ids (sidecar-sync), so
-        // stale records never resolve — they only cost disk until the next full pass.
+        // chunk, packaged after the embed loop into ONE SidecarFlushJob the caller
+        // bulkAppends off the mutex (1C). bulkAppend is
+        // append-only (1A: each flush = fresh shard file(s), no rewrite), so the
+        // batching here is about shard-count hygiene — one shard per pass instead
+        // of one tiny shard per file. A FULL reindex first drops this device's own
+        // sidecar files (clearDevice) so the run REPLACES them rather than
+        // doubling; an INCREMENTAL delta legitimately appends without clearing, so
+        // superseded/deleted records accumulate in this device's jsonl/shards
+        // until compactOwnSidecar (once per session) or the next full reindex
+        // reclaims them. The growth is bounded and read-safe: hydrate re-chunks
+        // the live vault and intersects ids (sidecar-sync), so stale records
+        // never resolve — they only cost disk until reclaimed.
         const sidecarPending: Array<{ id: string; tiers: TierBytes; mtime: number }> = [];
         if (this.coord.sidecarOn() && mode === 'full') {
             try {
-                await clearDevice(this.app.vault.adapter, this.coord.dir!, this.logger.deviceId);
+                // preserveSeqFloor: the rebuild's flushes must allocate ABOVE every
+                // shard deleted here — a peer may still hold the old files, and a
+                // republished embeddings.<dev>.N.bin with different bytes lets it
+                // resolve fresh jsonl refs against stale bytes (sidecar.ts).
+                await clearDevice(this.app.vault.adapter, this.coord.dir!, this.logger.deviceId, { preserveSeqFloor: true });
             } catch (e) {
                 await this.logger.appendError('sidecar-clear', e);
             }
@@ -593,10 +810,11 @@ export class SearchOrchestrator {
             return result.vectors;
         };
 
-        // Atomic per-file commit: chunks + vectors + file-record in close
-        // succession. If the plugin dies mid-commit a few chunks may persist
-        // without their file-record — a minor inconsistency the next reindex
-        // repairs. putBatch asserts chunks.length === vectors.length, so a
+        // Atomic per-file commit: chunks + vectors + file-record in ONE IndexedDB
+        // transaction (S1) — a mid-commit kill lands either the whole file or
+        // nothing, so commits can no longer strand record-less chunks (the orphan
+        // class sweepOrphanChunks repairs; hydrate remains its only live producer).
+        // putBatchQuantized asserts chunks.length === tiers.length, so a
         // mis-counted distribution throws here rather than corrupting the index.
         //
         // Embed-failure quarantine (issue #4): a file with hadError commits the
@@ -631,7 +849,17 @@ export class SearchOrchestrator {
                 reservoir.add(v);
             }
             const derived = fp32.map(v => ({ q: quantizeInt8(v), bin: packSignBits(v) }));
-            await this.store.putBatchQuantized(chunks, derived);
+            await this.store.putBatchQuantized(chunks, derived, {
+                note_path: fs.file.path,
+                // Read-time snapshot, NOT fs.file.stat.mtime (which may have
+                // advanced if the file was edited during this index pass — see
+                // FileState.mtimeMs). Recording the content's true mtime keeps
+                // computeDelta able to detect a mid-index edit on the next pass.
+                mtimeMs: fs.mtimeMs,
+                chunk_ids: chunks.map(c => c.chunk_id),
+                contentHash: fs.contentHash,
+                ...(failed > 0 ? { embedFailedChunks: failed, embedFailPluginVersion: PLUGIN_VERSION } : {}),
+            });
             // Surface the committed rows for the incremental cache path (A1). Done
             // AFTER the IDB write so the sink only ever holds rows that truly landed.
             if (budget.addsSink) pushDeltaAdds(budget.addsSink, chunks, derived);
@@ -644,17 +872,6 @@ export class SearchOrchestrator {
                     });
                 }
             }
-            await this.store.putFileRecord({
-                note_path: fs.file.path,
-                // Read-time snapshot, NOT fs.file.stat.mtime (which may have
-                // advanced if the file was edited during this index pass — see
-                // FileState.mtimeMs). Recording the content's true mtime keeps
-                // computeDelta able to detect a mid-index edit on the next pass.
-                mtimeMs: fs.mtimeMs,
-                chunk_ids: chunks.map(c => c.chunk_id),
-                contentHash: fs.contentHash,
-                ...(failed > 0 ? { embedFailedChunks: failed, embedFailPluginVersion: PLUGIN_VERSION } : {}),
-            });
             commitMs += performance.now() - commitStart;
             totalChunks += chunks.length;
             totalVectors += chunks.length;
@@ -708,6 +925,12 @@ export class SearchOrchestrator {
                 // still skips just that file, as before.
                 if (isStoreClosedError(ce)) throw ce;
                 filesSkippedError++;
+                // Disk full is environmental, not content: count it separately so the
+                // pass-end gate can say "free up space" instead of "see error log"
+                // (S2). Still per-file skip, not a pass abort — quota can clear
+                // mid-pass (another app releases space), and the un-committed files
+                // stay dirty for catch-up either way.
+                if (isQuotaError(ce)) filesSkippedQuota++;
                 await this.logger.appendError(`commitFile:${p.fs.file.path}`, ce);
             }
         };
@@ -769,6 +992,42 @@ export class SearchOrchestrator {
                 && ((budget.budgetMs !== undefined && performance.now() - overallStart > budget.budgetMs)
                     || (budget.shouldContinue !== undefined && !budget.shouldContinue()))) {
                 break;
+            }
+            // Full-mode soft preempt (3A): pause between files while the user is
+            // typing / a query embed is in flight, then RESUME — never abort. The
+            // wait sits at loop-top, before this file's chunks enter the buffers, so
+            // nothing is held mid-flight; buffered chunks from prior files just wait.
+            // Searches are not blocked by this pass (full mode never sets
+            // currentDelta), so pausing here is what actually frees the iframe/GPU
+            // for the live query. The episode cap only guards a wedged signal —
+            // searchActive self-heals, so it should never bind (see the constants).
+            if (mode === 'full' && budget.shouldContinue !== undefined && !preemptWedged
+                && !budget.shouldContinue()) {
+                const waitStart = performance.now();
+                this.forensics?.beat('index-preempt-wait', { filesCommitted, chunks: totalChunks });
+                // Say WHY the counter froze — a silent 2-min stall is exactly the
+                // shape that made users force-quit healthy runs (see
+                // PROGRESS_MAX_SILENCE_MS); a labelled pause is self-explaining.
+                onProgress?.(`Indexed ${filesCommitted} files · ${totalChunks} chunks — paused while you search…`);
+                while (!budget.shouldContinue() && !this.disposed
+                    && performance.now() - waitStart < FULL_PREEMPT_MAX_WAIT_MS) {
+                    await new Promise(resolve => setTimeout(resolve, FULL_PREEMPT_POLL_MS));
+                }
+                preemptWaitMs += performance.now() - waitStart;
+                if (this.disposed) break;
+                if (!budget.shouldContinue()) {
+                    // Episode cap expired with the signal STILL false (see
+                    // FULL_PREEMPT_WEDGE_EPISODES for why consecutive expiries
+                    // mean wedged, not busy).
+                    if (++preemptExpiries >= FULL_PREEMPT_WEDGE_EPISODES) {
+                        preemptWedged = true;
+                        console.warn('[seek] full-reindex preempt signal never released across '
+                            + `${preemptExpiries} episodes — treating it as wedged; no more pauses this pass`);
+                        this.forensics?.beat('index-preempt-wedged', { filesCommitted, episodes: preemptExpiries });
+                    }
+                } else {
+                    preemptExpiries = 0;
+                }
             }
             processedFiles++;
             const fileStart = performance.now();
@@ -920,6 +1179,23 @@ export class SearchOrchestrator {
             filesQuarantined -= unwoundPaths.size;
             checksExtra.push(`⚠️ mass embed failure (${quarantined.length} files > cap ${quarantineCap}) — environmental, not content: unwound ${unwoundPaths.size} quarantine record(s); files stay dirty and retry on the next pass`);
         }
+        // Quota gate (S2): commits failed because device storage is FULL — an
+        // environmental condition no retry fixes while it persists. The affected
+        // files are already safe (no record advance → they stay dirty and catch-up
+        // heals them once space frees); what was missing was any actionable signal
+        // — the pass just logged generic per-file skips and the drain re-fired
+        // forever. Check line + forensics beat on every affected pass; the toast is
+        // rate-limited because catch-up bursts re-trip this for as long as the disk
+        // stays full.
+        if (filesSkippedQuota > 0) {
+            checksExtra.push(`⚠️ storage full: ${filesSkippedQuota} file(s) failed to commit with QuotaExceededError — free up disk space; the files stay dirty and catch up automatically`);
+            this.forensics?.beat('index-quota-exhausted', { files: filesSkippedQuota, mode });
+            this.quotaToast();
+        }
+        // 3A observability: how long this full pass paused for live search activity.
+        if (preemptWaitMs > 500) {
+            checksExtra.push(`ℹ️ paused ${(preemptWaitMs / 1000).toFixed(1)} s for live search activity (full-reindex soft preempt)`);
+        }
         onProgress?.(`Indexed ${filesCommitted} files · ${totalChunks} chunks`);
         await this.emitProgress('embed', files.length, files.length, totalChunks, performance.now() - overallStart);
 
@@ -928,8 +1204,8 @@ export class SearchOrchestrator {
         // corpus is below MIN_BG_SAMPLE — too small to calibrate). An INCREMENTAL
         // pass saw only the changed files, far too few to estimate a corpus
         // global, so it carries the prior full-reindex values forward unchanged.
-        // Computed HERE (before the sidecar flush) so the device meta can carry it
-        // to hydrate-only peers.
+        // Computed HERE (before the sidecar job is packaged) so the device meta
+        // the flush writes can carry it to hydrate-only peers.
         const prevMeta = await this.store.getMeta();
         // A FULL pass, or a cold first-build (storeWasEmpty), saw the whole corpus, so
         // it recomputes the background from scratch AND claims the live identity. An
@@ -947,67 +1223,30 @@ export class SearchOrchestrator {
         // incremental preserves prevMeta's — only a full rebuild claims a new one.
         const identity = pluginIdentity();
 
-        // Flush the sidecar once: append every committed chunk's tiers to this
-        // device's own shards/jsonl and (re)write its meta for the version gate.
-        // Best-effort — a sidecar failure must never fail the (already-committed)
-        // IDB index; it just means cross-device/eviction durability lags a pass.
-        if (this.coord.sidecarOn() && sidecarPending.length > 0) {
-            const sidecarStart = performance.now();
-            try {
-                const adapter = this.app.vault.adapter;
-                // Create the sidecar dir up front. The F8 ordering writes meta FIRST,
-                // and writeDeviceMeta (→ writeTextAtomic) does not create parents — so
-                // on a fresh install the meta write would ENOENT and the catch below
-                // would abort the WHOLE flush before bulkAppend (which ensures the dir
-                // itself) ever runs, leaving no sidecar at all. ensureDir here makes the
-                // dir exist before any write, independent of which write lands first.
-                await ensureDir(adapter, this.coord.dir!);
-                // F8: write/refresh meta BEFORE appending shard+jsonl. These three
-                // writes aren't one transaction; ordering meta first means a crash
-                // between them leaves meta-without-data (metaAccepts refuses cleanly;
-                // the records re-embed next pass) instead of data-without-meta — a
-                // fully-written sidecar the null-meta gate refuses, un-hydratable
-                // until a full reindex, defeating the eviction-recovery the sidecar
-                // exists for.
-                const prior = await readDeviceMeta(adapter, this.coord.dir!, this.logger.deviceId);
-                // A SIDECAR_FORMAT bump alone (no chunker/model/dim change) never forces
-                // a full reindex — identityMatches deliberately excludes it (identity.ts).
-                // An ordinary INCREMENTAL commit landing here after such a bump would
-                // otherwise write the CURRENT format into meta below while every untouched
-                // note's shard bytes are still in the PRIOR record stride — a lie that
-                // later misleads this device's own compactOwnSidecar (and any peer
-                // hydrating from it) into decoding stale-stride bytes as corrupt. A full
-                // pass already clearDevice()'d above (prior reads null there), so this
-                // only fires for the incremental case: wipe first so the meta write below
-                // is never untrue relative to what's actually on disk.
-                if (staleSidecarFormat(prior, identity.sidecarFormat)) {
-                    await clearDevice(adapter, this.coord.dir!, this.logger.deviceId);
-                }
-                await writeDeviceMeta(adapter, this.coord.dir!, {
-                    // Canonical version slice (modelId/revision/chunkerVersion/dim)
-                    // from the single identity source — NOT embedder.modelId, which
-                    // is '' until a model load. format gates the cross-device protocol.
-                    ...expectationFor(identity),
-                    format: identity.sidecarFormat,
-                    deviceId: this.logger.deviceId,
-                    lastFullReindex: mode === 'full' ? new Date().toISOString() : (prior?.lastFullReindex ?? null),
-                    bgMean,
-                    bgStd,
-                });
-                await bulkAppend(adapter, this.coord.dir!, this.logger.deviceId, sidecarPending);
-            } catch (e) {
-                await this.logger.appendError('sidecar-commit', e);
-            }
-            commitMs += performance.now() - sidecarStart;
-        }
+        // 1C: package the sidecar flush instead of performing it here. This engine
+        // always runs inside the write mutex, and the flush is pure file IO the
+        // IDB index never depends on — the meta read/write plus bulkAppend's
+        // per-shard stat sweep and shard/jsonl writes were extending the critical
+        // section that searches (ensureFrame waiting on currentDelta) and queued
+        // deltas sit behind. The caller runs the job via flushSidecarAfterPass
+        // once the mutex releases, still awaited before its own promise resolves.
+        // Narrow window accepted: a pass that throws between here and returning
+        // (the final setMeta below can quota-throw) drops the job where the old
+        // inline flush had already run — a durability lag, not a correctness
+        // loss (hydrate re-chunks and intersects ids, so peers and post-eviction
+        // recovery just re-embed the missing records; nothing dangles).
+        const sidecarJob: SidecarFlushJob | null =
+            this.coord.sidecarOn() && sidecarPending.length > 0
+                ? { pending: sidecarPending, mode, bgMean, bgStd, identity }
+                : null;
 
         // BM25 doesn't need its own persisted index for v0 — it's rebuilt
         // in-memory at search time from the chunk store. Track the timing
         // as zero here; we'll measure it on the first search.
         const bm25Ms = 0;
 
-        // Final commit: meta marker (bgMean/bgStd computed above, before the
-        // sidecar flush, so both stores agree)
+        // Final commit: meta marker (bgMean/bgStd computed above and shared with
+        // the packaged sidecar flush, so both stores agree)
         const commitFinalStart = performance.now();
         await this.store.setMeta({
             embeddingDim: EMBEDDING_DIM,
@@ -1071,6 +1310,10 @@ export class SearchOrchestrator {
             checks.push(`⚠️ ${filesQuarantined} file(s) quarantined (${chunksFailedEmbed} chunk(s) failed to embed after solo retry) — healthy chunks committed + searchable; retried on edit / new release / full reindex`);
         }
         checks.push(...checksExtra);
+        // 1C: the flush itself runs off the mutex after this entry is logged, so
+        // its duration is no longer inside commitDurationMs — the queued count is
+        // the entry's honest record of what this pass handed the flush chain.
+        if (sidecarJob) checks.push(`ℹ️ sidecar: ${sidecarJob.pending.length} tier record(s) queued for off-mutex flush`);
         if (totalChunks === 0) checks.push('⚠️ no chunks produced — vault may be empty or all files below min_chunk_chars');
         // WS2.3 invariant surface: splits are normal (every >512-token chunk
         // re-packs); a nonzero overBudget means some input still truncates
@@ -1120,6 +1363,7 @@ export class SearchOrchestrator {
             chunksIndexed: totalChunks,
             vectorsWritten: totalVectors,
             filesSkippedError,
+            filesSkippedQuota,
             filesQuarantined,
             chunksFailedEmbed,
             filesDeferred: files.length - processedFiles,
@@ -1148,7 +1392,7 @@ export class SearchOrchestrator {
             dispatches: fDispatches, paddedTokens: fPaddedTokens,
         });
         await this.logger.append(entry);
-        return entry;
+        return { entry, sidecarJob };
     }
 
     // The single index-membership predicate, shared by full reindex (the scan
@@ -1367,6 +1611,12 @@ export class SearchOrchestrator {
         // successful incremental patch IS the warm, so warmCaches is skipped (it
         // would re-pay the O(N) fit the patch just avoided).
         let appliedIncrementally = false;
+        // 1C: the engine's packaged sidecar flush, captured by closure the moment
+        // the engine returns (NOT threaded through the result) so the .finally
+        // below still flushes it even when a post-engine step (applyDelta, the
+        // meta stamp) throws — parity with the old inline flush, which had
+        // already completed by then.
+        let sidecarJob: SidecarFlushJob | null = null;
         const result = await this.coord.runExclusive(async () => {
             let release!: () => void;
             this.coord.currentDelta = new Promise<void>(r => { release = r; });
@@ -1461,12 +1711,14 @@ export class SearchOrchestrator {
                         // maxFiles is already enforced by the slice above; the engine
                         // only needs the wall-clock + hidden aborts (for one huge note
                         // or a mid-burst background).
-                        embedded = await this.embedAndCommitFiles(remaining, 'incremental', opts.onProgress, overallStart, memBefore,
+                        const engineOut = await this.embedAndCommitFiles(remaining, 'incremental', opts.onProgress, overallStart, memBefore,
                             // Pass the PASS-START emptiness (captured above, before carry-over
                             // + sidecar hydration committed any chunk) so the engine's identity
                             // stamp + background recompute use the same cold-build signal as the
                             // meta stamp below — not a count() taken after hydration.
                             { budgetMs: opts.budgetMs, shouldContinue: opts.shouldContinue, addsSink: adds, storeWasEmpty });
+                        embedded = engineOut.entry;
+                        sidecarJob = engineOut.sidecarJob;
                     }
                     // Paths this burst actually committed (now non-dirty), so the catch-up
                     // drain advances by REAL progress instead of by maxFiles: carry-over
@@ -1555,7 +1807,12 @@ export class SearchOrchestrator {
                 release();
                 this.coord.currentDelta = null;
             }
-        });
+        }).finally(() =>
+            // 1C: run the pass's packaged sidecar flush AFTER the mutex releases,
+            // awaited before reindexDelta resolves (or rethrows) so callers keep
+            // "delta resolved ⇒ sidecar flushed". flushSidecarAfterPass never
+            // rejects, so this can't mask the critical section's own error.
+            this.flushSidecarAfterPass(sidecarJob));
         // Re-warm only when we did NOT patch incrementally (the patch is the warm).
         // Fire-and-forget, off the mutex — the moment the flush scheduler already
         // judged quiet enough for embed work, so the rebuild lands here rather than
@@ -1671,7 +1928,7 @@ export class SearchOrchestrator {
         // renumber). Returning false routes that through invalidate+warmCaches.
         const n = frame.orderedChunks.length;
         if (n > 0 && frame.tombstoneCount / n >= COMPACTION_TOMBSTONE_FRACTION) {
-            return this.deltaFallback(`compaction due (${frame.tombstoneCount}/${n} tombstones)`);
+            return this.deltaFallback('compaction due', { tombstones: frame.tombstoneCount, rows: n });
         }
 
         // Commit: bump the generation so other readers re-validate, then re-stamp
@@ -1706,9 +1963,21 @@ export class SearchOrchestrator {
     }
 
     // Log why the incremental path declined + signal the caller to full-rebuild.
-    // Makes the live smoke observable: every delta logs either an "applyDelta:
-    // +x/-y incremental" success or an "applyDelta fallback: <reason>" line.
-    private deltaFallback(reason: string): false {
+    // S4 tripwire instrumentation: each decline is a full O(corpus) cache rebuild
+    // (listAllMeta + listAllBinary + embeddings scan), so per-reason session counts
+    // ride every beat — a churny session repeatedly tripping the SAME reason is the
+    // signal that reducing fallback frequency is worth engineering against. Until
+    // that data says otherwise, the fallback itself stays the correct design
+    // ("slow, never wrong").
+    // `reason` must be a STABLE slug — it keys deltaFallbackCounts, so per-call
+    // values (counts, sizes) go in `detail`, which rides the beat payload only.
+    private deltaFallback(reason: string, detail?: Record<string, unknown>): false {
+        const n = (this.deltaFallbackCounts.get(reason) ?? 0) + 1;
+        this.deltaFallbackCounts.set(reason, n);
+        // console.* is invisible on mobile; the beat is the field-observable channel.
+        console.info(`[seek] applyDelta fallback: ${reason} — full cache rebuild (×${n} this session)`
+            + (detail ? ` ${JSON.stringify(detail)}` : ''));
+        this.forensics?.beat('delta-fallback', { reason, sessionCount: n, ...detail });
         return false;
     }
 
@@ -1873,12 +2142,14 @@ export class SearchOrchestrator {
     // orphans (nuke + rehydrate), this clears SAME-version churn.
     async sweepOrphanChunks(opts: { shouldContinue?: () => boolean } = {}): Promise<{ removed: number; completed: boolean }> {
         // Snapshot all chunk ids + the referenced set TOGETHER under the write mutex.
-        // A per-file commit is two transactions (putBatch THEN putFileRecord), so an
-        // UNLOCKED snapshot could catch a just-written chunk before its file record
-        // lands and delete the user's NEWEST edit as a false orphan. (Content-addressing
-        // makes that self-healing, but it is still a real freshness hit, so close the
-        // window.) The only residual — a rare re-add of the SAME content between batches
-        // — reuses the same id and is itself self-healing.
+        // The embed commit is one atomic tx now (S1: chunks + file record together),
+        // but the HYDRATE path still flushes chunk batches before its file records
+        // land (batches span file boundaries), so an UNLOCKED snapshot could catch a
+        // just-hydrated chunk before its record and delete it as a false orphan —
+        // and pre-S1 indexes can still hold genuinely record-less chunks. (Content-
+        // addressing makes that self-healing, but it is still a real freshness hit,
+        // so keep the snapshot locked.) The only residual — a rare re-add of the SAME
+        // content between batches — reuses the same id and is itself self-healing.
         const orphans = await this.coord.runExclusive(async () => {
             const allIds = await this.store.getAllChunkIds();
             const referenced = new Set<string>();
@@ -2124,9 +2395,9 @@ export class SearchOrchestrator {
     }
 
     // Compact THIS device's own sidecar (jsonl + shards) if it has accumulated enough
-    // dead bytes. Model-FREE — a pure byte-copy of existing vectors — so, unlike a full
-    // reindex, it is safe on mobile (same read-concat-write footprint bulkAppend already
-    // runs there, no GPU/model heap → no jetsam). It is also the ONLY reclaim path for a
+    // dead bytes. Model-FREE — a pure byte-copy of existing vectors, peak ~8 MB (one
+    // source + one dest shard) — so, unlike a full reindex, it is safe on mobile (no
+    // GPU/model heap → no jetsam). It is also the ONLY reclaim path for a
     // device that never reaches a desktop: a version-bump reindex and hydrate-from-a-
     // compacted-peer both need connectivity an off-grid phone/iPad may lack for months,
     // and its own edit churn would otherwise pile up unbounded. Called at most once per
@@ -2152,8 +2423,19 @@ export class SearchOrchestrator {
         // normal incremental commits afterward, same as any other reap.
         const ownMeta = await readDeviceMeta(adapter, dir, dev);
         if (staleSidecarFormat(ownMeta)) {
-            await clearDevice(adapter, dir, dev);
-            return { compacted: false, reason: 'format-mismatch', recordsBefore: 0, recordsAfter: 0, bytesBefore: 0, bytesAfter: 0, shed: 0 };
+            // Census the shards BEFORE wiping, and leave the same once-per-session
+            // sidecar-compact breadcrumb as a normal compaction: this path makes
+            // the largest disk-state change compaction can make (every shard on
+            // the device deleted), and a forensics trace showing shard counts drop
+            // to zero between sessions must record which path did it.
+            const preWipe = await listDeviceShards(adapter, dir, dev);
+            const bytesBefore = preWipe.reduce((sum, s) => sum + s.size, 0);
+            await clearDevice(adapter, dir, dev, { preserveSeqFloor: true });
+            this.forensics?.beat('sidecar-compact', {
+                reason: 'format-mismatch', shardsBefore: preWipe.length, shardsAfter: 0,
+                bytesBefore, bytesAfter: 0,
+            });
+            return { compacted: false, reason: 'format-mismatch', recordsBefore: 0, recordsAfter: 0, bytesBefore, bytesAfter: 0, shed: 0, shardsBefore: preWipe.length, shardsAfter: 0 };
         }
 
         // Off-grid means no iCloud re-upload now (it lands as a SMALLER upload on
@@ -2172,6 +2454,13 @@ export class SearchOrchestrator {
         // The live-id oracle runs INSIDE compactDevice's dir lock so the snapshot and the
         // on-disk scan exclude concurrent appends — the drop decision needs no clock.
         const result = await compactDevice(adapter, dir, dev, () => this.collectLiveIds(), { minDeadRatio: 0.5, minShardBytes: floor });
+        // Once-per-session shard-census beat: the field channel for watching
+        // append-only flush proliferation (1A). shardsBefore trending high while
+        // reason stays below-floor/below-ratio = tighten the compaction trigger.
+        this.forensics?.beat('sidecar-compact', {
+            reason: result.reason ?? 'none', shardsBefore: result.shardsBefore, shardsAfter: result.shardsAfter,
+            bytesBefore: result.bytesBefore, bytesAfter: result.bytesAfter,
+        });
         // Refresh the persisted reconcile sig after a self jsonl rewrite. With self now
         // excluded from sidecarDirSignature (a device's own writes don't move its own
         // signature), this compaction touches only our own jsonl so the signature is
@@ -2183,6 +2472,40 @@ export class SearchOrchestrator {
                 this.persistReconcileSig(await sidecarDirSignature(adapter, dir, dev));
             } catch (e) {
                 await this.logger.appendError('compact-sig-refresh', e);
+            }
+        }
+        return result;
+    }
+
+    // Oracle-free shard-count hygiene for the append-only sidecar (1A): fold
+    // accumulated per-flush small shards into dense ones once enough pile up.
+    // Byte-copy only — no vault re-chunk, no model — so unlike compactOwnSidecar
+    // it is safe to call every reconcile poll; below the count gate it costs one
+    // directory listing. SKIPS (never wipes) a stale-format sidecar: records must
+    // be decoded with the stride they were written under, and the format-mismatch
+    // wipe is compactOwnSidecar's job — running once per session, it always gets
+    // its chance before shard count matters.
+    async coalesceOwnSidecar(): Promise<CoalesceResult | null> {
+        if (!this.coord.sidecarOn()) return null;
+        const adapter = this.app.vault.adapter;
+        const dir = this.coord.dir!;
+        const dev = this.logger.deviceId;
+        if (staleSidecarFormat(await readDeviceMeta(adapter, dir, dev))) return null;
+        const result = await coalesceSmallShards(adapter, dir, dev);
+        if (result.coalesced) {
+            // Census beat only when a fold actually ran — the every-poll below-count
+            // no-op would otherwise flood the forensics ring.
+            this.forensics?.beat('sidecar-coalesce', {
+                smallShards: result.smallShards, shardsBefore: result.shardsBefore, shardsAfter: result.shardsAfter,
+                bytesMoved: result.bytesMoved, shed: result.shed, skippedLines: result.skippedLines,
+            });
+            // Same belt-and-suspenders sig refresh as compactOwnSidecar: self is
+            // excluded from sidecarDirSignature, so this should be a no-op — kept so
+            // the persisted sig always reflects the same convention as the live gate.
+            try {
+                this.persistReconcileSig(await sidecarDirSignature(adapter, dir, dev));
+            } catch (e) {
+                await this.logger.appendError('coalesce-sig-refresh', e);
             }
         }
         return result;
@@ -2416,8 +2739,18 @@ export class SearchOrchestrator {
             if (chunks.length === 0) continue;
             const tiers = chunks.map(c => carryOver.get(embedInput(c)));
             if (tiers.some(t => t === undefined)) continue;   // not fully covered → embed normally
-            await this.store.putBatchQuantized(chunks, tiers.map(t => ({ q: t!.q, bin: t!.sign })));
-            await this.store.putFileRecord({ note_path: f.path, mtimeMs: f.stat.mtime, chunk_ids: chunks.map(c => c.chunk_id), contentHash: cyrb53Hex(content) });
+            // One atomic tx for chunks + record (S1), same as commitFile.
+            try {
+                await this.store.putBatchQuantized(chunks, tiers.map(t => ({ q: t!.q, bin: t!.sign })),
+                    { note_path: f.path, mtimeMs: f.stat.mtime, chunk_ids: chunks.map(c => c.chunk_id), contentHash: cyrb53Hex(content) });
+            } catch (e) {
+                // A commit failure (quota, closing store) must not abort the whole
+                // delta burst. Leave the file OUT of `done`: it falls through to
+                // the normal embed path, whose per-file catch classifies quota
+                // (S2) and keeps the file dirty for catch-up.
+                await this.logger.appendError(`carryOver-commit:${f.path}`, e);
+                continue;
+            }
             done.add(f.path);
         }
         return files.filter(f => !done.has(f.path));

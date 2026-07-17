@@ -83,6 +83,10 @@ const IDLE_UNLOAD_MS = 3 * 60 * 1000;
 // genuinely transient failure (file mid-sync) two more polls to clear while
 // capping the pathological case at ~15 minutes of exposure.
 const SIDECAR_COMPACT_MAX_INCOMPLETE_RETRIES = 3;
+// Hard-error budget for the every-poll small-shard coalesce before it latches
+// off for the session (transient iCloud/WKWebView IO deserves a few retries;
+// a persistent disk-full must not re-run a rewrite every 5 minutes).
+const SIDECAR_COALESCE_MAX_FAILURES = 3;
 const UNLOAD_CHECK_MS = 60 * 1000;
 
 // A delta larger than this isn't an edit — it's a bulk import (paste, vault sync,
@@ -250,6 +254,16 @@ export default class SeekPlugin extends Plugin {
     // grind every 5-minute poll for the session.
     private sidecarCompactIncompleteRetries = 0;
     private sidecarCompactRunning = false;
+    // Small-shard coalesce (oracle-free, every poll tick — see periodicReconcile).
+    // `Failed` latches OFF for the session after a few hard errors so a failing
+    // rewrite (disk full, write error) doesn't re-run every 5 minutes — but a
+    // single transient iCloud/WKWebView hiccup gets bounded retries first, since
+    // a long mobile session that latched on one blip would quietly re-grow the
+    // exact small-shard pile the pass exists to fold. `Running` guards
+    // re-entrancy against a slow fold spanning a poll tick.
+    private sidecarCoalesceFailed = false;
+    private sidecarCoalesceFailures = 0;
+    private sidecarCoalesceRunning = false;
 
     // True while a reindex / incremental embed is running. currentTaskContext is
     // private; this is the read-only surface the settings Index status card reads
@@ -1340,6 +1354,32 @@ export default class SeekPlugin extends Plugin {
                     this.sidecarCompactRunning = false;
                 }
             }
+            // EVERY poll tick (unlike the once-per-session compaction): fold the
+            // small per-flush shards the append-only writer (1A) accumulates into
+            // dense ones once enough pile up. Oracle-free byte-copy — no re-chunk,
+            // no model — and below its count gate it costs one directory listing,
+            // so a heavy editing session gets folded down the same day instead of
+            // waiting weeks for compaction's byte floor.
+            if (!this.sidecarCoalesceFailed && !this.sidecarCoalesceRunning) {
+                this.sidecarCoalesceRunning = true;
+                try {
+                    const c = await this.orchestrator.coalesceOwnSidecar();
+                    // Same corruption breadcrumb as compaction: a shed record is a
+                    // live id whose own-shard bytes were unreadable (expected zero).
+                    if (c && c.shed > 0) await this.logger.appendError('sidecar-coalesce-shed', new Error(`shed ${c.shed} corrupt/unreadable record(s)`)).catch(() => {});
+                    // Torn jsonl lines the fold's rewrite just removed for good —
+                    // log the evidence before it is only visible here.
+                    if (c && c.skippedLines > 0) await this.logger.appendError('sidecar-coalesce-skipped-lines', new Error(`rewrite dropped ${c.skippedLines} unparseable jsonl line(s)`)).catch(() => {});
+                } catch (e) {
+                    await this.logger.appendError('sidecar-coalesce', e).catch(() => {});
+                    if (++this.sidecarCoalesceFailures >= SIDECAR_COALESCE_MAX_FAILURES) {
+                        this.sidecarCoalesceFailed = true;
+                        await this.logger.appendError('sidecar-coalesce-retry-cap', new Error(`coalesce failed ${this.sidecarCoalesceFailures}× — latching off for the session`)).catch(() => {});
+                    }
+                } finally {
+                    this.sidecarCoalesceRunning = false;
+                }
+            }
         } catch (e) {
             await this.logger.appendError('periodic-reconcile', e).catch(() => {});
         } finally {
@@ -1978,7 +2018,13 @@ export default class SeekPlugin extends Plugin {
         try {
             await this.ensureModelLoaded();
             this.orchestrator.invalidateBm25Cache();
-            const result = await this.orchestrator.reindexAll(opts?.onProgress);
+            const result = await this.orchestrator.reindexAll(opts?.onProgress, {
+                // 3A soft preempt: the full pass pauses between files while the user
+                // types / a query embed is in flight — the same indexingBlocked
+                // signal every other indexing path honours — then resumes. It never
+                // aborts (a full reindex must finish; see embedAndCommitFiles).
+                shouldContinue: () => !this.indexingBlocked,
+            });
             const summary = [
                 result.pass ? '✅' : '❌',
                 `${result.filesIndexed} files`,
