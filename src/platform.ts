@@ -27,7 +27,11 @@ export function isMobilePlatform(): boolean {
 // (capacitor://localhost on iOS, the Electron origin on desktop) → per physical
 // device and NEVER synced — exactly the deviceId / crash-forensics convention.
 
-export type BackendChoice = 'auto' | 'webgpu' | 'wasm';
+// 'webgpu-query' (EXPERIMENTAL, off by default): WebGPU for the single-query
+// search path only; any indexing batch swaps the session to CPU first (see
+// LocalEmbedder.queryOnlyGpu). Aimed at iPhone, where WebGPU reindexing gets
+// jetsam-killed but a one-shot query embed is tiny.
+export type BackendChoice = 'auto' | 'webgpu' | 'wasm' | 'webgpu-query';
 
 const OVERRIDE_KEY = 'seek-backend-override';  // BackendChoice; absent/invalid = auto
 const DEMOTED_KEY = 'seek-webgpu-demoted';     // '1' once a mobile WebGPU reindex was OS-killed
@@ -43,7 +47,7 @@ const ACTIVE_KEY = 'seek-active-backend';      // 'webgpu' | 'wasm' — backend 
 export function getBackendOverride(): BackendChoice {
     try {
         const v = window.localStorage.getItem(OVERRIDE_KEY);
-        if (v === 'webgpu' || v === 'wasm' || v === 'auto') return v;
+        if (v === 'webgpu' || v === 'wasm' || v === 'auto' || v === 'webgpu-query') return v;
     } catch { /* localStorage unavailable — treat as auto */ }
     return 'auto';
 }
@@ -53,7 +57,7 @@ export function setBackendOverride(choice: BackendChoice): void {
         window.localStorage.setItem(OVERRIDE_KEY, choice);
         // Re-opting into WebGPU clears any sticky demote: the user is
         // explicitly asking this device to try the GPU again, so honour it.
-        if (choice === 'webgpu') clearWebgpuDemoted();
+        if (choice === 'webgpu' || choice === 'webgpu-query') clearWebgpuDemoted();
     } catch { /* best-effort */ }
 }
 
@@ -93,9 +97,18 @@ export function resolveDevice(): 'auto' | 'wasm' {
     const override = getBackendOverride();
     if (override === 'wasm') return 'wasm';
     if (override === 'webgpu') return 'auto';
+    // Query-only GPU is an explicit opt-in, so it beats the sticky demote like
+    // 'webgpu' does. Indexing never runs on the GPU in this mode, so the
+    // demote's failure class (a WebGPU reindex kill) shouldn't apply anyway.
+    if (override === 'webgpu-query') return 'auto';
     const base = capabilityDefault();
     if (base === 'auto' && Platform.isMobile && isWebgpuDemoted()) return 'wasm';
     return base;
+}
+
+// True when this device opted into the experimental query-only GPU mode.
+export function isQueryOnlyGpu(): boolean {
+    return getBackendOverride() === 'webgpu-query';
 }
 
 // Boot-time tripwire. Demote (sticky, per-device) only when a MOBILE device was

@@ -39,7 +39,7 @@ import {
 } from './insert-link';
 import { indexBannerSpec, INDEX_STALE_MSG, INDEX_SYNCING_MSG, INDEX_PEER_AHEAD_MSG, type DegradedReason } from './index-notice';
 import { SeekSettingTab } from './settings-tab';
-import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash } from './platform';
+import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash, isQueryOnlyGpu } from './platform';
 import { CompositorPacer } from './pacer';
 import { shouldUnloadEmbedder, type UnloadGateState } from './embedder-lifecycle';
 import { drainCatchUp, CATCHUP_MAX_FILES_PER_BURST, CATCHUP_BURST_BUDGET_MS } from './catchup';
@@ -448,6 +448,15 @@ export default class SeekPlugin extends Plugin {
         // see [[Seek Mobile WebGPU Investigation]]. Forensics beat FIRST and
         // synchronously: if the page is about to die too, the localStorage
         // write must win the race; the NDJSON append is the best-effort twin.
+        // Query-only-GPU swap (WebGPU → wasm before an indexing batch). Restamp
+        // the active backend FIRST and synchronously: a jetsam kill during the
+        // wasm indexing that follows must not read as a WebGPU crash and trip
+        // maybeDemoteOnCrash. Then breadcrumb + log the replacement load.
+        this.embedder.onDeviceSwap = (info) => {
+            recordActiveBackend(info.to);
+            this.forensics?.beat('gpu-query-swap', { from: info.from, to: info.to, swapMs: Math.round(info.swapMs) });
+            void this.logger.append({ ...info.entry, gpuQuerySwap: { from: info.from, swapMs: Math.round(info.swapMs) } });
+        };
         this.embedder.onIframeEvent = (event) => {
             const kind = typeof event.kind === 'string' ? event.kind : 'webgpu-event';
             const detail: Record<string, number | string | boolean | null> = {};
@@ -1103,6 +1112,11 @@ export default class SeekPlugin extends Plugin {
                 // webgpuError. ⚠️ ORT #26827 hang risk still applies on iPhone,
                 // which is why iPhone stays off the 'auto' path by default.
                 const requestedDevice = resolveDevice();
+                // EXPERIMENTAL query-only GPU ('webgpu-query' override): warm only
+                // the query grid, and swap to wasm before any indexing batch.
+                // Re-read on every load so a settings change applies at the next
+                // load without a plugin reload.
+                this.embedder.queryOnlyGpu = isQueryOnlyGpu();
                 // Model selection: the LOCAL_MODEL dev override wins (it's a
                 // base URL, not a hub id); otherwise MODEL_ID. Both ride dtype
                 // 'q4' — tx.js resolves it to onnx/model_q4.onnx (the ml97

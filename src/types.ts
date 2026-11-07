@@ -940,6 +940,10 @@ export interface LoadEntry {
     proxy: boolean;
     proxyAttempted: boolean;
     proxyError: string | null;
+    // EXPERIMENTAL query-only-GPU mode: present only on the replacement wasm
+    // load an indexing batch forced off WebGPU. swapMs = dispose + rebuild +
+    // wasm load wall time (the cost of entering indexing from a GPU session).
+    gpuQuerySwap?: { from: Device; swapMs: number };
     pass: boolean;
     checks: string[];
 }

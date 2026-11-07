@@ -787,12 +787,14 @@ export class SeekSettingTab extends PluginSettingTab {
 
         // Compute backend — PER-DEVICE (localStorage), never synced. Auto / Force CPU /
         // Force WebGPU map to the platform.ts override values auto / wasm / webgpu.
-        const computeLabel: Record<BackendChoice, string> = { auto: 'Auto', wasm: 'Force CPU', webgpu: 'Force WebGPU' };
-        const labelToChoice: Record<string, BackendChoice> = { Auto: 'auto', 'Force CPU': 'wasm', 'Force WebGPU': 'webgpu' };
+        // 'Search on GPU' = the EXPERIMENTAL 'webgpu-query' mode: WebGPU for search
+        // only, CPU for indexing (aimed at iPhone; see LocalEmbedder.queryOnlyGpu).
+        const computeLabel: Record<BackendChoice, string> = { auto: 'Auto', wasm: 'Force CPU', webgpu: 'Force WebGPU', 'webgpu-query': 'Search on GPU' };
+        const labelToChoice: Record<string, BackendChoice> = { Auto: 'auto', 'Force CPU': 'wasm', 'Force WebGPU': 'webgpu', 'Search on GPU': 'webgpu-query' };
         const compute = new Setting(containerEl)
             .setName('Compute')
-            .setDesc('How the embedding model runs on this device (this option is not synced to other devices). Auto uses WebGPU when available and falls back to CPU. Changing this setting is not recommended.');
-        this.addSegmented(compute, ['Auto', 'Force CPU', 'Force WebGPU'], computeLabel[getBackendOverride()], (pick) => {
+            .setDesc('How the embedding model runs on this device (this option is not synced to other devices). Auto uses WebGPU when available and falls back to CPU. Search on GPU (experimental): WebGPU for search only, CPU for indexing. Takes effect the next time the model loads. Changing this setting is not recommended.');
+        this.addSegmented(compute, ['Auto', 'Force CPU', 'Force WebGPU', 'Search on GPU'], computeLabel[getBackendOverride()], (pick) => {
             setBackendOverride(labelToChoice[pick]);
             this.rerender(); // forcing WebGPU clears a prior sticky demote; reflect it
         });

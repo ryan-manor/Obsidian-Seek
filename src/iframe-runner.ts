@@ -78,6 +78,9 @@ export const SEQ_BUCKETS = [32, 48, 64, 96, 128, 192, 256, 384, 512];
 // live iframeEmbedMs, not assumed.
 export const QUERY_SEQ_BUCKETS = [8, 16, 32, 48, 64, 96, 128];
 
+// Which shape grid a WebGPU load warms — see IframeRunner.load.
+export type WarmupProfile = 'full' | 'query';
+
 // Parent-side CHAR-ESTIMATE bucket selector — legacy fallback only. The
 // ceil(chars/4.5) estimate under-buckets dense text (URLs, paths, numbers,
 // code run ~3.6 chars/token), silently truncating BELOW the 512 cap — the
@@ -370,8 +373,13 @@ export class IframeRunner {
     // (see embedder.ts). If true AND the WebGPU path succeeds, the iframe
     // bypasses the 40-dispatch shader-compile loop entirely. Always pay the
     // warmup on the WASM path or on a fingerprint miss.
-    load(modelId: string, device: RequestedDevice, dtype: Dtype, skipWarmup: boolean, revision?: string | null): Promise<LoadResult> {
-        return this.send<LoadResult>('load', { modelId, device, dtype, skipWarmup, revision: revision ?? null }, LOAD_RPC_TIMEOUT_MS);
+    // warmupProfile: 'full' warms the whole indexer grid (WARMUP_BATCH_SIZES ×
+    // SEQ_BUCKETS + query floors, ~74 shapes). 'query' (EXPERIMENTAL, the
+    // query-only-GPU mode) warms just batch 1 × QUERY_SEQ_BUCKETS (7 shapes):
+    // a session that never runs an indexing batch on WebGPU shouldn't pay the
+    // compile time, or grow the ORT buffer/shader pool, for shapes it won't use.
+    load(modelId: string, device: RequestedDevice, dtype: Dtype, skipWarmup: boolean, revision?: string | null, warmupProfile: WarmupProfile = 'full'): Promise<LoadResult> {
+        return this.send<LoadResult>('load', { modelId, device, dtype, skipWarmup, revision: revision ?? null, warmupProfile }, LOAD_RPC_TIMEOUT_MS);
     }
 
     embed(text: string): Promise<EmbedResult> {
@@ -786,7 +794,7 @@ async function tryWebgpu(modelId, preferredDtype, revision) {
     throw new Error('all WebGPU dtypes failed: ' + errors.join(' | '));
 }
 
-async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, revision) {
+async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, revision, warmupProfile) {
     const t0 = performance.now();
 
     let webgpuAttempted = false;
@@ -830,7 +838,22 @@ async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, r
                         // — same behavior as the try/catch around each
                         // warmup dispatch already implies.
                         let warmupMs = null;
-                        if (!skipWarmup) {
+                        if (!skipWarmup && warmupProfile === 'query') {
+                            // Query-only-GPU profile: batch 1 on the query ladder
+                            // only. Indexing batches never reach this session
+                            // (the parent swaps to wasm first), so the full grid
+                            // would be compile time + pool growth for nothing.
+                            const warmupStart = performance.now();
+                            for (const bucket of QUERY_SEQ_BUCKETS) {
+                                try {
+                                    await pipeline(['warmup'], {
+                                        pooling: 'cls', normalize: true,
+                                        padding: 'max_length', truncation: true, max_length: bucket,
+                                    });
+                                } catch (_) { /* non-fatal — live call compiles on first use */ }
+                            }
+                            warmupMs = performance.now() - warmupStart;
+                        } else if (!skipWarmup) {
                             const warmupStart = performance.now();
                             for (const n of WARMUP_BATCH_SIZES) {
                                 const batch = Array(n).fill('warmup');
@@ -1196,6 +1219,7 @@ window.addEventListener('message', async (event) => {
                 data.payload.dtype,
                 data.payload.skipWarmup,
                 data.payload.revision,
+                data.payload.warmupProfile === 'query' ? 'query' : 'full',
             );
             currentDevice = result.device;
         } else if (data.type === 'embed') {

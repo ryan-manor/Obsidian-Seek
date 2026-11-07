@@ -28,6 +28,7 @@ import {
     type RawProfile,
     type IframeEvent,
     type IframeInit,
+    type WarmupProfile,
 } from './iframe-runner';
 
 // localStorage namespace for the warmup-skip fingerprint. Bumping the prefix
@@ -41,8 +42,11 @@ const WARMUP_FP_KEY = 'seek:warmup-fingerprint:v1';
 //   transformers — different ORT-Web revs emit different WGSL bodies
 //   batch×seq    — the exact grid the iframe warms, mirrored via the parent
 //                  exports so they can't drift
-function warmupFingerprint(modelId: string, dtype: Dtype, revision: string | null): string {
-    return [
+//   profile      — 'full' vs 'query' warm different grids (query-only-GPU
+//                  mode); a full-grid fingerprint must not let a query-profile
+//                  load skip warmup, or vice versa
+export function warmupFingerprint(modelId: string, dtype: Dtype, revision: string | null, profile: WarmupProfile = 'full'): string {
+    const parts = [
         modelId,
         revision ?? 'main',   // a revision bump fetches different bytes → must re-warm
         dtype,
@@ -50,7 +54,11 @@ function warmupFingerprint(modelId: string, dtype: Dtype, revision: string | nul
         WARMUP_BATCH_SIZES.join(','),
         SEQ_BUCKETS.join(','),
         QUERY_SEQ_BUCKETS.join(','),   // query-path floors (8,16) are warmed too; grid change must re-warm
-    ].join('|');
+    ];
+    // Appended only for 'query' so the pre-existing 'full' fingerprint string is
+    // byte-identical — shipping this prototype doesn't force a re-warm.
+    if (profile === 'query') parts.push('profile=query');
+    return parts.join('|');
 }
 
 // localStorage is sync, fast, and reliable in the Obsidian renderer process.
@@ -152,8 +160,29 @@ export const PLUGIN_VERSION = typeof __PLUGIN_VERSION__ !== 'undefined' ? __PLUG
 // local vectors are dropped. See dim-consistency.test.ts for the invariant.
 export const EMBEDDING_DIM = ACTIVE_MODEL_SPEC.dim;
 
+// Fired after a query-only-GPU swap (WebGPU → wasm before an indexing batch).
+export interface DeviceSwapInfo {
+    from: Device;
+    to: Device;
+    // Wall time of the swap: iframe dispose + rebuild + wasm model load.
+    swapMs: number;
+    // The LoadEntry of the replacement wasm load (log-ready).
+    entry: LoadEntry;
+}
+
 export class LocalEmbedder {
     private runner = new IframeRunner();
+
+    // EXPERIMENTAL query-only-GPU mode (platform.ts 'webgpu-query'). When set:
+    // loads warm only the query grid, and embedBatch (indexing) swaps a WebGPU
+    // session to wasm before running. The swap sticks until the next fresh
+    // load() (idle unload → ensureModelLoaded), which goes back to WebGPU.
+    queryOnlyGpu = false;
+    onDeviceSwap: ((info: DeviceSwapInfo) => void) | null = null;
+    // Single-flight latch for the swap, so concurrent embedBatch callers don't
+    // each start a recycle.
+    private _swapPromise: Promise<void> | null = null;
+    get warmupProfile(): WarmupProfile { return this.queryOnlyGpu ? 'query' : 'full'; }
     private _device: Device = 'wasm';
     private _dtype: Dtype = 'q4';
     private _loaded = false;
@@ -287,7 +316,10 @@ export class LocalEmbedder {
         const effectiveModelId = modelIdOverride ?? MODEL_ID;
         // undefined = caller didn't specify → use the active pin; explicit null = track main.
         const effectiveRevision = revision !== undefined ? revision : MODEL_REVISION;
-        const expectedFp = warmupFingerprint(effectiveModelId, dtype, effectiveRevision);
+        // Warmup only exists on WebGPU; a wasm request is always 'full' so the
+        // fingerprint write below stays meaningful.
+        const profile: WarmupProfile = requested === 'wasm' ? 'full' : this.warmupProfile;
+        const expectedFp = warmupFingerprint(effectiveModelId, dtype, effectiveRevision, profile);
         const skipWarmup = readWarmupFingerprint() === expectedFp;
 
         // Remember the args so recycle() can rebuild the same pipeline.
@@ -298,7 +330,7 @@ export class LocalEmbedder {
 
         let result;
         try {
-            result = await this.runner.load(effectiveModelId, requested, dtype, skipWarmup, effectiveRevision);
+            result = await this.runner.load(effectiveModelId, requested, dtype, skipWarmup, effectiveRevision, profile);
         } catch (e) {
             this._loaded = false;
             throw e;
@@ -456,6 +488,10 @@ export class LocalEmbedder {
     // fires only once per ~2100 chunks. Replays the last load() args; leaves
     // _loaded true on success, false (and throws) if the rebuild fails.
     async recycle(): Promise<void> {
+        await this.recycleImpl();
+    }
+
+    private async recycleImpl(): Promise<LoadEntry> {
         this._loaded = false;
         this.runner.dispose();
         // Set the rebuild promise into the init memo BEFORE the first await so a
@@ -498,7 +534,7 @@ export class LocalEmbedder {
         })();
         this._loadPromise = p;
         try {
-            await p;
+            return await p;
         } catch (e) {
             // init() succeeded but load() failed: without this the memo pins a
             // resolved "ready" entry pointing at an iframe whose model never
@@ -513,9 +549,32 @@ export class LocalEmbedder {
     // bucket: explicit seq rung from token-exact routing (selectIndexBucket).
     // Optional only for back-compat; the indexer always passes it.
     async embedBatch(texts: string[], bucket?: number): Promise<EmbedBatchTimed> {
+        if (this._swapPromise) await this._swapPromise;
         if (!this._loaded) throw new Error('Model not loaded.');
+        if (this.queryOnlyGpu && this._device === 'webgpu') await this.swapToWasm();
         const r = await this.runner.embedBatch(texts, bucket);
         return { vectors: r.vectors, iframeLatencyMs: r.latencyMs };
+    }
+
+    // Query-only-GPU: move the session off WebGPU before indexing. Reuses
+    // recycle() — dispose the iframe (frees the GPU device + its buffer pool,
+    // which is the iPhone memory problem) and reload under the same
+    // _loadPromise single-flight latch — with the replayed device set to wasm.
+    // _lastRequested stays 'wasm', so any later recovery recycle (SafeInt /
+    // TIMEOUT) also stays on CPU; only a fresh load() returns to WebGPU.
+    private swapToWasm(): Promise<void> {
+        if (this._swapPromise) return this._swapPromise;
+        const from = this._device;
+        const t0 = performance.now();
+        const p = (async () => {
+            this._lastRequested = 'wasm';
+            const entry = await this.recycleImpl();
+            const swapMs = performance.now() - t0;
+            try { this.onDeviceSwap?.({ from, to: this._device, swapMs, entry }); }
+            catch { /* observer errors must not fail the embed */ }
+        })();
+        this._swapPromise = p;
+        return p.finally(() => { this._swapPromise = null; });
     }
 
     // Exact token counts from the iframe pipeline's tokenizer (specials
@@ -523,6 +582,9 @@ export class LocalEmbedder {
     // session involvement, so no recycle interplay. Feeds token-budget
     // enforcement + bucket routing in search.ts.
     async tokenCounts(texts: string[]): Promise<number[]> {
+        // A query-only-GPU swap disposes the iframe (tokenizer included) for a
+        // few seconds; wait it out instead of hitting a dead runner.
+        if (this._swapPromise) await this._swapPromise;
         if (!this._loaded && !this._tokenizerLoaded) throw new Error('Neither model nor tokenizer loaded.');
         return this.runner.tokenCounts(texts);
     }
