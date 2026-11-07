@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>WGSL encoder test</title>
+<pre id="out">running…</pre>
+<script type="module">
+import { loadGraniteWeights } from './onnx-weights.js';
+import { WgslEncoder } from './engine-webgpu.js';
+const log = (s) => { document.getElementById('out').textContent += '\n' + s; console.log(s); };
+const MODEL = new URLSearchParams(location.search).get('model') || '/model';
+window.__result = (async () => {
+  const config = await (await fetch(MODEL + '/config.json')).json();
+  const bytes = new Uint8Array(await (await fetch(MODEL + '/onnx/model_q4.onnx')).arrayBuffer());
+  const fx = await (await fetch('./fixtures.json')).json();
+  let t = performance.now();
+  const weights = loadGraniteWeights(bytes, config);
+  const tParse = performance.now() - t; t = performance.now();
+  const enc = await WgslEncoder.create(weights, config, { maxRows: 256, maxS: 128 });
+  const tInit = performance.now() - t;
+  log(`parse ${tParse.toFixed(0)}ms init ${tInit.toFixed(0)}ms gpu ${(enc.stats.gpuBytes/1e6).toFixed(1)}MB (weights ${(enc.stats.weightBytes/1e6).toFixed(1)}MB, activations ${(enc.stats.activationBytes/1e6).toFixed(1)}MB) dispatches ${enc.stats.dispatches}`);
+  const dot = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0);
+  const rows = [];
+  for (const f of fx) {
+    t = performance.now();
+    const [v] = await enc.embed([f.ids]);
+    rows.push({ S: f.ids.length, fp32: dot(v, f.fp32), shipped: dot(v, f.shipped), ms: performance.now() - t });
+    log(`S=${f.ids.length} cos(fp32)=${rows.at(-1).fp32.toFixed(7)} cos(shipped)=${rows.at(-1).shipped.toFixed(6)} ${rows.at(-1).ms.toFixed(0)}ms`);
+  }
+  // batched (padding mask path): all fixtures in one call
+  t = performance.now();
+  const vs = await enc.embed(fx.map((f) => f.ids).slice(0, 2));
+  const batchCos = vs.map((v, i) => dot(v, fx[i].fp32));
+  log(`batch(2, padded) cos(fp32)=${batchCos.map((c) => c.toFixed(7)).join(', ')} ${(performance.now()-t).toFixed(0)}ms`);
+  return { rows, batchCos, stats: enc.stats };
+})().catch((e) => { log('ERROR ' + e.stack); return { error: String(e) }; });
+</script>

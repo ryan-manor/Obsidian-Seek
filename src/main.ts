@@ -39,6 +39,7 @@ import {
 } from './insert-link';
 import { indexBannerSpec, INDEX_STALE_MSG, INDEX_SYNCING_MSG, INDEX_PEER_AHEAD_MSG, type DegradedReason } from './index-notice';
 import { SeekSettingTab } from './settings-tab';
+import { runWgslBench } from './wgsl-bench';
 import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash, isQueryOnlyGpu } from './platform';
 import { CompositorPacer } from './pacer';
 import { shouldUnloadEmbedder, type UnloadGateState } from './embedder-lifecycle';
@@ -661,6 +662,32 @@ export default class SeekPlugin extends Plugin {
             id: 'search',
             name: 'Search',
             callback: () => this.openSearchModal(),
+        });
+
+        // EXPERIMENTAL (investigation branch, not for release): on-device bench of
+        // the hand-written WebGPU encoder vs the production pipeline. Writes a
+        // report note to the vault root. See research/wgsl-encoder/README.md.
+        this.addCommand({
+            id: 'experimental-wgsl-bench',
+            name: '(Experimental) Benchmark WGSL encoder',
+            callback: async () => {
+                if (this.currentTaskContext !== 'idle' || this.flushing || this.catchUpRunning || this.driftRecoveryRunning) {
+                    new Notice('Seek: busy indexing — run the WGSL bench when idle.', 6000);
+                    return;
+                }
+                new Notice('Seek: WGSL bench running (≈1 min)…', 5000);
+                try {
+                    const path = await runWgslBench(
+                        this.app, this.embedder,
+                        () => this.ensureModelLoaded(),
+                        () => { this.embedder.teardown(); this.modelLoadPromise = null; },
+                    );
+                    new Notice(`Seek: WGSL bench written to "${path}"`, 8000);
+                    await this.app.workspace.openLinkText(path, '', true);
+                } catch (e) {
+                    new Notice(`Seek: WGSL bench failed — ${String(e).slice(0, 120)}`, 10000);
+                }
+            },
         });
 
         // ---- obsidian://seek deep-link --------------------------------
