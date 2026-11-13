@@ -217,24 +217,81 @@ describe('iframe init coalescing (startup deferral)', () => {
         expect((e as unknown as { _initPromise: unknown })._initPromise).not.toBeNull();
     });
 
+    // A fakeInitRunner (init gated until releaseInit) that also serves the
+    // tokenizer-only RPCs, counting loads.
+    function mkTokRunner() {
+        const fr = fakeInitRunner();
+        let tokLoads = 0;
+        const tr = Object.assign(fr, {
+            loadTokenizer: async () => { tokLoads++; return { ok: true, cached: false }; },
+            tokenCounts: async (ts: string[]) => ts.map(() => 1),
+            tokLoads: () => tokLoads,
+        });
+        tr.releaseInit();
+        return tr;
+    }
+
     it('teardown() resets the tokenizer latch so ensureTokenizer re-loads on the fresh runner', async () => {
         const e = new LocalEmbedder();
-        let tokLoads = 0;
-        const fr = { loadTokenizer: async () => { tokLoads++; }, dispose: () => {} };
+        const fr = mkTokRunner();
         (e as unknown as { runner: unknown }).runner = fr;
 
         await e.ensureTokenizer();
-        expect(tokLoads).toBe(1);
+        expect(fr.tokLoads()).toBe(1);
         await e.ensureTokenizer();             // latched — idempotent while the iframe lives
-        expect(tokLoads).toBe(1);
+        expect(fr.tokLoads()).toBe(1);
 
         // The tokenizer dies with the disposed iframe. If the latch survives
         // teardown, ensureTokenizer short-circuits forever and every
         // tokenCounts() hits a tokenizer-less iframe ('iframe not initialized').
         e.teardown();
-        (e as unknown as { runner: unknown }).runner = fr;   // re-stub the fresh runner
+        const fresh = mkTokRunner();
+        (e as unknown as { runner: unknown }).runner = fresh;   // re-stub the fresh runner
         await e.ensureTokenizer();
-        expect(tokLoads).toBe(2);              // re-loaded, not short-circuited
+        expect(fresh.tokLoads()).toBe(1);      // re-loaded, not short-circuited
+        // ...and on an INITED iframe: teardown leaves the runner un-inited, and
+        // a tokenizer-only unload made that path common (PR #100 review).
+        expect(fresh.initCalls()).toBe(1);
+    });
+
+    it('a successful model load clears tokenizerLoaded (the iframe drops its standalone copy)', async () => {
+        const e = new LocalEmbedder();
+        const fr = mkTokRunner();
+        (e as unknown as { runner: unknown }).runner = fr;
+        await e.ensureTokenizer();
+        expect(e.tokenizerLoaded).toBe(true);
+        await e.load('wasm', 'q4');
+        // Left true, the unload gate and telemetry would report a standalone
+        // tokenizer the iframe no longer holds.
+        expect(e.loaded).toBe(true);
+        expect(e.tokenizerLoaded).toBe(false);
+    });
+
+    it('a model load landing mid-ensureTokenizer leaves tokenizerLoaded false', async () => {
+        const e = new LocalEmbedder();
+        const fr = mkTokRunner();
+        (e as unknown as { runner: unknown }).runner = fr;
+        let finishTok!: () => void;
+        fr.loadTokenizer = () => new Promise(res => { finishTok = () => res({ ok: true, cached: false }); });
+        const tokP = e.ensureTokenizer();
+        await new Promise(r => setTimeout(r, 0));   // let it reach the RPC
+        await e.load('wasm', 'q4');                  // model wins the race
+        finishTok();
+        await tokP;
+        expect(e.loaded).toBe(true);
+        expect(e.tokenizerLoaded).toBe(false);
+    });
+
+    it('ensureTokenizer and tokenCounts stamp lastTokenizerUseAt (mobile idle-unload clock)', async () => {
+        const e = new LocalEmbedder();
+        (e as unknown as { runner: unknown }).runner = mkTokRunner();
+        expect(e.lastTokenizerUseAt).toBe(0);
+        const t0 = Date.now();
+        await e.ensureTokenizer();
+        expect(e.lastTokenizerUseAt).toBeGreaterThanOrEqual(t0);
+        e.lastTokenizerUseAt = 0;
+        await e.tokenCounts(['a']);            // a long hydrate keeps the clock fresh per note
+        expect(e.lastTokenizerUseAt).toBeGreaterThanOrEqual(t0);
     });
 });
 

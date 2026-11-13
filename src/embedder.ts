@@ -28,6 +28,7 @@ import {
     type RawProfile,
     type IframeEvent,
     type IframeInit,
+    type WarmupProfile,
 } from './iframe-runner';
 
 // localStorage namespace for the warmup-skip fingerprint. Bumping the prefix
@@ -41,8 +42,11 @@ const WARMUP_FP_KEY = 'seek:warmup-fingerprint:v1';
 //   transformers — different ORT-Web revs emit different WGSL bodies
 //   batch×seq    — the exact grid the iframe warms, mirrored via the parent
 //                  exports so they can't drift
-function warmupFingerprint(modelId: string, dtype: Dtype, revision: string | null): string {
-    return [
+//   profile      — 'full' vs 'query' warm different grids (query-only-GPU
+//                  mode); a full-grid fingerprint must not let a query-profile
+//                  load skip warmup, or vice versa
+export function warmupFingerprint(modelId: string, dtype: Dtype, revision: string | null, profile: WarmupProfile = 'full'): string {
+    const parts = [
         modelId,
         revision ?? 'main',   // a revision bump fetches different bytes → must re-warm
         dtype,
@@ -50,7 +54,11 @@ function warmupFingerprint(modelId: string, dtype: Dtype, revision: string | nul
         WARMUP_BATCH_SIZES.join(','),
         SEQ_BUCKETS.join(','),
         QUERY_SEQ_BUCKETS.join(','),   // query-path floors (8,16) are warmed too; grid change must re-warm
-    ].join('|');
+    ];
+    // Appended only for 'query' so the pre-existing 'full' fingerprint string is
+    // byte-identical — shipping this prototype doesn't force a re-warm.
+    if (profile === 'query') parts.push('profile=query');
+    return parts.join('|');
 }
 
 // localStorage is sync, fast, and reliable in the Obsidian renderer process.
@@ -154,7 +162,9 @@ export const EMBEDDING_DIM = ACTIVE_MODEL_SPEC.dim;
 
 export class LocalEmbedder {
     private runner = new IframeRunner();
+
     private _device: Device = 'wasm';
+    private _engine: 'ort' | 'wgsl' = 'ort';
     private _dtype: Dtype = 'q4';
     private _loaded = false;
     // ort-wasm glue variant the current pipeline loaded with (plain/asyncify/jspi),
@@ -209,9 +219,12 @@ export class LocalEmbedder {
     private static readonly QUERY_EMBED_CACHE_MAX = 128;
 
     get device(): Device { return this._device; }
+    // 'wgsl' when the EXPERIMENTAL Seek WebGPU engine is serving embeds.
+    get engine(): 'ort' | 'wgsl' { return this._engine; }
     get dtype(): Dtype { return this._dtype; }
     get glue(): string | null { return this._glue; }
     get loaded(): boolean { return this._loaded; }
+    get tokenizerLoaded(): boolean { return this._tokenizerLoaded; }
     // Model id of the current/last pipeline — what the orchestrator stamps
     // into index meta so a later load can detect model-vs-index drift.
     get modelId(): string { return this._lastModelId; }
@@ -287,7 +300,10 @@ export class LocalEmbedder {
         const effectiveModelId = modelIdOverride ?? MODEL_ID;
         // undefined = caller didn't specify → use the active pin; explicit null = track main.
         const effectiveRevision = revision !== undefined ? revision : MODEL_REVISION;
-        const expectedFp = warmupFingerprint(effectiveModelId, dtype, effectiveRevision);
+        // The indexer grid ('full') is the only profile production warms now
+        // (the query-only profile went with the 'webgpu-query' mode).
+        const profile: WarmupProfile = 'full';
+        const expectedFp = warmupFingerprint(effectiveModelId, dtype, effectiveRevision, profile);
         const skipWarmup = readWarmupFingerprint() === expectedFp;
 
         // Remember the args so recycle() can rebuild the same pipeline.
@@ -298,7 +314,7 @@ export class LocalEmbedder {
 
         let result;
         try {
-            result = await this.runner.load(effectiveModelId, requested, dtype, skipWarmup, effectiveRevision);
+            result = await this.runner.load(effectiveModelId, requested, dtype, skipWarmup, effectiveRevision, profile);
         } catch (e) {
             this._loaded = false;
             throw e;
@@ -308,9 +324,14 @@ export class LocalEmbedder {
         const memAfter = await snapshotMemory();
 
         this._device = result.device;
+        this._engine = result.engine ?? 'ort';
         this._dtype = result.dtype;
         this._glue = result.glue ?? null;
         this._loaded = true;
+        // The iframe released its standalone tokenizer on this successful load
+        // (the pipeline's own serves tokenCounts now); mirror it so
+        // tokenizerLoaded keeps meaning "a standalone tokenizer is resident".
+        this._tokenizerLoaded = false;
         this.queryEmbedCache.clear();   // vectors are pipeline-specific; new load invalidates them
 
         const checks: string[] = [];
@@ -361,11 +382,24 @@ export class LocalEmbedder {
         // success means a future config change that lands in this branch
         // (e.g. model swap then immediate re-load) self-heals on the load
         // that *did* run the warmup, not on the load that paid for the swap.
-        if (result.device === 'webgpu') {
+        // Not for the WGSL engine: the fingerprint records that ORT/Dawn's shape
+        // grid is warm, which a WGSL load never touches.
+        if (result.device === 'webgpu' && result.engine !== 'wgsl') {
             writeWarmupFingerprint(expectedFp);
         }
 
-        if (result.device !== requested && requested !== 'auto') {
+        if (requested === 'wgsl' || requested === 'wgsl-wasm') {
+            if (result.engine === 'wgsl') {
+                checks.push(`✅ running on the WGSL engine (WebGPU, dtype=${result.dtype})`);
+            } else if (requested === 'wgsl-wasm' && result.device === 'wasm') {
+                // The designed fallback on iPhone / Android (no usable WebGPU, or
+                // the self-test failed): a working CPU load, not a failure.
+                checks.push(`⚠️ WGSL engine unavailable, running on CPU: ${result.wgslError ?? 'unknown'}`);
+            } else {
+                pass = false;
+                checks.push(`❌ requested wgsl but fell back to ORT ${result.device}: ${result.wgslError ?? 'unknown'}`);
+            }
+        } else if (result.device !== requested && requested !== 'auto') {
             pass = false;
             checks.push(`❌ requested ${requested} but used ${result.device}`);
         } else {
@@ -382,6 +416,8 @@ export class LocalEmbedder {
             timestamp: new Date().toISOString(),
             requestedDevice: requested,
             actualDevice: result.device,
+            engine: result.engine ?? 'ort',
+            wgslError: result.wgslError ?? null,
             dtype: result.dtype,
             embeddingDim: EMBEDDING_DIM,
             coldStartMs,
@@ -456,7 +492,13 @@ export class LocalEmbedder {
     // fires only once per ~2100 chunks. Replays the last load() args; leaves
     // _loaded true on success, false (and throws) if the rebuild fails.
     async recycle(): Promise<void> {
+        await this.recycleImpl();
+    }
+
+    private async recycleImpl(): Promise<LoadEntry> {
         this._loaded = false;
+        // Same reason as teardown(): the disposed iframe takes any tokenizer with it.
+        this._tokenizerLoaded = false;
         this.runner.dispose();
         // Set the rebuild promise into the init memo BEFORE the first await so a
         // CONCURRENT embedder.init() coalesces onto it (init() returns the memo)
@@ -498,7 +540,7 @@ export class LocalEmbedder {
         })();
         this._loadPromise = p;
         try {
-            await p;
+            return await p;
         } catch (e) {
             // init() succeeded but load() failed: without this the memo pins a
             // resolved "ready" entry pointing at an iframe whose model never
@@ -524,19 +566,38 @@ export class LocalEmbedder {
     // enforcement + bucket routing in search.ts.
     async tokenCounts(texts: string[]): Promise<number[]> {
         if (!this._loaded && !this._tokenizerLoaded) throw new Error('Neither model nor tokenizer loaded.');
+        this.lastTokenizerUseAt = Date.now();
         return this.runner.tokenCounts(texts);
     }
 
     // Tokenizer-only load for the sidecar hydrate's chunk-id reproduction. A
     // full model load already includes the tokenizer, so this no-ops when
-    // _loaded. Otherwise it pulls just the vocab/merges (a few MB) — the
-    // hydrate can then reproduce token-budget splits without the ~250 MB model
-    // it exists to avoid on mobile. Cheap and idempotent.
+    // _loaded. Otherwise it pulls just the vocab/merges (ml97's tokenizer.json
+    // is 25 MB; ~68 MB of parsed heap measured 2026-10-13) — the hydrate can
+    // then reproduce token-budget splits without the ~250 MB model it exists
+    // to avoid on mobile. Idempotent. The iframe drops this standalone copy
+    // once a full model load succeeds (the pipeline brings its own).
     private _tokenizerLoaded = false;
+    // Epoch ms of the last ensureTokenizer/tokenCounts. The hydrate never goes
+    // through main.ts ensureModelLoaded, so the mobile idle-unload timer reads
+    // max(lastModelUseAt, this) to keep a tokenizer-only iframe from looking idle
+    // mid-hydrate (and to make it unloadable once the hydrate is done).
+    lastTokenizerUseAt = 0;
     async ensureTokenizer(modelId: string = MODEL_ID, revision: string | null = MODEL_REVISION): Promise<void> {
+        this.lastTokenizerUseAt = Date.now();
         if (this._loaded || this._tokenizerLoaded) return;
+        // Bring the iframe up first, as loadImpl does. After a teardown (now
+        // reachable from a tokenizer-only idle/background unload) the runner is
+        // fresh and un-inited, and load-tokenizer would reject with 'iframe not
+        // initialized' until some search happened to load the model.
+        const initEntry = await this.init();
+        if (!initEntry.iframeReady) {
+            throw new Error(`iframe init failed: ${initEntry.error ?? 'unknown'}`);
+        }
         await this.runner.loadTokenizer(modelId, revision);
-        this._tokenizerLoaded = true;
+        // A model load that finished during the await already serves tokenCounts
+        // (and the iframe declined the standalone copy), so don't claim one.
+        if (!this._loaded) this._tokenizerLoaded = true;
     }
 
     // Capability probe — see iframe-runner.ts. Exposed here so callers

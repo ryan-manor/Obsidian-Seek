@@ -780,6 +780,11 @@ describe('matchesFilters / dates (period-exclusive, missing→reject)', () => {
         const dailyNote = makeChunk({ note_path: 'Daily/2026-05-16.md', metadata: { created: null, modified: null } });
         expect(matchesFilters(dailyNote, filters({ dateAfter: '2026-01-01' }), ctx())).toBe(false);
     });
+
+    it('NO mtime fallback in property mode (2026-11-11): missing property is rejected even with an mtime', () => {
+        const unstamped = makeChunk({ metadata: { created: null, modified: '2026-11-07' } });
+        expect(matchesFilters(unstamped, filters({ dateAfter: '2026-01-01' }), ctx())).toBe(false);
+    });
 });
 
 describe('matchesFilters / numeric (value-inclusive, missing→reject)', () => {

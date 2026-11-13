@@ -15,8 +15,8 @@ export function isMobilePlatform(): boolean {
 //
 // WebGPU viability is a property of the DEVICE, not the vault — an iPad runs a
 // granite reindex on WebGPU at desktop speed, an iPhone gets jetsam-killed mid
-// reindex (~1.5 GB WebContent budget), and Android System WebView's WebGPU is
-// immature/absent. But settings persisted via Plugin.saveData live in the
+// reindex (~1.5 GB WebContent budget), and Android WebView's WebGPU varies by
+// driver and version. But settings persisted via Plugin.saveData live in the
 // vault's data.json, which iCloud (and Obsidian Sync's plugin-settings option)
 // replicate to every device — so a backend toggle there would be SHARED: turn
 // it on for the iPad and the iPhone inherits it on the next sync. That is the
@@ -27,6 +27,12 @@ export function isMobilePlatform(): boolean {
 // (capacitor://localhost on iOS, the Electron origin on desktop) → per physical
 // device and NEVER synced — exactly the deviceId / crash-forensics convention.
 
+// The GPU engine is Seek's own WebGPU encoder (the Seek engine, src/
+// wgsl-engine) for search AND indexing: no per-shape compile/warmup, fixed
+// GPU memory, a load-time self-test. If it can't load (or fails the self-test)
+// the load falls back to ONNX Runtime. Retired 2026-11-10: the 'webgpu-query'
+// (search-only GPU) and 'wgsl' (Seek engine opt-in) choices, now subsumed by
+// the defaults; a stored value is migrated to 'webgpu' on read.
 export type BackendChoice = 'auto' | 'webgpu' | 'wasm';
 
 const OVERRIDE_KEY = 'seek-backend-override';  // BackendChoice; absent/invalid = auto
@@ -44,6 +50,11 @@ export function getBackendOverride(): BackendChoice {
     try {
         const v = window.localStorage.getItem(OVERRIDE_KEY);
         if (v === 'webgpu' || v === 'wasm' || v === 'auto') return v;
+        // Retired opt-ins: both asked this device for the GPU, so keep that.
+        if (v === 'webgpu-query' || v === 'wgsl') {
+            window.localStorage.setItem(OVERRIDE_KEY, 'webgpu');
+            return 'webgpu';
+        }
     } catch { /* localStorage unavailable — treat as auto */ }
     return 'auto';
 }
@@ -71,31 +82,38 @@ export function recordActiveBackend(device: string): void {
     catch { /* best-effort */ }
 }
 
-// Capability ALLOWLIST — WebGPU auto-enables ONLY on surfaces verified to
-// reindex without an OS memory kill. NOT "mobile minus iPhone": anything
-// unverified (every Android, an iPad we haven't characterised stays on the
-// tablet branch but Android tablets do NOT) defaults to WASM until proven good.
-//   - Desktop (Electron): WebGPU — the long-standing default, ~2× WASM.
-//   - iPad: WebGPU — ml97 GBQ4 reindexes desktop-class on WKWebView (2026-06-10),
-//     ~4 GB WebContent budget.
-//   - iPhone + ALL Android: WASM — jetsam at ~1.5 GB / immature WebView WebGPU.
-function capabilityDefault(): 'auto' | 'wasm' {
-    if (!Platform.isMobile) return 'auto';                       // desktop
-    if (Platform.isIosApp && Platform.isTablet) return 'auto';   // iPad
-    return 'wasm';                                               // iPhone + all Android
+// Capability ALLOWLIST: which devices get the GPU by default.
+//   - Desktop (Electron), iPad: Seek engine, falling back to ORT's WebGPU-then-
+//     WASM ladder (ORT WebGPU has been the long-standing default there).
+//   - iPhone: Seek engine, falling back straight to WASM. ORT's own WebGPU
+//     path stays off the iPhone (jetsam during reindex, ORT #26827 hang); the
+//     Seek engine avoids both (fixed ~43 MB GPU, no wasm glue). Release-
+//     candidate default as of 2026-11-10; the crash demote below is the net.
+//   - Android (phone + tablet): Seek engine, falling back straight to WASM,
+//     like iPhone. Benchmarked 2026-11-11 on Pixel 11 Pro, Galaxy S23 and
+//     Galaxy A26 (WebView 157). ORT's WebGPU path stays off Android: it is
+//     the untested part, and the Seek engine's self-test + WASM fallback cover
+//     a WebView without (or with broken) WebGPU.
+type GpuDefault = 'gpu' | 'gpu-cpu-fallback' | 'wasm';
+function capabilityDefault(): GpuDefault {
+    if (!Platform.isMobile) return 'gpu';                        // desktop
+    if (Platform.isIosApp && Platform.isTablet) return 'gpu';    // iPad
+    return 'gpu-cpu-fallback';                                   // iPhone + Android
 }
 
-// The device string to hand the embedder ('auto' = WebGPU-then-WASM ladder;
-// 'wasm' = skip WebGPU). Override wins; else the allowlist; with a sticky
-// mobile demote forcing WASM on the auto path. A 'webgpu' override maps to
-// 'auto' — the iframe ladder still WASM-falls-back if the GPU can't load.
-export function resolveDevice(): 'auto' | 'wasm' {
+// The device string to hand the embedder. Override wins; else the allowlist;
+// a sticky mobile demote (an OS kill mid-GPU-reindex) forces WASM on the auto
+// path. 'wgsl' = Seek engine then the ORT ladder; 'wgsl-wasm' = Seek engine
+// then CPU; 'wasm' = CPU only. Force WebGPU is an explicit opt-in, so it beats
+// the demote and keeps the ORT WebGPU fallback even on iPhone.
+export function resolveDevice(): 'wgsl' | 'wgsl-wasm' | 'wasm' {
     const override = getBackendOverride();
     if (override === 'wasm') return 'wasm';
-    if (override === 'webgpu') return 'auto';
+    if (override === 'webgpu') return 'wgsl';
     const base = capabilityDefault();
-    if (base === 'auto' && Platform.isMobile && isWebgpuDemoted()) return 'wasm';
-    return base;
+    if (base === 'wasm') return 'wasm';
+    if (Platform.isMobile && isWebgpuDemoted()) return 'wasm';
+    return base === 'gpu' ? 'wgsl' : 'wgsl-wasm';
 }
 
 // Boot-time tripwire. Demote (sticky, per-device) only when a MOBILE device was
@@ -103,6 +121,14 @@ export function resolveDevice(): 'auto' | 'wasm' {
 // signature) WHILE WebGPU was the active backend. Never on desktop, and never
 // when the kill happened on WASM (demoting WebGPU there is a no-op that would
 // falsely read as a fix). Returns true if it tripped.
+// A 'webgpu-device-lost' event from the iframe's requestDevice hook means the
+// GPU went away under us, EXCEPT reason 'destroyed': that is our own
+// device.destroy() (a failed Seek-engine load releasing its device before the
+// WASM fallback, or a teardown), and must not reject in-flight RPCs.
+export function isUnexpectedGpuLoss(event: { kind?: unknown; reason?: unknown }): boolean {
+    return event.kind === 'webgpu-device-lost' && event.reason !== 'destroyed';
+}
+
 export function maybeDemoteOnCrash(verdict: string): boolean {
     if (verdict !== 'crash-while-indexing-foreground') return false;
     if (!Platform.isMobile) return false;

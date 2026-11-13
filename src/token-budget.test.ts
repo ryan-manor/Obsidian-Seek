@@ -343,11 +343,16 @@ describe('enforceTokenBudget — WS3 structural atoms', () => {
 });
 
 describe('dense suffix (frontmatter-into-dense)', () => {
-    const SUFFIX = 'food restaurant Austin';
-
-    it('embedInput appends the suffix after title + content', () => {
-        const c = mkChunk({ content: 'great patio downtown', denseSuffix: SUFFIX });
-        expect(embedInput(c)).toBe(`Note > Section\n\ngreat patio downtown\n\n${SUFFIX}`);
+    it('embedInput keys surviving properties into the dense suffix (v11)', () => {
+        // v11: embedInput DERIVES a keyed `key: value` suffix from properties
+        // (goForwardDenseParts) — the raw denseSuffix string is now only the
+        // chunk_id/budget proxy, not what gets embedded. Values novel vs
+        // title+body survive, keyed, groups period-separated.
+        const c = mkChunk({
+            content: 'great patio downtown',
+            metadata: { ...META, properties: { cuisine: 'Thai', pageType: 'places' } },
+        });
+        expect(embedInput(c)).toBe('Note > Section\n\ngreat patio downtown\n\ncuisine: Thai. pageType: places');
     });
 
     it('absent suffix leaves embedInput as the bare title\\n\\ncontent', () => {
@@ -355,17 +360,22 @@ describe('dense suffix (frontmatter-into-dense)', () => {
         expect(embedInput(c)).toBe('Note > Section\n\ngreat patio downtown');
     });
 
-    it('split parts keep the suffix, stay ≤ budget WITH it, and hash it into the id', async () => {
-        // A chunk that must split, carrying a note-level suffix. The suffix is
-        // reserved in the content budget (overhead), so it survives on EVERY
-        // part (the ungated/all-chunks decision) instead of being truncated off
-        // the at-cap part — and each part's id must equal the hash of its full
-        // embedded bytes, suffix included.
+    it('split parts keep the keyed suffix, stay ≤ budget WITH it, and hash the proxy into the id', async () => {
+        // A chunk that must split, carrying a note-level suffix. The note-level
+        // denseSuffix proxy is reserved in the content budget (overhead) and
+        // hashed into each part's id; the KEYED suffix (derived per-part from
+        // properties) rides on EVERY part instead of being truncated off the
+        // at-cap part. Proxy == keyed text here so budget reserve and embed agree.
         const content = [
             makeParagraph(20, 'a'), makeParagraph(20, 'b'),
             makeParagraph(20, 'c'), makeParagraph(20, 'd'),
         ].join('\n\n');
-        const chunk = mkChunk({ content, denseSuffix: SUFFIX });
+        const KEYED = 'cuisine: Thai. region: Austin';   // novel vs title + aWord/bWord content
+        const chunk = mkChunk({
+            content,
+            denseSuffix: KEYED,   // note-level proxy (budget reserve + id hash)
+            metadata: { ...META, properties: { cuisine: 'Thai', region: 'Austin' } },
+        });
         const budget = 64;
         expect(fakeCount(embedInput(chunk))).toBeGreaterThan(budget); // really splits
 
@@ -373,14 +383,15 @@ describe('dense suffix (frontmatter-into-dense)', () => {
         expect(r.splits).toBe(1);
         expect(r.chunks.length).toBeGreaterThan(1);
         for (const part of r.chunks) {
-            // suffix carried + appended last
-            expect(part.denseSuffix).toBe(SUFFIX);
-            expect(embedInput(part).endsWith(`\n\n${SUFFIX}`)).toBe(true);
+            // note-level proxy carried onto every part (drives budget + id)
+            expect(part.denseSuffix).toBe(KEYED);
+            // the keyed suffix (derived from properties) rides on EVERY part, last
+            expect(embedInput(part).endsWith(`\n\n${KEYED}`)).toBe(true);
             // composed input (suffix included) honors the budget
             expect(fakeCount(embedInput(part))).toBeLessThanOrEqual(budget);
-            // chunk_id == hash of the embedded bytes (notePath + embedInput)
+            // chunk_id == hash of notePath + title + content + proxy suffix
             expect(part.chunk_id).toBe(
-                chunkIdFor(part.note_path, part.title, part.content, SUFFIX));
+                chunkIdFor(part.note_path, part.title, part.content, KEYED));
         }
         // every original paragraph survived the re-pack (nothing truncated)
         const joined = r.chunks.map(c => c.content).join('\n\n');
@@ -510,5 +521,37 @@ describe('padding collapse + count gate (issue #4)', () => {
         // every row survives, in order, exactly once (tables never overlap-seed)
         const emitted = r.chunks.flatMap(c => c.content.split('\n').slice(2));
         expect(emitted).toEqual(rows);
+    });
+});
+
+// v12: split parts are packed and counted against what embedInput actually
+// embeds (dense title + keyed suffix), not the v10 note-level bag proxy. A
+// tiny bag proxy with a long keyed suffix used to let parts pack past budget
+// and report a count shorter than their real input, routing them into a seq
+// bucket too small for them and truncating the keyed suffix off the tail.
+describe('splitChunk budgets against the embedded keyed composition (v12)', () => {
+    const props: Record<string, string | string[]> = {
+        pageType: 'meeting',
+        project: 'zebracrossing quokkaflight',
+        venue: 'marmalade observatory',
+        attendees: ['alpha bravo', 'charlie delta', 'echo foxtrot', 'golf hotel'],
+    };
+    const chunk = mkChunk({
+        content: Array.from({ length: 12 }, (_, i) => makeParagraph(40, `p${i}`)).join('\n\n'),
+        denseSuffix: 'x',   // stale tiny bag proxy: must NOT be what gets reserved
+        metadata: { ...META, properties: props },
+    });
+
+    it('returns exact embedInput counts, all within budget, suffix intact', async () => {
+        const budget = 160;
+        const r = await enforceTokenBudget([chunk], counter, budget);
+        expect(r.chunks.length).toBeGreaterThan(1);
+        expect(r.overBudget).toBe(0);
+        r.chunks.forEach((part, i) => {
+            const text = embedInput(part);
+            expect(r.counts[i]).toBe(fakeCount(text));
+            expect(r.counts[i]).toBeLessThanOrEqual(budget);
+            expect(text).toContain('venue: marmalade observatory');
+        });
     });
 });

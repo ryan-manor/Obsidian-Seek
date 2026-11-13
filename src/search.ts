@@ -13,6 +13,7 @@ import { snapshotMemory, memoryDelta, distributionStats } from './types';
 import { MarkdownChunker, cyrb53Hex } from './chunker';
 import { cleanDenseText } from './dense-clean';
 import { extractBaseDocs } from './base-extractor';
+import { bm25fParamsFrom, type Bm25fKnobs } from './bm25f';
 import { MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, ANALYZER_VERSION, BM25_COVERAGE_POW, processQueryTerm } from './bm25';
 import { buildSynonymMap, chunkDeclaresAlias, buildPhraseMap, matchPhrases, SYNONYM_WEIGHT, type SynonymMap, type PhraseSynonymMap } from './synonyms';
 import { aggregateLinkPairs, mineLinkPairsByPath, mineLinkPairsForPaths, type LinkPairCount } from './link-dict';
@@ -25,7 +26,8 @@ import { LocalEmbedder, EMBEDDING_DIM, LEGACY_ENGLISH_MODEL_ID, MODEL_ID, PLUGIN
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
 import { selectIndexBucket } from './iframe-runner';
-import { enforceTokenBudget, embedInput, type TokenBudgetResult } from './token-budget';
+import { embedInput, type TokenBudgetResult } from './token-budget';
+import { packChunks } from './small-note';
 import { concatPacked, topNIndices, packSignBits } from './binary';
 import { selectTopNIndices } from './select';
 import { poolCaps, POOL_FLOORS } from './pool';
@@ -42,6 +44,7 @@ import { CompositorPacer, cheapYield } from './pacer';
 import { isMobilePlatform, residentInt8Enabled } from './platform';
 import { parseQuery, compileMatcher, excludedNotePaths } from './query-parser';
 import { buildPassageTerms, passageWindow, type PassageTerm } from './passage';
+import { pickDisplayChunk, DISPLAY_POOL_DEPTH } from './display-chunk';
 import { enumerateNumberPropertyNames } from './prop-types';
 
 // Indexing batches via PER-BUCKET ROLLING BUFFERS (2026-06-03 redesign).
@@ -88,7 +91,7 @@ const ROLLING_MAX = 8;
 // is at a floor only threads (COOP/COEP, Obsidian-core) would move. Reverted
 // to one shared sizing: on wasm the budget also caps the synchronous
 // main-thread stall per dispatch, which batch=4 made ~4× worse for nothing.
-function rollingBatchFor(bucket: number): number {
+export function rollingBatchFor(bucket: number): number {
     return Math.max(1, Math.min(ROLLING_MAX, Math.round(ROLLING_BUDGET / bucket)));
 }
 
@@ -215,6 +218,12 @@ export interface SearchOverride {
 // this.settings for that lever.
 export interface ExperimentOverride {
     synonymsV2?: boolean;
+    // BM25F vs the legacy per-field-sum lexical model for THIS query only
+    // (seek:search bm25f=true|false). Absent ⇒ settings.bm25f.
+    bm25f?: boolean;
+    // Per-query BM25F knob overrides (seek:search title= aliases= props= body= k1=),
+    // layered over the settings values. Only consulted when BM25F is on.
+    bm25fKnobs?: Partial<Bm25fKnobs>;
 }
 
 // 1C: an index pass's deferred sidecar flush. embedAndCommitFiles always runs
@@ -276,6 +285,51 @@ export class SearchOrchestrator {
     // full reindex (reindexAllInner) clears the map so it is always retried then.
     private static readonly UNREADABLE_QUARANTINE_MS = 30 * 60 * 1000; // 30 min
     private unreadableQuarantine = new Map<string, number>();
+
+    // Paths whose IDB commit failed (transaction aborted / failed — on iOS most
+    // often the OS killing in-flight transactions when the app is backgrounded).
+    // The un-committed file stays dirty, so computeDelta re-finds it and the
+    // catch-up drain retries it. The backoff bounds that retry so a file whose
+    // commit fails DETERMINISTICALLY can't be hammered every drain: attempts are
+    // spaced by COMMIT_RETRY_BACKOFF_MS, and after the last step the path is
+    // parked until its content changes (mtime moves), the next full reindex, or a
+    // plugin reload (the map is in-memory — one retry per launch is the floor).
+    // A successful commit clears the entry.
+    static readonly COMMIT_RETRY_BACKOFF_MS = [60_000, 10 * 60_000, 60 * 60_000];
+    private commitFailures = new Map<string, { attempts: number; until: number; mtime: number }>();
+
+    private noteCommitFailure(file: TFile): void {
+        const prev = this.commitFailures.get(file.path);
+        // A content change since the last failure starts a fresh budget.
+        const attempts = prev && prev.mtime === file.stat.mtime ? prev.attempts + 1 : 1;
+        const steps = SearchOrchestrator.COMMIT_RETRY_BACKOFF_MS;
+        const until = attempts <= steps.length ? Date.now() + steps[attempts - 1] : Number.POSITIVE_INFINITY;
+        this.commitFailures.set(file.path, { attempts, until, mtime: file.stat.mtime });
+        if (until === Number.POSITIVE_INFINITY) {
+            console.warn(`[seek] commit failed ${attempts}× — parking until the note changes or the next full reindex: ${file.path}`);
+        }
+    }
+
+    // True while a commit-failed path is inside its backoff window. An edit
+    // (mtime moved past the failing version) lifts it immediately.
+    private isCommitBackedOff(f: TFile): boolean {
+        const e = this.commitFailures.get(f.path);
+        if (!e) return false;
+        if (f.stat.mtime !== e.mtime) { this.commitFailures.delete(f.path); return false; }
+        return Date.now() < e.until;
+    }
+
+    // Earliest moment a backed-off commit retry becomes due, or null when none
+    // is pending (parked paths don't count). main.ts arms a one-shot catch-up
+    // timer from this so a transient abort is retried in ~1 min, not on the
+    // 20-min stranded-delta backstop.
+    nextCommitRetryAt(): number | null {
+        let next: number | null = null;
+        for (const e of this.commitFailures.values()) {
+            if (Number.isFinite(e.until) && (next === null || e.until < next)) next = e.until;
+        }
+        return next;
+    }
 
     // Last time the "storage full" Notice was shown (epoch ms). Rate-limits the
     // toast across passes (see QUOTA_NOTICE_MIN_INTERVAL_MS); the check line +
@@ -512,6 +566,7 @@ export class SearchOrchestrator {
         // the backoff map so a file that has since become readable (e.g. an
         // iCloud placeholder that finished downloading) isn't skipped here too.
         this.unreadableQuarantine.clear();
+        this.commitFailures.clear();
 
         // Reset. Close our long-lived connection first so deleteDatabase
         // isn't blocked by us, then re-open the (fresh, empty) DB.
@@ -976,6 +1031,7 @@ export class SearchOrchestrator {
                 } else {
                     filesCommitted++;
                 }
+                this.commitFailures.delete(p.fs.file.path);
                 // Real progress for the catch-up drain — quarantined files too:
                 // their record is written, so they are non-dirty by the drain's
                 // own criterion and must not be re-fed to the embed loop.
@@ -995,7 +1051,11 @@ export class SearchOrchestrator {
                 // (S2). Still per-file skip, not a pass abort — quota can clear
                 // mid-pass (another app releases space), and the un-committed files
                 // stay dirty for catch-up either way.
+                // Quota is the disk, not the note: no per-note backoff, so
+                // catch-up heals the moment space frees (quotaToast rate-limits
+                // the noise). Every other commit failure is backed off.
                 if (isQuotaError(ce)) filesSkippedQuota++;
+                else this.noteCommitFailure(p.fs.file);
                 await this.logger.appendError(`commitFile:${p.fs.file.path}`, ce);
             }
         };
@@ -1164,7 +1224,7 @@ export class SearchOrchestrator {
             let budgeted: TokenBudgetResult;
             try {
                 const tbStart = performance.now();
-                budgeted = await enforceTokenBudget(fileChunks, ts => this.embedder.tokenCounts(ts));
+                budgeted = await packChunks(fileChunks, ts => this.embedder.tokenCounts(ts));
                 chunkMs += performance.now() - tbStart;
             } catch (e) {
                 filesSkippedError++;
@@ -1645,15 +1705,14 @@ export class SearchOrchestrator {
             // dropped record makes classifyFileDelta report 'dirty' forever (see
             // the quarantine field comment), wedging every computeDelta caller.
             if (this.isQuarantined(f.path)) continue;
-            const prev = stored.get(f.path);
-            let decision = classifyFileDelta(prev, f.stat.mtime, undefined, PLUGIN_VERSION);
-            if (decision === 'check-bytes') {
-                try {
-                    decision = classifyFileDelta(prev, f.stat.mtime, cyrb53Hex(await this.app.vault.cachedRead(f)), PLUGIN_VERSION);
-                } catch {
-                    decision = 'dirty';   // unreadable → let the embed path decide
-                    this.quarantineUnreadable(f.path); // give it this one attempt, then back off
-                }
+            // Same for a commit-failed path inside its retry backoff.
+            if (this.isCommitBackedOff(f)) continue;
+            let decision: 'dirty' | 'clean';
+            try {
+                decision = await this.classifyLiveFile(f, stored.get(f.path));
+            } catch {
+                decision = 'dirty';   // unreadable → let the embed path decide
+                this.quarantineUnreadable(f.path); // give it this one attempt, then back off
             }
             if (decision === 'dirty') dirty.push(f.path);
         }
@@ -1662,6 +1721,18 @@ export class SearchOrchestrator {
             if (!livePaths.has(path)) deleted.push(path);
         }
         return { dirty, deleted };
+    }
+
+    // The one "did this file really change?" rule, shared by computeDelta and the
+    // live enqueue (main.ts enqueueIfDirty). Reads + hashes the bytes only when
+    // the mtime moved on a hash-bearing record, so an iCloud mtime re-stamp with
+    // identical content resolves 'clean' instead of queueing a no-op re-index.
+    // Throws if the file can't be read; callers decide what that means.
+    async classifyLiveFile(f: TFile, prev: FileRecord | undefined): Promise<'dirty' | 'clean'> {
+        const quick = classifyFileDelta(prev, f.stat.mtime, undefined, PLUGIN_VERSION);
+        if (quick !== 'check-bytes') return quick;
+        const hash = cyrb53Hex(await this.app.vault.cachedRead(f));
+        return classifyFileDelta(prev, f.stat.mtime, hash, PLUGIN_VERSION) === 'dirty' ? 'dirty' : 'clean';
     }
 
     // ── Heal a version-mismatched index WITHOUT a full re-embed, when it is provably
@@ -1857,7 +1928,23 @@ export class SearchOrchestrator {
                 }
 
                 // Phase 2: embed dirty files (only when we can do it now).
-                const indexable = dirtyPaths.filter(p => this.shouldIndex(p));
+                // Re-classify under the mutex: a path queued while the store was
+                // empty or mid-rebuild (a vault 'modify' during a full reindex —
+                // iCloud re-stamps mtimes on every foreground) was judged dirty
+                // against a missing record. Now that the pass has committed, an
+                // unchanged file reads 'clean' and costs nothing more. Observed
+                // 2026-11-11: 4,161 queued post-reindex, ~1,200 rewritten for
+                // nothing before iOS killed the backgrounded app mid-pass.
+                const indexable: string[] = [];
+                for (const p of dirtyPaths) {
+                    if (!this.shouldIndex(p)) continue;
+                    const f = this.app.vault.getAbstractFileByPath(p);
+                    if (!(f instanceof TFile)) continue;
+                    let decision: 'dirty' | 'clean' = 'dirty';
+                    try { decision = await this.classifyLiveFile(f, await this.store.getFileRecord(p)); }
+                    catch { /* unreadable → let the embed path decide, as before */ }
+                    if (decision === 'dirty') indexable.push(p);
+                }
                 let embedded: IndexCompleteEntry | null = null;
                 let deferredEmbed = 0;
                 let sidecarHydrated = 0;
@@ -2758,7 +2845,7 @@ export class SearchOrchestrator {
     // notes indexing splits oversize chunks into new contents → new ids. Without
     // reproducing that split here, the sidecar lookup missed every split note
     // (hydrated:0 → fell back to a full on-device re-embed → iPhone jetsam; see
-    // the 2026-06-14 forensics). Loads the tokenizer ONLY (a few MB, no ~250 MB
+    // the 2026-06-14 forensics). Loads the tokenizer ONLY (25 MB file, no ~250 MB
     // model) so the hydrate stays mobile-safe.
     private async reChunkLive(): Promise<ReChunkedNote[]> {
         await this.embedder.ensureTokenizer();
@@ -2773,7 +2860,7 @@ export class SearchOrchestrator {
             let chunks = this.chunksFor(content, f.path, new Date(f.stat.mtime).toISOString());
             if (chunks.length === 0) continue;
             try {
-                chunks = (await enforceTokenBudget(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
+                chunks = (await packChunks(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
             } catch (e) {
                 // Tokenizer hiccup on one note — skip its hydrate (it just embeds
                 // later via the catch-up); never abort the whole hydrate.
@@ -2834,7 +2921,7 @@ export class SearchOrchestrator {
             let chunks = this.chunksFor(content, f.path, new Date(f.stat.mtime).toISOString());
             if (chunks.length === 0) continue; // genuinely empty note — no ids, not a skip
             try {
-                chunks = (await enforceTokenBudget(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
+                chunks = (await packChunks(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
             } catch (e) {
                 complete = false; // tokenizer hiccup → incomplete
                 await this.logger.appendError(`collectLiveIds-tokenBudget:${f.path}`, e);
@@ -3123,7 +3210,7 @@ export class SearchOrchestrator {
             let chunks = this.chunksFor(content, f.path, new Date(f.stat.mtime).toISOString());
             if (chunks.length === 0) continue;
             try {
-                chunks = (await enforceTokenBudget(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
+                chunks = (await packChunks(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
             } catch (e) {
                 await this.logger.appendError(`dedupViaSidecar-tokenBudget:${f.path}`, e);
                 continue;
@@ -3253,7 +3340,7 @@ export class SearchOrchestrator {
             let chunks = this.chunksFor(content, f.path, new Date(f.stat.mtime).toISOString());
             if (chunks.length === 0) continue;
             try {
-                chunks = (await enforceTokenBudget(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
+                chunks = (await packChunks(chunks, ts => this.embedder.tokenCounts(ts))).chunks;
             } catch (e) {
                 await this.logger.appendError(`carryOver-tokenBudget:${f.path}`, e);
                 continue;
@@ -3347,7 +3434,7 @@ export class SearchOrchestrator {
     //   S1  union of three candidate gens, fed by the resident tier:
     //         a. binary-top-N — asymmetric float·sign-bit dot product
     //         b. bm25-top-M   — multi-field BM25F (cached)
-    //         c. recency-top-K — newest by frontmatter `created` (mtime fallback)
+    //         c. recency-top-K — newest by the selected date field (recencyDate; undated notes skipped)
     //   S2  fp32 exact rerank ONLY over the union: load fp32 vectors for the
     //       union ids, cosine, then run the shipped α-min-max-hybrid + recency
     //       + title boost over the subset
@@ -3608,6 +3695,16 @@ export class SearchOrchestrator {
         // otherwise. The phrase dictionary is built lazily on the first search
         // with the valve on (ensurePhraseCache), so OFF costs nothing.
         const synV2 = expOverride?.synonymsV2 ?? this.settings.synonymsV2;
+        // BM25F field model (settings.bm25f, default ON): per-call CLI override wins
+        // (seek:search bm25f=false is the live A/B against the per-field sum).
+        // Score-time only: both models read the same MiniSearch index.
+        const useBm25f = expOverride?.bm25f ?? this.settings.bm25f;
+        // Knobs: BM25F_KNOB_DEFAULTS unless a per-query override (seek:search title=
+        // aliases= props= body= k1=) sets one. bm25fParamsFrom fills missing keys with
+        // defaults, clamps out-of-range values, and returns the BM25F_PARAMS singleton
+        // at defaults; the BM25 cache's UB(t) memo is keyed by the params VALUE, so an
+        // override can never serve a stale bound.
+        const bfParams = useBm25f ? bm25fParamsFrom({ ...expOverride?.bm25fKnobs }) : undefined;
         // Phrase-trigger pre-scan (v2 Stage 1): phrase detection cannot ride
         // MiniSearch's per-token processTerm hook, so the query is scanned HERE
         // and resolved mates ride the synonyms override below. Scans
@@ -3623,6 +3720,9 @@ export class SearchOrchestrator {
         // re-ranks the pool without shrinking recall.
         const { scores: bm25Scores, coverage: bm25Coverage, bound: bm25Bound } = this.bm25Cache!.getScoresWithCoverage(cleanedQuery, {
             boosts: this.bm25FieldBoosts(),
+            // BM25F ignores `boosts` (it reads BM25F_PARAMS.weights); the legacy
+            // per-field sum ignores `bm25f` being absent. See bm25f.ts.
+            ...(bfParams && { bm25f: bfParams }),
             // Explicit on/off so the toggles deterministically override the
             // index's baked-in fuzzy:false / prefix:false. Fuzzy "on" = edit
             // distance scaled by term length (≤2 exact / 3–5 = 1 / ≥6 = 2),
@@ -3649,7 +3749,7 @@ export class SearchOrchestrator {
         const bm25Ms = performance.now() - bm25Start;
 
         // ---- S1c: recency candidate-gen ---------------------------------
-        // Sorts by frontmatter `created` (mtime fallback), descending — same
+        // Sorts by the selected date field (recencyDate, strict), descending — same
         // source the reranker scores on (see topByRecency / ranker.ts). Cheap
         // (one pass + sort) and the arm is purely for *coverage* of recent notes
         // that may not surface via
@@ -3751,6 +3851,16 @@ export class SearchOrchestrator {
             recencyHalfLifeDays: override?.halfLifeDays ?? this.settings.recencyHalfLifeDays,
             recencyKey: this.settings.recencyKey,
             createdProp: this.settings.createdProp,
+            // Title-gate typo tolerance rides the fuzzy toggle: a query token OOV
+            // in the lexical index may fuzz onto a title token within the same
+            // FUZZY_BY_LENGTH budget the BM25 channel used (fusion.ts TitleFuzzy).
+            ...(this.settings.fuzzyEnabled && this.bm25Cache && {
+                titleFuzzy: (tok: string) => {
+                    const cache = this.bm25Cache;
+                    if (!cache || cache.hasIndexedTerm(tok)) return 0;
+                    return FUZZY_BY_LENGTH(tok) || 0;
+                },
+            }),
         };
         const fusionStart = performance.now();
         // Dedup over the FULL scored candidate union, not a topK-proportional
@@ -3803,6 +3913,9 @@ export class SearchOrchestrator {
         // weight inside buildPassageTerms, never a throw).
         const passageTerms = buildPassageTerms(
             cleanedQuery, t => this.bm25Cache?.termDocFraction(t) ?? 0);
+        // Display-only: show the sibling chunk that covers more of the query
+        // (display-chunk.ts). Rank, score, and signals stay the ranking chunk's.
+        const displaySwaps = await this.selectDisplayChunks(results, rankedPool, passageTerms);
         for (const r of results) r.snippet = makeSnippet(r.content, passageTerms, 200);
         const snippetMs = performance.now() - snippetStart;
 
@@ -3876,10 +3989,18 @@ export class SearchOrchestrator {
             ...(synV2 && { synonymsV2: true, phraseMatesFired: phraseMates.length }),
             searchableProperties: this.settings.searchableProperties,
             headingsField: this.settings.headingsField,
+            lexicalModel: useBm25f ? 'bm25f' : 'sum',
+            ...(bfParams && {
+                bm25fKnobs: {
+                    title: bfParams.weights.title, aliases: bfParams.weights.aliases,
+                    properties: bfParams.weights.properties, body: bfParams.weights.content, k1: bfParams.k1,
+                },
+            }),
             // Theoretical BM25 bound for this query (0 = bound had no opinion →
             // fusion used the empirical-max fallback). Diagnoses weak-lexical
             // queries: max(rawBm25)/bm25Bound is the channel's confidence.
             bm25Bound: parseFloat(bm25Bound.toFixed(4)),
+            ...(displaySwaps.length > 0 && { displaySwaps }),
             searchId,
         };
         await this.logger.append(entry);
@@ -4160,6 +4281,12 @@ export class SearchOrchestrator {
                 this.taskCtx?.pop('bm25-warm');
             }
         }
+        // BM25F state (bm25f.ts): one O(postings) lengths sweep per fit/load (~35 ms
+        // desktop at 7k chunks), paid here with the cache build instead of inside the
+        // first keystroke's bm25 stage. Idempotent: a built state returns at once
+        // (after a delta it only re-maps rows). A per-query bm25f=true CLI override
+        // with the setting off builds it lazily on that query instead.
+        if (this.settings.bm25f) this.bm25Cache?.warmBm25f();
         if (this.settings.synonymExpansion && !this.synonymCache) {
             // O(notes) build, trivially cheap next to fit(); df ceiling reads
             // the freshly (re)built BM25 index. Telemetry: dictionary shape +
@@ -4484,6 +4611,43 @@ export class SearchOrchestrator {
         for (let i = 0; i < results.length; i++) results[i].content = bodies[i] ?? '';
     }
 
+    // Replace each result (in place) with its display chunk; see display-chunk.ts.
+    // Siblings come from the top DISPLAY_POOL_DEPTH of the ranked pool, bodies in
+    // one batched read. .base results are skipped: their heading_path selects a
+    // view, so swapping would change which view opens. The swapped row keeps the
+    // ranking chunk's score/signals (title-nav open reads title_boost) and records
+    // its id in rank_chunk_id for click telemetry.
+    private async selectDisplayChunks(
+        results: ScoredChunk[],
+        rankedPool: ScoredChunk[],
+        terms: PassageTerm[],
+    ): Promise<Array<{ note_path: string; rank_chunk_id: string; display_chunk_id: string }>> {
+        const swaps: Array<{ note_path: string; rank_chunk_id: string; display_chunk_id: string }> = [];
+        if (terms.length === 0) return swaps;
+        const byPath = new Map<string, ScoredChunk[]>();
+        for (const r of results) if (!r.note_path.endsWith('.base')) byPath.set(r.note_path, []);
+        for (const c of rankedPool.slice(0, DISPLAY_POOL_DEPTH)) byPath.get(c.note_path)?.push(c);
+        const rankIds = new Set(results.map(r => r.chunk_id));
+        const need = [...byPath.values()].flat().filter(c => !rankIds.has(c.chunk_id));
+        if (need.length === 0) return swaps;
+        const bodies = await this.store.getBodiesByIds(need.map(c => c.chunk_id));
+        // A sibling whose body is missing from the store can't be a display chunk:
+        // it would win on its heading alone and then render an empty snippet.
+        const sibs = new Map<string, ScoredChunk>();
+        need.forEach((c, i) => { const b = bodies[i]; if (b != null) sibs.set(c.chunk_id, { ...c, content: b }); });
+        for (let i = 0; i < results.length; i++) {
+            const r = results[i];
+            const pool = byPath.get(r.note_path);
+            if (!pool) continue;
+            const siblings = pool.flatMap(c => sibs.get(c.chunk_id) ?? []);
+            const d = pickDisplayChunk(r, siblings, terms, snippetPlainText);
+            if (d === r) continue;
+            results[i] = { ...d, score: r.score, ranking_signals: r.ranking_signals, rank_chunk_id: r.chunk_id };
+            swaps.push({ note_path: r.note_path, rank_chunk_id: r.chunk_id, display_chunk_id: d.chunk_id });
+        }
+        return swaps;
+    }
+
     private topByRecency(chunks: ChunkMeta[], k: number, mask?: boolean[] | null): number[] {
         // Parse each eligible chunk's recency date once into a parallel buffer;
         // NaN marks ineligible (filtered out by mask, or no parseable date).
@@ -4578,6 +4742,9 @@ export class SearchOrchestrator {
     // once the coverage navigational boost is in). Passed to getScores per-query;
     // the cached index is boost-agnostic so there's no reindex on change.
     private bm25FieldBoosts(): Record<string, number> {
+        // Per-field-sum boosts: the BM25F model (settings.bm25f) ignores them and
+        // reads BM25F_PARAMS.weights, so under BM25F this preset only matters for
+        // its index-shape half (headings forced on in ensureBm25).
         if (!this.settings.boostedBm25) return DEFAULT_FIELD_BOOSTS;
         // "Boosted BM25" preset: lift the name/structure fields (aliases→9,
         // headings→4) and trim noisy tags (→2); title/content/properties keep

@@ -56,6 +56,36 @@ describe('MarkdownChunker — lexical-only fallback flag', () => {
         expect(chunks[0].content.length).toBeGreaterThan(0);
     });
 
+    // 2026-09-08: byte-length was the wrong test for "content-free". A body that
+    // is nothing but headings clears `length === 0` while contributing nothing the
+    // dense title doesn't already carry. 137 of the reference vault's 231
+    // headings-only notes escaped the floor this way.
+    it('body is only an H1 restating the title => lexicalOnly', () => {
+        const content = '---\npageType: dailyNotes\n---\n# January 01, 2026\n';
+        const chunks = chunker.chunkContent(content, 'Notes/Daily/2026-01-01.md');
+        expect(chunks).toHaveLength(1);
+        expect(chunks[0].lexicalOnly).toBe(true);
+    });
+
+    // The half that actually carried the measured harm: a TOPICAL title whose body
+    // only echoes it. A title-echo vector with no body to dilute it outranks notes
+    // that genuinely discuss the topic.
+    it('body is only headings under a topical title => lexicalOnly', () => {
+        const content = '# Lightroom eval plan\n\n## Notes\n\n## Attendees\n';
+        const chunks = chunker.chunkContent(content, 'Meetings/Lightroom eval plan - 2025-03-31.md');
+        expect(chunks).toHaveLength(1);
+        expect(chunks[0].lexicalOnly).toBe(true);
+    });
+
+    // The predicate must not swallow a stub that has real prose under a heading —
+    // that fallback still has something to embed.
+    it('heading PLUS a line of prose => NOT lexicalOnly', () => {
+        const content = '# Bob\n\nMet re: pricing.';
+        const chunks = chunker.chunkContent(content, 'People/Bob.md');
+        expect(chunks).toHaveLength(1);
+        expect(chunks[0].lexicalOnly).toBeUndefined();
+    });
+
     it('normal multi-section note => no chunk is lexicalOnly', () => {
         const body = 'x'.repeat(80);
         const content = `# Heading\n\n${body}\n\n## Sub\n\n${body}`;

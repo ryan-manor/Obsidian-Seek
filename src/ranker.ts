@@ -18,7 +18,7 @@
 // nDCG. The gate is deleted; see [[seek-empty-stub-dense-pollution]].
 
 import { DEFAULT_SETTINGS, type ChunkMeta, type ScoredChunk, type RecencyKeyChoice } from './types';
-import { theoreticalNormDense, theoreticalNormBm25, hybridFusion, computeRecencyScore, recencyDate, titleMatchBoost } from './fusion';
+import { theoreticalNormDense, theoreticalNormBm25, hybridFusion, computeRecencyScore, recencyDate, titleMatchBoost, type TitleFuzzy } from './fusion';
 
 // (BlendMode deleted 2026-06-11: the opt-in 'rrf' mode is gone — linear TM2C2
 // is the only fusion. RRF lost the head-to-heads and discards score magnitude;
@@ -31,6 +31,11 @@ export interface RankingConfig {
     recencyKey: RecencyKeyChoice;
     createdProp: string;
     titleBoost: number;
+    // Typo tolerance for the title gate (fusion.ts TitleFuzzy): per query token,
+    // the edit budget it may fuzz by against title tokens. search.ts supplies it
+    // (OOV-in-index tokens only, FUZZY_BY_LENGTH budget) when fuzzy is on; absent
+    // = exact/prefix only, the pre-2026-11-12 behavior.
+    titleFuzzy?: TitleFuzzy;
 }
 
 // ONE source of truth: the ranking defaults ARE the plugin's shipped settings
@@ -125,7 +130,7 @@ export function rank(
         });
     }
 
-    const titleBoost = titleMatchBoost(query, chunks, config.titleBoost);
+    const titleBoost = titleMatchBoost(query, chunks, config.titleBoost, true, config.titleFuzzy);
 
     const final = new Float64Array(n);
     for (let i = 0; i < n; i++) final[i] = hybrid[i] + config.recencyEpsilon * recency[i] + titleBoost[i];

@@ -5,7 +5,8 @@
 // background asymmetry is unit-tested in isolation.
 
 export interface UnloadGateState {
-    // The model is actually loaded — nothing to free otherwise.
+    // Something is resident in the iframe: the model, or (since 2026-10-13) a
+    // standalone tokenizer from a hydrate-only session. Nothing to free otherwise.
     loaded: boolean;
     // A compute task (search / indexing / reindex) is mid-flight:
     // currentTaskContext !== 'idle'. Tearing down now would DISPOSE its embed.

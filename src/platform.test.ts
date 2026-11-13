@@ -1,6 +1,6 @@
 // Per-device compute-backend resolution: the capability allowlist, the manual
 // override precedence, and the crash-demote tripwire. These decide WebGPU vs
-// WASM per physical device, so the Android-tablet-stays-WASM and
+// WASM per physical device, so the never-ORT-WebGPU-on-phones/Android and
 // demote-only-on-WebGPU assertions are the load-bearing ones.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -16,6 +16,7 @@ import {
     clearWebgpuDemoted,
     recordActiveBackend,
     maybeDemoteOnCrash,
+    isUnexpectedGpuLoss,
     residentInt8Enabled,
     RESIDENT_INT8_MAX_BYTES,
 } from './platform';
@@ -44,30 +45,29 @@ beforeEach(() => {
 });
 
 describe('capability allowlist (no override, no demote)', () => {
-    it('desktop → auto (WebGPU)', () => {
+    it('desktop → Seek engine, ORT ladder fallback', () => {
         setDevice('desktop');
-        expect(resolveDevice()).toBe('auto');
+        expect(resolveDevice()).toBe('wgsl');
     });
 
-    it('iPad → auto (WebGPU)', () => {
+    it('iPad → Seek engine, ORT ladder fallback', () => {
         setDevice('ipad');
-        expect(resolveDevice()).toBe('auto');
+        expect(resolveDevice()).toBe('wgsl');
     });
 
-    it('iPhone → wasm', () => {
+    it('iPhone → Seek engine, CPU-only fallback (never ORT WebGPU)', () => {
         setDevice('iphone');
-        expect(resolveDevice()).toBe('wasm');
+        expect(resolveDevice()).toBe('wgsl-wasm');
     });
 
-    it('Android phone → wasm', () => {
+    it('Android phone → Seek engine, CPU-only fallback (never ORT WebGPU)', () => {
         setDevice('android-phone');
-        expect(resolveDevice()).toBe('wasm');
+        expect(resolveDevice()).toBe('wgsl-wasm');
     });
 
-    it('Android tablet → wasm (allowlist, NOT mobile-minus-iPhone)', () => {
-        // The whole point of an allowlist: an untested tablet stays safe.
+    it('Android tablet → Seek engine, CPU-only fallback (not the iPad ORT ladder)', () => {
         setDevice('android-tablet');
-        expect(resolveDevice()).toBe('wasm');
+        expect(resolveDevice()).toBe('wgsl-wasm');
     });
 });
 
@@ -78,16 +78,30 @@ describe('manual override precedence', () => {
         expect(resolveDevice()).toBe('wasm');
     });
 
-    it('force webgpu maps to auto even on iPhone', () => {
+    it('force webgpu → Seek engine with the full ORT fallback, even on iPhone', () => {
         setDevice('iphone');
         setBackendOverride('webgpu');
-        expect(resolveDevice()).toBe('auto');
+        expect(resolveDevice()).toBe('wgsl');
+    });
+
+    it('force webgpu turns the GPU on for Android too', () => {
+        setDevice('android-phone');
+        setBackendOverride('webgpu');
+        expect(resolveDevice()).toBe('wgsl');
+    });
+
+    it('retired opt-ins (webgpu-query, wgsl) migrate to webgpu and persist', () => {
+        for (const old of ['webgpu-query', 'wgsl']) {
+            localStorage.setItem('seek-backend-override', old);
+            expect(getBackendOverride()).toBe('webgpu');
+            expect(localStorage.getItem('seek-backend-override')).toBe('webgpu');
+        }
     });
 
     it('explicit auto falls back to the allowlist', () => {
         setDevice('android-tablet');
         setBackendOverride('auto');
-        expect(resolveDevice()).toBe('wasm');
+        expect(resolveDevice()).toBe('wgsl-wasm');
     });
 
     it('override round-trips through localStorage', () => {
@@ -101,11 +115,27 @@ describe('manual override precedence', () => {
 });
 
 describe('demote tripwire', () => {
+    it('a demoted iPhone resolves to wasm on the auto path', () => {
+        setDevice('iphone');
+        recordActiveBackend('webgpu');   // Seek engine loads record 'webgpu'
+        expect(maybeDemoteOnCrash('crash-while-indexing-foreground')).toBe(true);
+        expect(resolveDevice()).toBe('wasm');
+        setBackendOverride('webgpu');    // explicit opt-in beats (and clears) it
+        expect(resolveDevice()).toBe('wgsl');
+    });
+
     it('a demoted iPad resolves to wasm on the auto path', () => {
         setDevice('ipad');
         recordActiveBackend('webgpu');
         expect(maybeDemoteOnCrash('crash-while-indexing-foreground')).toBe(true);
         expect(isWebgpuDemoted()).toBe(true);
+        expect(resolveDevice()).toBe('wasm');
+    });
+
+    it('a demoted Android phone resolves to wasm on the auto path', () => {
+        setDevice('android-phone');
+        recordActiveBackend('webgpu');
+        expect(maybeDemoteOnCrash('crash-while-indexing-foreground')).toBe(true);
         expect(resolveDevice()).toBe('wasm');
     });
 
@@ -116,7 +146,7 @@ describe('demote tripwire', () => {
         recordActiveBackend('webgpu');
         maybeDemoteOnCrash('crash-while-indexing-foreground');
         setDevice('desktop');
-        expect(resolveDevice()).toBe('auto');
+        expect(resolveDevice()).toBe('wgsl');
     });
 
     it('forcing WebGPU clears a sticky demote', () => {
@@ -133,7 +163,7 @@ describe('demote tripwire', () => {
         recordActiveBackend('webgpu');
         maybeDemoteOnCrash('crash-while-indexing-foreground');
         clearWebgpuDemoted();
-        expect(resolveDevice()).toBe('auto');
+        expect(resolveDevice()).toBe('wgsl');
     });
 });
 
@@ -201,5 +231,20 @@ describe('residentInt8Enabled — B2 resident-block memory gate', () => {
         expect(Number.isInteger(rows)).toBe(true);
         expect(residentInt8Enabled(rows, embDim)).toBe(true);
         expect(residentInt8Enabled(rows + 1, embDim)).toBe(false);
+    });
+});
+
+describe('isUnexpectedGpuLoss', () => {
+    it('a real device loss fails in-flight RPCs', () => {
+        expect(isUnexpectedGpuLoss({ kind: 'webgpu-device-lost', reason: 'unknown' })).toBe(true);
+    });
+
+    it('our own destroy() (failed Seek-engine load on the way to WASM) does not', () => {
+        expect(isUnexpectedGpuLoss({ kind: 'webgpu-device-lost', reason: 'destroyed' })).toBe(false);
+    });
+
+    it('other GPU events never do', () => {
+        expect(isUnexpectedGpuLoss({ kind: 'webgpu-device-created' })).toBe(false);
+        expect(isUnexpectedGpuLoss({ kind: 'webgpu-uncaptured-error' })).toBe(false);
     });
 });

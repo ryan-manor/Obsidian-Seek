@@ -118,3 +118,32 @@ describe('iframe child WASM fallback — preserves the WebGPU failure cause', ()
         expect(second).toBeGreaterThan(first);
     });
 });
+
+// A WebGPU call that hangs (rather than rejects) must not strand the Seek-engine
+// load until the parent's 180 s RPC timeout: each GPU step is bounded so the
+// load throws and loadModel falls back to ORT WASM (Android WebView drivers).
+describe('iframe child Seek engine — bounded GPU steps', () => {
+    const script = buildChildScript('https://example.com/cdn', 384);
+
+    it('bounds adapter, device, encoder create and self-test, not the weight download', () => {
+        const fnStart = script.indexOf('async function loadWgsl');
+        const body = script.slice(fnStart, script.indexOf('async function loadModel', fnStart));
+        expect(body).toContain("gpuStep(navigator.gpu.requestAdapter(), 'requestAdapter')");
+        expect(body).toContain("gpuStep(deviceP, 'requestDevice')");
+        expect(body).toContain("'encoder create'");
+        expect(body).toContain("gpuStep(enc.embed([WGSL_SELFTEST.ids]), 'self-test')");
+        expect(body).not.toMatch(/gpuStep\(\s*wgslFetch/);
+        // A device that resolves after its timeout is released.
+        expect(body).toContain('deviceP.then((d) => { try { d.destroy(); }');
+    });
+
+    it('gpuStep rejects a hung promise and passes a settled one through', async () => {
+        const start = script.indexOf('function gpuStep');
+        const end = script.indexOf('\n}\n', start) + 2;
+        // eslint-disable-next-line @typescript-eslint/no-implied-eval
+        const gpuStep = new Function('WGSL_GPU_STEP_MS', script.slice(start, end) + '\nreturn gpuStep;')(20000) as
+            (p: Promise<unknown>, label: string, ms?: number) => Promise<unknown>;
+        await expect(gpuStep(new Promise(() => {}), 'requestDevice', 20)).rejects.toThrow('WGSL requestDevice timed out after 20 ms');
+        await expect(gpuStep(Promise.resolve('dev'), 'requestDevice', 20)).resolves.toBe('dev');
+    });
+});

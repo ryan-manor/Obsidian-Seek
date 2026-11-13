@@ -28,7 +28,8 @@ import { IndexStore, indexDbPrefix } from './index-store';
 import { SeekLogger } from './logger';
 import { Forensics } from './forensics';
 import { RecentSearches } from './recents';
-import { SearchOrchestrator, driftRecoveryDecision, type SearchOverride, type ExperimentOverride } from './search';
+import { SearchOrchestrator, driftRecoveryDecision, shouldIndexPath, type SearchOverride, type ExperimentOverride } from './search';
+import type { Bm25fKnobs } from './bm25f';
 import { SeekSearchModal, TITLE_NAV_COVERAGE_MIN, titleNavCoverage, type IndexBanner, type ResultOpenInfo } from './search-modal';
 import {
     buildNoteLink,
@@ -39,7 +40,7 @@ import {
 } from './insert-link';
 import { indexBannerSpec, INDEX_STALE_MSG, INDEX_SYNCING_MSG, INDEX_PEER_AHEAD_MSG, type DegradedReason } from './index-notice';
 import { SeekSettingTab } from './settings-tab';
-import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash } from './platform';
+import { collectPlatformInfo, isMobilePlatform, resolveDevice, recordActiveBackend, maybeDemoteOnCrash, isUnexpectedGpuLoss } from './platform';
 import { CompositorPacer } from './pacer';
 import { shouldUnloadEmbedder, type UnloadGateState } from './embedder-lifecycle';
 import { drainCatchUp, CATCHUP_MAX_FILES_PER_BURST, CATCHUP_BURST_BUDGET_MS } from './catchup';
@@ -90,6 +91,11 @@ const CATCHUP_REARM_INTERVAL_MS = 20 * 60 * 1000;
 // timer counts as `pending`), not by the relative size of these constants.
 // Checked on a coarse interval — a minute of slack on a 3-minute idle is fine.
 const IDLE_UNLOAD_MS = 3 * 60 * 1000;
+// Tokenizer-only iframes (hydrate path, no model) idle out slower: longer than
+// the 5-min periodicReconcile poll, so a peer flushing to the sidecar every
+// poll keeps one resident tokenizer instead of a re-parse (25 MB JSON) per tick.
+// Background unload still frees it immediately.
+const TOKENIZER_IDLE_UNLOAD_MS = 10 * 60 * 1000;
 
 // Sidecar compaction: how many 'incomplete-rechunk' verdicts (each = a full
 // vault re-chunk that found an unreadable/untokenizable file) to tolerate per
@@ -228,6 +234,15 @@ export default class SeekPlugin extends Plugin {
     private indexPaused = false;                 // a paused full reindex is outstanding (settings reads this)
     get isIndexPaused(): boolean { return this.indexPaused; }
     private lastCatchUpRearmAt = 0;              // epoch ms of the last periodic delta re-check
+    // While a full reindex runs, the store is empty-then-filling, so a 'modify'
+    // classified mid-pass reads every not-yet-committed note as dirty (iCloud
+    // re-stamps mtimes on every foreground → thousands queued). Hold those paths
+    // here instead and re-classify them once the pass has committed.
+    private fullReindexRunning = false;
+    private heldDuringFullReindex = new Set<string>();
+    // One-shot timer for the next commit-failure retry (SearchOrchestrator
+    // commit backoff), so a transient abort retries in ~1 min, not 20.
+    private commitRetryTimer: number | null = null;
     // Size of the incremental pass currently running (flushDirty's delta, or the
     // catch-up drain); 0 when idle. Exists so the settings status card can say WHAT
     // it is indexing — a bare "Indexing…" is indistinguishable from a full rebuild,
@@ -310,6 +325,10 @@ export default class SeekPlugin extends Plugin {
     // slow rebuild is attributable to the CPU path instead of looking like a hang.
     get activeBackend(): Device | null {
         return this.embedder.loaded ? this.embedder.device : null;
+    }
+    // Engine behind activeBackend: 'wgsl' = the EXPERIMENTAL Seek WebGPU encoder.
+    get activeEngine(): 'ort' | 'wgsl' | null {
+        return this.embedder.loaded ? this.embedder.engine : null;
     }
 
     // Non-null while an incremental pass is in flight, carrying its file count.
@@ -465,8 +484,11 @@ export default class SeekPlugin extends Plugin {
             // embedBatch would otherwise hang on the dead device until the per-RPC
             // timeout; reject it now (recoverable, NOT 'DISPOSED') so the embed
             // catch's recycle+retry rebuilds a fresh device promptly. Skipped while
-            // unloading — the iframe is being torn down; don't poke it.
-            if (kind === 'webgpu-device-lost' && !this.unloading) {
+            // unloading — the iframe is being torn down; don't poke it. Also
+            // skipped for an intentional destroy() (reason 'destroyed'), e.g.
+            // a failed Seek-engine load releasing its device on the way to the
+            // WASM fallback: failing in-flight there would reject that load.
+            if (isUnexpectedGpuLoss(event) && !this.unloading) {
                 this.embedder.failInflight('webgpu device lost');
             }
         };
@@ -514,6 +536,12 @@ export default class SeekPlugin extends Plugin {
         // write. Each step is gated/no-op when the sidecar is disabled.
         void (async () => {
             let identityHandled = false;
+            // Span the onload hydrate like periodicReconcile does. Load-bearing for
+            // the unload gate since 2026-10-13: a tokenizer-only iframe is now
+            // unloadable, so without `busy` here a background/idle unload could
+            // tear the tokenizer down mid-reChunkLive (every later note's
+            // tokenCounts would throw and fall through to an on-device re-embed).
+            this.pushTaskContext('reconcile');
             try {
                 // One-time rev-3→4 migration: move an index written under the
                 // old active-override path into the literal '.obsidian' path,
@@ -545,6 +573,8 @@ export default class SeekPlugin extends Plugin {
                 }
             } catch (e) {
                 await this.logger.appendError('sidecar-hydrate-onload', e).catch(() => {});
+            } finally {
+                this.popTaskContext('reconcile');
             }
             // Steer split-config Obsidian Sync users to the visible folder: the
             // one case the hidden literal path can't reach (a renamed config
@@ -587,7 +617,11 @@ export default class SeekPlugin extends Plugin {
         // would be a latency regression for no benefit. Cleared on unload.
         if (isMobilePlatform()) {
             this.registerInterval(window.setInterval(() => {
-                if (Date.now() - this.lastModelUseAt >= IDLE_UNLOAD_MS) this.maybeUnloadEmbedder('idle');
+                // Also count tokenizer-only use (sidecar hydrate / compaction call
+                // ensureTokenizer + tokenCounts, never ensureModelLoaded).
+                const lastUse = Math.max(this.lastModelUseAt, this.embedder.lastTokenizerUseAt);
+                const threshold = this.embedder.loaded ? IDLE_UNLOAD_MS : TOKENIZER_IDLE_UNLOAD_MS;
+                if (Date.now() - lastUse >= threshold) this.maybeUnloadEmbedder('idle');
             }, UNLOAD_CHECK_MS));
         }
 
@@ -718,6 +752,12 @@ export default class SeekPlugin extends Plugin {
                     recencyWeight: { value: '<ε>', description: 'Override recency weight ε for THIS query only (additive; default = setting). Not persisted — for scrobbling recency configs.', required: false },
                     recencyHalflife: { value: '<days>', description: 'Override recency half-life in days for THIS query only (default = setting). Not persisted.', required: false },
                     synv2: { value: 'true|false', description: 'Override synonyms v2 (phrase-trigger expansion) for THIS query only. Not persisted — for A/B probes; the first synv2=true call builds the dictionary.', required: false },
+                    bm25f: { value: 'true|false', description: 'Override the lexical model for THIS query only: true = BM25F, false = the legacy per-field-sum BM25. Not persisted — for A/B probes.', required: false },
+                    title: { value: '<w>', description: 'BM25F title weight for THIS query only (0–20; default 10). Not persisted.', required: false },
+                    aliases: { value: '<w>', description: 'BM25F aliases weight for THIS query only (0–12; default 6). Not persisted.', required: false },
+                    props: { value: '<w>', description: 'BM25F properties weight for THIS query only (0–10; default 4). Not persisted.', required: false },
+                    body: { value: '<w>', description: 'BM25F body (content; tags + headings follow) weight for THIS query only (0–4; default 1). Not persisted.', required: false },
+                    k1: { value: '<k1>', description: 'BM25F k1 saturation for THIS query only (0.5–10; default 5). Not persisted.', required: false },
                 },
                 // Flag params arrive as the string "true"/"false", not booleans
                 // (the obsidian-cli/Templater convention), so widen the type and
@@ -767,10 +807,31 @@ export default class SeekPlugin extends Plugin {
                     // as the string "true"/"false" (see the handler comment above);
                     // same call-local discipline as the recency overrides — NEVER
                     // written into this.settings. Absent/garbage ⇒ settings rule.
+                    const flag = (v: unknown): boolean | undefined =>
+                        v === 'true' || v === true ? true : v === 'false' || v === false ? false : undefined;
+                    const synv2 = flag(args.synv2);
+                    // BM25F knob overrides (title= aliases= props= body= k1=): numeric,
+                    // garbage ignored, range-clamped downstream (bm25fParamsFrom). Any
+                    // knob implies BM25F for this query unless bm25f=false says otherwise.
+                    const num = (v: unknown): number | undefined => {
+                        const x = typeof v === 'string' ? parseFloat(v) : NaN;
+                        return Number.isFinite(x) ? x : undefined;
+                    };
+                    const knobs: Partial<Bm25fKnobs> = {};
+                    for (const [arg, key] of [['title', 'title'], ['aliases', 'aliases'], ['props', 'properties'], ['body', 'body'], ['k1', 'k1']] as const) {
+                        const x = num(args[arg]);
+                        if (x !== undefined) knobs[key] = x;
+                    }
+                    const hasKnobs = Object.keys(knobs).length > 0;
+                    const bm25f = flag(args.bm25f) ?? (hasKnobs ? true : undefined);
                     const expOverride: ExperimentOverride | undefined =
-                        args.synv2 === 'true' || args.synv2 === true ? { synonymsV2: true }
-                        : args.synv2 === 'false' || args.synv2 === false ? { synonymsV2: false }
-                        : undefined;
+                        synv2 !== undefined || bm25f !== undefined
+                            ? {
+                                  ...(synv2 !== undefined ? { synonymsV2: synv2 } : {}),
+                                  ...(bm25f !== undefined ? { bm25f } : {}),
+                                  ...(hasKnobs ? { bm25fKnobs: knobs } : {}),
+                              }
+                            : undefined;
 
                     try {
                         // Under the query-in-flight gate: a running catch-up drain
@@ -891,6 +952,7 @@ export default class SeekPlugin extends Plugin {
         // First thing, synchronously: a session whose record isn't closed at
         // next boot reads as a crash. Reload/disable/quit all pass through here.
         this.forensics?.markCleanEnd();
+        if (this.commitRetryTimer !== null) { window.clearTimeout(this.commitRetryTimer); this.commitRetryTimer = null; }
         this.embedder.teardown();
         this.orchestrator?.dispose();
         this.store.close();
@@ -996,8 +1058,12 @@ export default class SeekPlugin extends Plugin {
     // (it checks modelLoadPromise before loaded). Mirrors the manual
     // seek-unload-model command, gated by the pure shouldUnloadEmbedder predicate.
     private maybeUnloadEmbedder(reason: 'idle' | 'background'): void {
+        // A tokenizer-only iframe (hydrate path, no model) counts as resident:
+        // it holds the parsed tokenizer + a transformers.js instance, and on
+        // mobile most sessions never load the model at all.
+        const modelLoaded = this.embedder.loaded;
         const gate: UnloadGateState = {
-            loaded: this.embedder.loaded,
+            loaded: modelLoaded || this.embedder.tokenizerLoaded,
             busy: this.currentTaskContext !== 'idle',
             queryActive: this.indexingBlocked,
             running: this.flushing || this.catchUpRunning || this.driftRecoveryRunning,
@@ -1014,6 +1080,7 @@ export default class SeekPlugin extends Plugin {
             timestamp: new Date().toISOString(),
             event: 'unload',
             reason,
+            scope: modelLoaded ? 'model' : 'tokenizer',
             heapMB: heap ? heap.usedJSHeapSize / 1e6 : null,
         }).catch(() => {});
         // Synchronous breadcrumb too — the background unload races a possible
@@ -1084,13 +1151,14 @@ export default class SeekPlugin extends Plugin {
                 // Device selection is per-DEVICE (platform.ts resolveDevice),
                 // not a synced setting — see the NOTE in types.ts for why a
                 // data.json toggle would leak across iCloud-synced devices.
-                // 'auto' = WebGPU-then-WASM ladder; 'wasm' = skip WebGPU. The
-                // allowlist: desktop + iPad get 'auto', iPhone + all Android get
-                // 'wasm' (jetsam / immature WebView WebGPU), a per-device manual
-                // override wins, and a sticky tripwire demotes any mobile device
-                // that was OS-killed mid-WebGPU-reindex.
+                // 'wgsl' = Seek engine, then ORT's WebGPU-then-WASM ladder;
+                // 'wgsl-wasm' = Seek engine, then WASM; 'wasm' = CPU only. The
+                // allowlist: desktop + iPad 'wgsl', iPhone + Android
+                // 'wgsl-wasm'; a per-device manual override wins, and a
+                // sticky tripwire demotes any mobile device that was OS-killed
+                // mid-GPU-reindex.
                 //
-                // On the 'auto' path the iframe's WebGPU attempt rewrites
+                // On the ORT WebGPU fallback the iframe's WebGPU attempt rewrites
                 // wasmPaths to a webgpuInit-capable glue (jspi/asyncify — see
                 // overrideWebkitGlueForWebgpu in iframe-runner.ts), the fix that
                 // let the iPad run granite on WKWebView WebGPU (2026-06-10).
@@ -1101,7 +1169,7 @@ export default class SeekPlugin extends Plugin {
                 // fresh module instance (tx.js's webInitChain has no rejection
                 // handler — one failed load poisons the instance) and logs
                 // webgpuError. ⚠️ ORT #26827 hang risk still applies on iPhone,
-                // which is why iPhone stays off the 'auto' path by default.
+                // which is why iPhone's Seek-engine fallback skips ORT WebGPU.
                 const requestedDevice = resolveDevice();
                 // Model selection: the LOCAL_MODEL dev override wins (it's a
                 // base URL, not a hub id); otherwise MODEL_ID. Both ride dtype
@@ -1632,14 +1700,25 @@ export default class SeekPlugin extends Plugin {
     }
 
     // Enqueue a note for re-index only if it actually changed since we last
-    // indexed it (the mtime guard) — so navigating through notes to READ them
-    // never triggers an embed. One quick IDB read per note-leave.
+    // indexed it — so navigating through notes to READ them never triggers an
+    // embed. One quick IDB read per note-leave; when the mtime moved, also a
+    // read + hash of the bytes (classifyLiveFile, the same rule as computeDelta),
+    // so an iCloud mtime re-stamp of unchanged notes queues nothing. Without it a
+    // mass re-stamp (e.g. after reorganizing the vault) queued thousands of
+    // unchanged notes into one bulk pass that held the index lock for ~20 s.
     private async enqueueIfDirty(file: TFile | null): Promise<void> {
         if (!file || !isIndexableFile(file, this.settings.indexBases)) return;
-        if (!this.orchestrator) return;
+        const orchestrator = this.orchestrator;
+        if (!orchestrator) return;
+        // Out-of-index (excluded folder) notes never get a record, so they would
+        // classify dirty on every modify and ride every flush only to be dropped.
+        if (!shouldIndexPath(this.app, this.settings, file.path)) return;
+        if (this.fullReindexRunning) { this.heldDuringFullReindex.add(file.path); return; }
         try {
             const stored = await this.store.getFileRecord(file.path);
-            if (!stored || file.stat.mtime > stored.mtimeMs) {
+            // Unreadable → queue it and let the embed path decide (as computeDelta does).
+            const decision = await orchestrator.classifyLiveFile(file, stored).catch(() => 'dirty' as const);
+            if (decision === 'dirty') {
                 this.dirtyQueue.add(file.path);
                 this.scheduleFlush();
             }
@@ -1951,9 +2030,13 @@ export default class SeekPlugin extends Plugin {
                 // 50-deep shown list: rich rows the companion keeps for the top 10,
                 // ids-only beyond. `rank` is the display rank (result index), not the
                 // candidate-union rank fusedTop50 carries.
+                // chunk_id is the DISPLAYED chunk (what the snippet/anchor show);
+                // rank_chunk_id, present only on a display-chunk swap, is the chunk
+                // that ranked the note (joins Seek's own fusedTop50 / ClickEntry).
                 shown: shown.map((r, i) => ({
                     rank: i + 1,
                     chunk_id: r.chunk_id,
+                    ...(r.rank_chunk_id && { rank_chunk_id: r.rank_chunk_id }),
                     note_path: r.note_path,
                     title: r.title,
                     score: r.score,
@@ -1974,13 +2057,14 @@ export default class SeekPlugin extends Plugin {
 
     private emitSeekOpen(info: ResultOpenInfo): void {
         if (!this.settings.searchEventRelay) return;
-        const { r, rank, titleNavOpen, newTab, openTarget, searchId, dwellMs } = info;
+        const { r, rank, titleNavOpen, newTab, openTarget, searchId, dwellMs, openMethod } = info;
         try {
             (this.app.workspace as unknown as { trigger(name: string, ...data: unknown[]): void }).trigger('seek:result-open', {
                 v: 1,
                 searchId,
                 timestamp: new Date().toISOString(),
                 chunk_id: r.chunk_id,
+                ...(r.rank_chunk_id && { rank_chunk_id: r.rank_chunk_id }),
                 note_path: r.note_path,
                 rank,
                 score: r.score,
@@ -1992,6 +2076,8 @@ export default class SeekPlugin extends Plugin {
                 dwellMs,
                 newTab,
                 openTarget,
+                // Additive (still v:1): click | mod-click | tap | enter | mod-enter.
+                openMethod,
                 start_line: r.start_line,
                 heading_path: r.heading_path,
             });
@@ -2126,6 +2212,8 @@ export default class SeekPlugin extends Plugin {
             this.incrementalFiles = 0;
             this.popTaskContext('catchup');
             this.catchUpRunning = false;
+            // A retry that failed again sits in a longer backoff step now.
+            this.armCommitRetry();
         }
     }
 
@@ -2321,6 +2409,8 @@ export default class SeekPlugin extends Plugin {
         // button renders it inline; that's where "watch it go" lives).
         new Notice('Seek: full reindex starting…', 4000);
         this.pushTaskContext('indexing');
+        this.fullReindexRunning = true;
+        let completed = false;
         try {
             await this.ensureModelLoaded();
             this.orchestrator.invalidateBm25Cache();
@@ -2346,12 +2436,20 @@ export default class SeekPlugin extends Plugin {
                 new Notice(`Seek: indexing paused · ${result.filesIndexed} files done — resume to finish.`, 6000);
                 return true;
             }
+            completed = true;
+            // Counts read back from the store, so the toast agrees with the settings
+            // card by construction: filesIndexed counts files STARTED (a failed
+            // commit is still in it) and chunksIndexed counts chunks embedded (a
+            // note repeating an identical section collapses to one stored row).
+            const stored = await this.store.count().catch(() => null);
+            const failed = result.filesIndexed - result.committedFilePaths.length;
             const summary = [
                 result.pass ? '✅' : '❌',
-                `${result.filesIndexed} files`,
-                `${result.chunksIndexed} chunks`,
+                `${stored?.files ?? result.committedFilePaths.length} files`,
+                `${stored?.chunks ?? result.chunksIndexed} chunks`,
                 `${(result.totalDurationMs / 1000).toFixed(1)} s`,
                 `${result.chunksPerSec.toFixed(1)} ch/s`,
+                ...(failed > 0 ? [`${failed} to retry`] : []),
             ].join(' · ');
             new Notice(`Seek reindex: ${summary}`, 10000);
 
@@ -2376,7 +2474,39 @@ export default class SeekPlugin extends Plugin {
             return false;
         } finally {
             this.popTaskContext('indexing');
+            this.fullReindexRunning = false;
+            const held = [...this.heldDuringFullReindex];
+            this.heldDuringFullReindex.clear();
+            // Completed: re-classify against the rebuilt store, so only notes edited
+            // after their commit get queued. Paused / failed: drop them — resume and
+            // the stranded-delta backstop both diff the whole vault anyway.
+            if (completed) {
+                for (const p of held) {
+                    const f = this.app.vault.getAbstractFileByPath(p);
+                    if (f instanceof TFile) void this.enqueueIfDirty(f);
+                }
+                this.armCommitRetry();
+            }
         }
+    }
+
+    // Arm a one-shot catch-up for the earliest due commit-failure retry. The drain
+    // is self-guarded (hidden / searching / model cold → no-op), so a fire that
+    // lands in a bad window re-arms a minute later instead of dropping the retry.
+    // A parked path (backoff exhausted) never arms anything.
+    private armCommitRetry(): void {
+        const at = this.orchestrator?.nextCommitRetryAt() ?? null;
+        if (at === null) return;
+        if (this.commitRetryTimer !== null) window.clearTimeout(this.commitRetryTimer);
+        this.commitRetryTimer = window.setTimeout(() => {
+            this.commitRetryTimer = null;
+            if (activeDocument.hidden || this.catchUpRunning) {
+                this.commitRetryTimer = window.setTimeout(() => { this.commitRetryTimer = null; this.armCommitRetry(); }, 60_000);
+                return;
+            }
+            this.catchUpPending = true;
+            this.runCatchUp();
+        }, Math.max(0, at - Date.now()) + 1_000);
     }
 
     // Index health snapshot for the settings Index status card. Read-only; gathers the

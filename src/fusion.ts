@@ -2,7 +2,7 @@
 // Direct port of python-backend/app/search/fusion.py and the title-boost helper
 // in ranker.py. Coefficients match the live Python backend's defaults.
 
-import { depluralize, ENGLISH_STOPWORDS, foldDiacritics } from './bm25';
+import { depluralize, ENGLISH_STOPWORDS, foldDiacritics, prefixLastTokenFor } from './bm25';
 import { hasCjk, segmentCjkToken, seekTokenize } from './tokenize';
 import type { RecencyKeyChoice } from './types';
 
@@ -31,26 +31,10 @@ import type { RecencyKeyChoice } from './types';
 // recencyKey: which per-chunk date "recent" means — a GLOBAL vault-level
 // definition set once in settings, never per-query. 'created' (default) =
 // frontmatter `created`, copy-proof and matching the dated-instance semantics
-// episodic queries want; falls back to mtime for un-stamped notes. 'modified'
+// episodic queries want; un-stamped notes have no date (see recencyDate). 'modified'
 // = file mtime as of indexing — edit-recency, for vaults that want it as an
 // explicit choice (mtime is silently mass-corrupted by vault copies, iCloud
 // sync, and bulk plugin edits, which is why it is not the default).
-
-// A full YYYY-MM-DD anywhere in the basename: daily notes (`2026-06-11.md`)
-// and dated series notes (`Alex 1x1 2026-05-19.md`). Deliberately requires the
-// full 10-char dashed form — bare years and Jira-style `PROJ-2018` tokens are
-// NOT creation dates (the false-positive class temporal.ts guarded against).
-const FILENAME_DATE_RE = /(\d{4})-(\d{2})-(\d{2})/;
-
-function filenameDate(notePath: string | undefined): string | null {
-    if (!notePath) return null;
-    const basename = notePath.split('/').pop() ?? '';
-    const m = FILENAME_DATE_RE.exec(basename);
-    if (!m) return null;
-    const mo = +m[2], d = +m[3];
-    if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
-    return m[0];
-}
 
 // The minimal chunk shape every recency consumer can supply (full Chunks in the
 // ranker/arm, the dedup-light rows on the browse path).
@@ -71,30 +55,29 @@ export interface RecencyChunk {
 // means (the 06-07 lesson: a key change applied to the scorer but not the arm
 // admits the wrong candidates).
 //
-// The 'created' key resolves through a PORTABILITY LADDER — `created` is a
-// vault convention, not an Obsidian builtin, so other vaults need fallbacks:
-//   1. the configured created property (createdProp, default 'created') —
-//      the canonical metadata.created field when default, else looked up in
-//      metadata.properties (ALL scalar frontmatter is already indexed per
-//      chunk, so a custom name is read-side: no chunker change, no reindex);
-//   2. a YYYY-MM-DD in the filename — daily notes and dated series notes,
-//      the zero-frontmatter convention most vaults already have;
-//   3. mtime — the last resort (what Omnisearch keys everything on).
-// 'modified' is mtime first, then the same ladder as its own fallback.
+// STRICT since 2026-11-11: the selected date field is canonical, everywhere.
+//   'modified' → file mtime as of indexing.
+//   'created'  → the configured property (createdProp; the canonical
+//                metadata.created field when 'created', else looked up in
+//                metadata.properties — read-side, no reindex) — and NOTHING else.
+// A note missing the selected field has no date: 0 recency in the ranker, not
+// admitted by the recency arm, sorted after dated notes in browse, rejected by
+// before:/after:. The old portability ladder (custom prop → `created` →
+// filename YYYY-MM-DD → mtime) is gone: the mtime step handed un-stamped notes
+// a fake "recent" date whenever a move/link-rewrite/sync touched the file
+// (Notes/Ofawa.md, 2026-11-11: +0.097 at ε0.1·90d from a folder-move link
+// rewrite), and the other steps silently substituted a field the user didn't
+// pick. One resolver, so ranker ⇄ arm ⇄ browse ⇄ filters cannot disagree.
 export function recencyDate(
     chunk: RecencyChunk | undefined,
     key: RecencyKeyChoice,
     createdProp = 'created',
 ): string | null {
     const meta = chunk?.metadata;
-    const rawProp = meta?.properties?.[createdProp];
-    const propCreated = Array.isArray(rawProp) ? rawProp[0] : rawProp;
-    const created = (createdProp === 'created'
-        ? meta?.created
-        : propCreated ?? meta?.created)
-        ?? filenameDate(chunk?.note_path);
-    if (key === 'modified') return meta?.modified ?? created ?? null;
-    return created ?? meta?.modified ?? null;
+    if (key === 'modified') return meta?.modified ?? null;
+    if (createdProp === 'created') return meta?.created ?? null;
+    const raw = meta?.properties?.[createdProp];
+    return (Array.isArray(raw) ? raw[0] : raw) ?? null;
 }
 
 export interface RecencyOptions {
@@ -196,7 +179,11 @@ export function theoreticalNormDense(cos: Float64Array | Float32Array | number[]
 }
 
 // BM25 -> [0,1] by the per-query THEORETICAL upper bound (bm25.getQueryBound:
-// Σ_t Σ_f boost_f·idf_f(t)·(k1+1+d)), completing TM2C2 on the lexical side.
+// Σ_t UB(t), UB(t) = the max single-term score of t over the live index — under
+// BM25F (the default) the max BM25F score, under the legacy per-field sum the max
+// boosted per-field-sum score; the analytic Σ_t Σ_f boost_f·idf_f(t)·(k1+1+d) form
+// this comment used to cite was retired 2026-06-26), completing TM2C2 on the
+// lexical side.
 //
 // The previous form divided by the per-query EMPIRICAL max — the same
 // data-dependent-denominator pathology TM2C2 removed from the dense side: the
@@ -215,10 +202,15 @@ export function theoreticalNormDense(cos: Float64Array | Float32Array | number[]
 //   - Clip at 1: with fuzzy on, derived terms score with their own (often
 //     higher) IDF, so a doc can exceed the exact-term bound. Ties at 1.0 are
 //     arbitrated by dense — bounded, local degradation. Exact for fuzzy:false.
-//   - bound==0 with nonzero scores (fully-OOV typo query under fuzzy; OR a bare
+//     Since 2026-11-12 an OOV typo term that fuzzy CAN reach is bounded by its
+//     best derived term (bm25.ts queryBoundAndTerms), so a mixed typo query
+//     ("fy27 plannign") no longer clips its whole head to 1.0. A prefix-eligible
+//     last token with prefix extensions is excluded from that, so typeahead keeps
+//     the fallback below.
+//   - bound==0 with nonzero scores (OOV typo fuzzy can't reach; OR a bare
 //     single-token PREFIX still mid-type in typeahead — "amster" before
-//     "amsterdam" is an indexed term — since getQueryBound enumerates with
-//     prefix/fuzzy OFF; OR MiniSearch internals unavailable after an upgrade):
+//     "amsterdam" is an indexed term — since the bound does not model prefix
+//     extensions; OR MiniSearch internals unavailable after an upgrade):
 //     the bound has no opinion about this query, so DON'T let it manufacture
 //     silence — fall back to the empirical max (rank-only normalization, the
 //     pre-bound behavior). The typeahead-prefix case is INTENDED, not a TM2C2
@@ -297,21 +289,24 @@ export function hybridFusion(dense: Float64Array, bm25: Float64Array, alpha: num
 //
 // derived:FALSE is deliberate and eval-gated (audit 2026-06-29 #4,
 // nav_tokenizer_arm.py over the 483-q personal + 127-q dnd sets) for the
-// coverage DENOMINATOR |t| — it must match the bound/coverage ENUMERATORS,
-// which also take derived:false: the glue/camel forms exist to widen match
+// coverage DENOMINATOR |t|: the glue/camel forms exist to widen match
 // RECALL, but in a precision denominator they are noise (a dated title
 // `2026-05-19` would gain its concatenation `20260519`, shrinking precision
 // on exactly the dated known-item titles this boost targets). Measured:
 // derived:false denominator is a strict no-op (+0.0000), derived:true
-// denominator −0.0002.
+// denominator −0.0002. NOTE: the BM25 bound and coverage enumerators do NOT
+// share this choice — bm25.ts distinctQueryTerms / getQueryBound tokenize with
+// seekTokenize's DEFAULT derived:true, so a glue/camel recall form is its own
+// query term there (counted in the coverage denominator T and bounded by its
+// own UB). An earlier version of this comment claimed they take derived:false;
+// they never did (2026-11-11 investigation). Collapsing derived forms into one
+// slot per canonical token is a separate, open cleanup (measured ±0.006).
 //
 // The GATE/MEMBERSHIP test is a separate question (audit R2 2026-07-02 #2)
 // and DOES use the derived stream on the title side: a query typed as one
 // glued token ("gpt4") must still satisfy the gate against a hyphenated
 // title ("GPT-4"), the same morphological-variant recall BM25 already gets
-// via seekTokenize's default derived:true. Mirrors the existing bound
-// contract (getQueryBound above): derived forms score/match without
-// enlarging the enumerator they're checked against. So coverage() below
+// via seekTokenize's default derived:true. So coverage() below
 // checks membership against a DERIVED title-token set while still dividing
 // by the CANONICAL |t| — loosens the gate, leaves the precision denominator
 // (and therefore the eval-gated magnitude) untouched. Dated titles
@@ -360,8 +355,85 @@ function tokenSet(s: string, dropStopwords = false, derived = false): Set<string
     return out;
 }
 
-// |query ∩ title| / |title| when ALL query tokens are in the title, else 0.
-function coverage(qTokens: Set<string>, title: string): number {
+// Title-side prefix matching (2026-10-13, made fixed behavior 2026-11-11): the
+// FINAL query token may strict-prefix-match a title token from 1 char, so a
+// typeahead query ("andrei g", "evolving infini") keeps its title boost while
+// typing instead of dropping to 0 until the word is 3 chars long. Earlier tokens
+// must still match exactly, and a lone token under 3 chars never prefix-matches
+// (bm25.ts prefixLastTokenFor). Industry parity: Algolia prefixLast (prefix from
+// the first char), Typesense/Meilisearch last-word prefix.
+export const TITLE_PREFIX_MIN_CHARS = 1;
+// A prefix hit earns PARTIAL credit, weighted the way MiniSearch weights a prefix
+// hit in the BM25 channel (minisearch 7.2 index.js: prefixWeight · L/(L + 0.3·d),
+// d = completion length − typed length; default prefixWeight 0.375). It still
+// satisfies the all-tokens gate, but adds < 1 to the precision numerator, so an
+// exact title word outranks a prefix one ("… ai" prefers an `AI` title over `Aim`),
+// and a longer unfinished completion earns a little less. Industry ordering
+// (Algolia Exact, Meilisearch exactness, Typesense prioritize_exact_match) tiers
+// exact over prefix; Seek's signals sum rather than tier, so this mirrors the
+// additive scheme our own lexical channel already uses.
+//
+// Why 0.375 not the earlier flat 0.5 (2026-11-11): the |title| denominator let a
+// one-word prefix title beat a longer EXACT title — "car" put `Carboni's`
+// (0.5/1) over `Cars and bikes` (1/3). At 0.375·7/8.2 = 0.32 the exact 3-word
+// title wins. Margin is thin by design: this is a nudge, not a tier.
+export const TITLE_PREFIX_CREDIT = 0.375;
+export function titlePrefixCredit(typedLen: number, completionLen: number): number {
+    const d = Math.max(0, completionLen - typedLen);
+    return TITLE_PREFIX_CREDIT * completionLen / (completionLen + 0.3 * d);
+}
+const titlePrefixEligible = prefixLastTokenFor(TITLE_PREFIX_MIN_CHARS);
+
+// Title-side fuzzy matching (2026-11-12): a query token that is a TYPO may match a
+// title token within the edit budget the BM25 channel already used to reach it, so
+// one misspelling ("fy27 plannign") no longer zeroes the known-item bonus for every
+// note while the lexical channel happily matched "planning". The caller decides
+// eligibility per token (TitleFuzzy): only tokens OOV in the lexical index, with the
+// FUZZY_BY_LENGTH budget, so a real word ("plan") never fuzzes onto "play". Credit
+// mirrors MiniSearch's fuzzy weight the way the prefix credit mirrors its prefix
+// weight: 0.45·L/(L+d), L = title token length. It passes the all-tokens gate but
+// adds < 1 to the precision numerator, so the clean spelling still outranks it.
+export const TITLE_FUZZY_CREDIT = 0.45;
+export function titleFuzzyCredit(titleTokLen: number, dist: number): number {
+    return TITLE_FUZZY_CREDIT * titleTokLen / (titleTokLen + dist);
+}
+// Max edit distance a query token may fuzz by against title tokens; 0 = exact only.
+export type TitleFuzzy = (tok: string) => number;
+
+// Levenshtein distance when ≤ maxDist, else maxDist + 1 (banded, early exit).
+// Plain Levenshtein, not Damerau, to match MiniSearch's fuzzyGet: the title gate
+// accepts exactly what the BM25 channel could have matched.
+export function editDistanceWithin(a: string, b: string, maxDist: number): number {
+    const la = a.length, lb = b.length;
+    if (Math.abs(la - lb) > maxDist) return maxDist + 1;
+    let prev = new Array<number>(lb + 1);
+    let cur = new Array<number>(lb + 1);
+    for (let j = 0; j <= lb; j++) prev[j] = j;
+    for (let i = 1; i <= la; i++) {
+        cur[0] = i;
+        let rowMin = i;
+        const ca = a.charCodeAt(i - 1);
+        for (let j = 1; j <= lb; j++) {
+            const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
+            const v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+            cur[j] = v;
+            if (v < rowMin) rowMin = v;
+        }
+        if (rowMin > maxDist) return maxDist + 1;
+        const t = prev; prev = cur; cur = t;
+    }
+    return prev[lb] <= maxDist ? prev[lb] : maxDist + 1;
+}
+
+// Σcredit / |title| when ALL query tokens are in the title (exact, the final
+// token as a prefix, or a typo token within its fuzzy budget), else 0. Exact hits
+// credit 1, prefix hits titlePrefixCredit(), fuzzy hits titleFuzzyCredit().
+function coverage(
+    qTokens: Set<string>,
+    title: string,
+    prefixTok: string | null = null,
+    fuzzyDist: Map<string, number> | null = null,
+): number {
     const t = tokenSet(title);                // canonical — the precision DENOMINATOR
     if (t.size === 0) return 0;
     // The gate accepts the title's derived forms too (glue-joined compounds,
@@ -370,16 +442,41 @@ function coverage(qTokens: Set<string>, title: string): number {
     // canonical, so this can't dilute precision on titles that don't need it
     // (audit R2 2026-07-02 #2).
     const matchable = tokenSet(title, false, true);
-    let inter = 0;
-    for (const tok of qTokens) if (matchable.has(tok)) inter++;
+    let inter = 0;   // tokens matched — the gate
+    let credit = 0;  // precision numerator — exact 1, prefix partial
+    for (const tok of qTokens) {
+        if (matchable.has(tok)) { inter++; credit++; continue; }
+        let best = 0;
+        if (tok === prefixTok) {
+            // Best (shortest) completion among the title's tokens.
+            for (const m of matchable) {
+                if (m.startsWith(tok)) best = Math.max(best, titlePrefixCredit(tok.length, m.length));
+            }
+        }
+        const maxDist = best > 0 ? 0 : (fuzzyDist?.get(tok) ?? 0);
+        if (maxDist > 0) {
+            for (const m of matchable) {
+                const d = editDistanceWithin(tok, m, maxDist);
+                if (d >= 1 && d <= maxDist) best = Math.max(best, titleFuzzyCredit(m.length, d));
+            }
+        }
+        if (best > 0) { inter++; credit += best; }
+    }
     if (inter < qTokens.size) return 0; // require full query coverage (known-item gate)
     // Clamped: a single derived match (e.g. "gpt4") can cover more canonical
     // title tokens than it counts toward `inter`, which would otherwise let
     // several such matches push the ratio above 1.
-    return Math.min(1, inter / t.size); // precision
+    return Math.min(1, credit / t.size); // precision
 }
 
-export function titleMatchBoost(query: string, chunks: TitleBoostChunk[], boost = 0.8): Float64Array {
+// `prefix` = false is exact-only (tests / harness probes); production always prefixes.
+export function titleMatchBoost(
+    query: string,
+    chunks: TitleBoostChunk[],
+    boost = 0.8,
+    prefix = true,
+    fuzzy?: TitleFuzzy,
+): Float64Array {
     const out = new Float64Array(chunks.length);
     // Gate on content tokens (stopwords dropped, §6.1). If the query is ALL
     // stopwords ("will", "the it"), fall back to the literal tokens so a note
@@ -389,17 +486,34 @@ export function titleMatchBoost(query: string, chunks: TitleBoostChunk[], boost 
     if (qTokens.size === 0) qTokens = tokenSet(query, false);
     if (qTokens.size === 0) return out;
 
+    // Independent of BM25's prefixLastToken: the title floor (1) sits below
+    // BM25's (3) because only title tokens are scanned — no vocab fan-out.
+    const qList = [...qTokens];
+    const prefixTok = prefix && titlePrefixEligible(qList[qList.length - 1], qList.length - 1, qList)
+        ? qList[qList.length - 1]
+        : null;
+
+    // Per-query fuzzy budgets, resolved once (the caller's predicate may consult
+    // the lexical index). null when fuzzy is off or no token is eligible.
+    let fuzzyDist: Map<string, number> | null = null;
+    if (fuzzy) {
+        for (const tok of qList) {
+            const d = fuzzy(tok);
+            if (d > 0) (fuzzyDist ??= new Map()).set(tok, d);
+        }
+    }
+
     for (let i = 0; i < chunks.length; i++) {
         const notePath = chunks[i].note_path ?? '';
         let basename = notePath.split('/').pop() ?? '';
         if (basename.endsWith('.md')) basename = basename.slice(0, -3);
 
-        let best = coverage(qTokens, basename);
+        let best = coverage(qTokens, basename, prefixTok, fuzzyDist);
 
         const aliases = chunks[i].metadata?.aliases;
         if (best < 1 && Array.isArray(aliases)) {
             for (const alias of aliases) {
-                best = Math.max(best, coverage(qTokens, String(alias)));
+                best = Math.max(best, coverage(qTokens, String(alias), prefixTok, fuzzyDist));
                 if (best >= 1) break;
             }
         }

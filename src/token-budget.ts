@@ -66,7 +66,7 @@
 //      then, since its count must land ≤ budget to be emitted).
 
 import type { Chunk } from './types';
-import { chunkIdFor } from './chunker';
+import { chunkIdFor, goForwardDenseParts } from './chunker';
 import { parseAtoms, type Atom } from './atoms';
 
 // Batch token counter — exact counts, specials included, same tokenizer the
@@ -171,12 +171,18 @@ const OVERLAP_JOIN_SLACK = 4;
 // query path both assume this exact `title\n\ncontent` shape — compose it in
 // one place so the counted text and the embedded text can never drift.
 export function embedInput(c: Chunk): string {
-    const base = `${c.title}\n\n${c.content}`;
-    // Note-level frontmatter values, dense-channel only (chunker.ts
-    // buildDenseSuffix). Appended LAST so it folds into chunk_id identically
-    // (chunkIdFor's tail) and is what splitChunk reserves budget for. Absent on
-    // notes with no qualifying values → the bare `title\n\ncontent` as before.
-    const full = c.denseSuffix ? `${base}\n\n${c.denseSuffix}` : base;
+    // Go-forward keyed dense channel (CHUNKER_VERSION 11, chunker.ts
+    // goForwardDenseParts): a PER-CHUNK alias-deduped title and a keyed
+    // `key: value` property suffix deduped against title+body, tags dropped
+    // to BM25. Derived here — the single composition point both indexing and
+    // query-time re-chunking route through — so the counted text and the
+    // embedded text can never drift, and split parts each dedup against their
+    // own body. The stored note-level `c.denseSuffix` stays the chunk_id proxy
+    // only; it is NOT what gets embedded, and since v12 splitChunk no longer
+    // budgets against it either.
+    const { title, suffix } = goForwardDenseParts(c);
+    const base = `${title}\n\n${c.content}`;
+    const full = suffix ? `${base}\n\n${suffix}` : base;
     // Collapse + hard char cap (issue #4 defenses, header comment). The cap is
     // lossless for the dense channel: post-collapse, 512 tokens always lie
     // inside the first TOKEN_BUDGET × MAX_COLLAPSED_CHARS_PER_TOKEN chars, so
@@ -242,19 +248,20 @@ async function splitChunk(
     countTokens: CountTokens,
     budget: number,
 ): Promise<SplitResult> {
-    // Title overhead: tokens the title contributes to EVERY part's input.
-    // Counted on `title\n\n` alone; the ±1-2-token BPE boundary slack vs the
-    // composed input is absorbed by the verify loop below.
-    const [titleCount] = await countTokens([`${chunk.title}\n\n`]);
-    // The dense suffix (note-level frontmatter) is appended to EVERY part's embed
-    // input (embedInput), so reserve it in the content budget too. Without this a
-    // part packed up to the cap would have its suffix truncated off (it's last),
-    // silently dropping the injection on rich/multi-chunk notes — but the ship
-    // decision is ungated/all-chunks, so the suffix must survive on every part.
-    // Counted on the bare `\n\n${suffix}` tail; the ±1-token BPE join slack is
-    // absorbed by the verify loop below (which recounts the full composed input).
-    const suffixTail = chunk.denseSuffix ? `\n\n${chunk.denseSuffix}` : '';
-    const [suffixCount] = suffixTail ? await countTokens([suffixTail]) : [0];
+    // Per-part overhead: the dense title and keyed suffix embedInput wraps
+    // around EVERY part's body. Both are derived per part (goForwardDenseParts
+    // dedups aliases and property values against the part's own body), so
+    // reserve the WORST case: the parts derived against an EMPTY body, where
+    // nothing is deduped away. A real part's title/suffix can only be the same
+    // or shorter (±BPE join slack), and the verify loop below recounts the
+    // exact embedInput anyway. Pre-v12 this reserved the v10 note-level bag
+    // (`chunk.denseSuffix`) and the raw alias title, which is not what gets
+    // embedded: parts ran up to ~13 tokens past their counted length, were
+    // routed into a seq bucket too small for them, and lost the keyed suffix
+    // (it's last) to truncation.
+    const worst = goForwardDenseParts({ ...chunk, content: '' });
+    const [titleCount] = await countTokens([`${worst.title}\n\n`]);
+    const [suffixCount] = worst.suffix ? await countTokens([`\n\n${worst.suffix}`]) : [0];
     const overhead = titleCount + suffixCount;
     const contentBudget = budget - overhead;
     if (contentBudget < MIN_CONTENT_BUDGET) {
@@ -326,7 +333,9 @@ async function splitChunk(
         const work: Atom[][] = [g];
         while (work.length) {
             const grp = work.shift()!;
-            const [c] = await countTokens([`${chunk.title}\n\n${joinAtoms(grp)}${suffixTail}`]);
+            // Count EXACTLY what will be embedded, so the returned count (which
+            // routes the part's seq bucket) is the true length.
+            const [c] = await countTokens([embedInput({ ...chunk, content: joinAtoms(grp) })]);
             if (c <= budget) {
                 finalGroups.push(grp);
                 finalCounts.push(c);

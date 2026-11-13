@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { depluralize, foldDiacritics, MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, FUZZY_BY_LENGTH, extractPropertiesText, extractHeadingsText, BM25_COVERAGE_POW } from './bm25';
+import { depluralize, foldDiacritics, MultiFieldBM25, DEFAULT_FIELD_BOOSTS, PREFIX_LAST_TOKEN, prefixLastTokenFor, FUZZY_BY_LENGTH, extractPropertiesText, extractHeadingsText, BM25_COVERAGE_POW } from './bm25';
 import type { Chunk } from './types';
 
 function makeChunk(id: string, title: string, content: string, tags: string[] = [], aliases: string[] = []): Chunk {
@@ -1144,5 +1144,19 @@ describe('synonyms v2 phrase mates (per-search overrides)', () => {
         const inert = idx.getScoresWithCoverage('query understanding', { synonyms: { map: new Map(), weight: 0.8, phraseMates: [] } });
         const plain = idx.getScoresWithCoverage('query understanding');
         expect(inert).toEqual(plain);
+    });
+});
+
+describe('prefixLastTokenFor — configurable floor', () => {
+    it('default floor matches PREFIX_LAST_TOKEN', () => {
+        const f = prefixLastTokenFor(3);
+        expect(f('rea', 0, ['rea'])).toBe(true);
+        expect(f('re', 1, ['x', 're'])).toBe(false);
+    });
+    it('lower floor expands a short final token only after another token', () => {
+        const f = prefixLastTokenFor(1);
+        expect(f('g', 1, ['andrei', 'g'])).toBe(true);
+        expect(f('g', 0, ['g'])).toBe(false);
+        expect(f('andrei', 0, ['andrei', 'g'])).toBe(false);
     });
 });

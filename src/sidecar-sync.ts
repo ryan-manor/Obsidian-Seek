@@ -23,7 +23,7 @@
 // omitted the token-budget re-split (it needs the tokenizer), which silently
 // missed every note long enough to be split: on a long-note vault that was
 // ~the whole corpus → hydrated:0 → full on-device re-embed → iPhone jetsam.
-// The hydrate now loads the TOKENIZER ONLY (embedder.ensureTokenizer, a few MB,
+// The hydrate now loads the TOKENIZER ONLY (embedder.ensureTokenizer, a 25 MB file,
 // no ~250 MB model) to stay mobile-safe while reproducing ids.
 
 import type { DataAdapter } from 'obsidian';

@@ -133,29 +133,56 @@ export function chunkIdFor(notePath: string, title: string, content: string, den
 // sidecar's VECTORS would technically still be reproducible here, but the
 // conservative reject costs only one desktop re-seed.
 //
-// PENDING (would be 11, NOT bumped yet): three fixes landed after v10 shipped
-// that also move buildDenseSuffix's output or the parsed frontmatter/body —
-// and thus chunkIdFor's tail or content — for affected notes: (a)
-// INERT_VALUE_RE narrowed to stop swallowing free text trailing a date
-// property value (audit R2 batch2 #3, chunker.ts); (b) SUFFIX_ASSET_RE
-// unified onto dense-clean.ts's $-anchored ASSET_EXT_RE instead of its own
-// drifted \b-bounded copy, so a property value that merely CONTAINS an asset
-// extension (e.g. "trip.pdf notes") no longer gets misclassified as
-// shape-junk and dropped (audit R2 batch2 #5, chunker.ts + dense-clean.ts);
-// and (c) a leading BOM (U+FEFF) is now stripped before frontmatter parsing
-// (audit R2 batch2 #4, chunkContent) — previously FRONTMATTER_RE's `^---`
-// anchor never matched a BOM-prefixed file, so metadata stayed `{}` and body
-// was the whole raw file including the frontmatter block text; for any
-// BOM-prefixed note this changes metadata, body, denseSuffix, and hence
-// chunk_id. All three are eval-gate-before-ship the same way v10 itself was —
-// DELIBERATELY left off the live CHUNKER_VERSION until that eval runs, not an
-// oversight. In the meantime this means a producer and consumer can each
-// self-report chunkerVersion=10 while actually running different
-// id-affecting code (a staggered-rollout risk on IDENTITY, not data safety —
-// hydrateFromSidecar's id-lookup path just falls through to a normal local
-// re-embed on a miss, same as any other unmatched id). Fold all three into
-// this comment block when the eval runs and the version finally bumps to 11.
-export const CHUNKER_VERSION = 10;
+// v11 (2026-07-21): the go-forward KEYED dense channel (goForwardDenseParts,
+// derived in embedInput). The embedded bytes change for most notes — a keyed
+// `key: value` suffix deduped against title+body, per-chunk alias dedup, tags
+// dropped to BM25 — but chunk_ids do NOT: the id still hashes the note-level
+// buildDenseSuffix proxy (chunkIdFor's tail), so, exactly as with v10's
+// link_terms, the VERSION bump (not an id delta) is the re-embed trigger.
+// Validated +0.0038 nDCG_b, the only dense-cleanliness arm whose 95% CI
+// excluded zero (coalesce_keyed_arm.py; [[seek-dense-keyed-clean-2026-07-21]]).
+//
+// This bump ALSO finally lands three id-affecting fixes that had been held off
+// v10's version pending an eval — their id/content deltas are simply absorbed
+// by the full reindex v11 forces: (a) INERT_VALUE_RE narrowed to stop swallowing
+// free text trailing a date property value (audit R2 batch2 #3); (b)
+// SUFFIX_ASSET_RE unified onto dense-clean.ts's $-anchored ASSET_EXT_RE instead
+// of its own drifted \b-bounded copy, so a value that merely CONTAINS an asset
+// extension ("trip.pdf notes") is no longer misclassified as shape-junk and
+// dropped (audit R2 batch2 #5); and (c) a leading BOM (U+FEFF) is stripped
+// before frontmatter parsing (audit R2 batch2 #4) — previously FRONTMATTER_RE's
+// `^---` anchor never matched a BOM-prefixed file, so metadata stayed `{}` and
+// the frontmatter text leaked into the body. All three still feed the note-level
+// buildDenseSuffix proxy / body and thus chunk_id, so v11 makes them live.
+//
+// v12 (2026-11): index-structure fixes, no ranking change intended. (a)
+// splitChunk packs and counts split parts against the embedded v11 keyed
+// composition (embedInput) instead of the v10 bag proxy, so a part's routed
+// seq bucket is its true length and the keyed suffix is never truncated off
+// the tail; (b) the keyed suffix cap cuts at group/value boundaries, no
+// dangling `key:`; (c) ISO-week values ("W35, 2026") are inert; (d) the
+// content-free stub floor (isContentFree, 2026-09-08) reaches existing
+// indexes, since chunk_id doesn't hash lexicalOnly and only a bump re-chunks;
+// (e) small-note collapse (small-note.ts, floor 64): a note the chunker split
+// into 2+ heading sections whose WHOLE body is <= 64 tokens is emitted as one
+// chunk (note title, empty heading_path, headings inlined into the body). The
+// boundaries, titles and ids of those notes change, so a v11 sidecar's vectors
+// for them are unreproducible here. Small sections inside larger notes are
+// untouched.
+export const CHUNKER_VERSION = 12;
+
+// A cleaned body with no line outside a heading marker. cleanDenseBody keeps
+// headings verbatim (`# Text`), so the check is lexical: such a body contributes
+// only words the dense title already carries, or a scaffold ("## Subtasks") that
+// carries nothing at all. Used for the title-only fallback's lexicalOnly flag.
+const HEADING_LINE_RE = /^#{1,6}\s/;
+export function isContentFree(cleanedBody: string): boolean {
+    for (const line of cleanedBody.split('\n')) {
+        const t = line.trim();
+        if (t && !HEADING_LINE_RE.test(t)) return false;
+    }
+    return true;
+}
 
 export interface ChunkerOptions {
     minChunkChars?: number;
@@ -417,16 +444,42 @@ export class MarkdownChunker {
         // structurally-dead known-item queries in the personal eval (2026-06-05).
         if (chunks.length === 0) {
             const fallbackContent = cleanDenseBody(body);
-            // A body-LESS note (empty fallbackContent) embeds as "<title>\n\n" —
-            // a content-free vector (often just a bare date) that becomes a
-            // universal near-neighbor for any OOV/ID query. Mark it lexical-only
-            // so the ranker keeps it out of the dense channel; BM25's title boost
-            // still makes it findable by name. A short-but-non-empty fallback DOES
-            // carry embeddable content, so it stays dense-eligible (flag absent).
+            // A CONTENT-FREE note embeds as (near enough) "<title>\n\n" — a vector
+            // that says nothing its own title didn't, and becomes a universal
+            // near-neighbor for any OOV/ID query. Mark it lexical-only so the
+            // ranker keeps it out of the dense channel; BM25's title boost still
+            // makes it findable by name. A fallback carrying real prose DOES have
+            // something to embed, so it stays dense-eligible (flag absent).
+            //
+            // "Content-free" was `length === 0` until 2026-09-08, and byte-length
+            // is the wrong test: a body that is nothing but headings is textually
+            // non-empty and semantically empty. On the reference vault 231 of 2326
+            // single-chunk notes are headings-only and 137 cleared the length test —
+            // an H1 restating the note's own title ("# January 01, 2026" under
+            // `2026-01-01`, "# Lightroom eval plan" under "Lightroom eval plan -
+            // 2025-03-31"). They embedded as real vectors; the empty daily notes
+            // collapsed onto each other at 0.9685 mean pairwise cosine (90.8% of
+            // pairs > 0.95, against a 0.7712 prose baseline).
+            //
+            // Retrieval, though, indicts the OTHER half. Flooring only the pure-date
+            // stubs moves ZERO queries at either alpha — that cluster is degenerate
+            // but unreachable. The whole measured effect is the ~30 headings-only
+            // notes with a TOPICAL title, which are title-echo vectors with no body
+            // to dilute them and so outrank notes that actually discuss the topic.
+            // personal/483q, NO query regressed in any scope:
+            //   fused a=0.85   +0.0005 [0, 0.0014]  3 up / 0 down, gold@1 +0.0021
+            //     on the 42 queries where such a stub reached the top-10:
+            //                  +0.0062 [0, 0.0161]              gold@1 +0.0238
+            //   dense-only     +0.0004 [0, 0.0010]  4 up / 0 down
+            //     on its 66 polluted queries:
+            //                  +0.0027 [0.0002, 0.0079]
+            // myvault's usage sets trigger on 3 and 7 queries — no-harm checks, not
+            // evidence.
+            //
             // See [[seek-miss-anatomy]] (the 2026-06-05 fallback) for why the
             // fallback exists at all, and the dense-floor in ranker.ts for the
             // other half of this fix.
-            const lexicalOnly = fallbackContent.length === 0 ? true : undefined;
+            const lexicalOnly = isContentFree(fallbackContent) ? true : undefined;
             const fallbackLinkTerms = extractLinkTermsBody(body);
             chunks.push({
                 chunk_id: idFor(titleWithAliases, fallbackContent),
@@ -688,7 +741,12 @@ const SUFFIX_SKIP_KEYS = new Set(['aliases', 'alias', ...MACHINERY_KEYS]);
 // way — dates remain queryable via [key:value] filters); a date FOLLOWED BY
 // FREE TEXT no longer matches, so the whole value (date digits and all)
 // survives as ordinary searchable text instead of being dropped.
-const INERT_VALUE_RE = /^(?:\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?|-?\d+(?:\.\d+)?|true|false|yes|no|on|off)$/i;
+//
+// v12: ISO-week period values are dates too. A weekly-note link `[[W35, 2026]]`
+// flattens to "W35, 2026", which matched nothing above (the comma defeats the
+// number-list shape gate) and leaked into dense on ~680 notes. Both the
+// `W35, 2026` / `W35 2026` display form and ISO `2026-W35` are inert.
+const INERT_VALUE_RE = /^(?:\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?|-?\d+(?:\.\d+)?|true|false|yes|no|on|off|W\d{1,2},?\s*\d{4}|\d{4}-?W\d{1,2})$/i;
 
 // Shape gate: by-FORM junk the type-filter misses (frontmatter census, 2026-06-18).
 // A number-list is >=2 all-numeric tokens — lat/long coordinate strings and value
@@ -756,4 +814,156 @@ function buildDenseSuffix(metadata: Record<string, unknown>, titleText = ''): st
     const joined = parts.join(' ');
     const toks = joined.split(/\s+/);
     return toks.length > SUFFIX_CAP_TOKENS ? toks.slice(0, SUFFIX_CAP_TOKENS).join(' ') : joined;
+}
+
+// ---- go-forward keyed dense channel (per-chunk, CHUNKER_VERSION 11) ----------
+//
+// The 2026-07-21 validated dense-suffix policy (coalesce_keyed_arm.py: +0.0038
+// nDCG_b, the ONLY arm of the whole dense-cleanliness cycle whose 95% CI
+// [+0.0001,+0.0089] excluded zero; gold@1 0.810→0.814). It supersedes the bare,
+// note-level buildDenseSuffix above on three points, all faithful to the harness
+// `goforward_text(c)` which was measured on the FINAL (post-split) chunk set —
+// i.e. exactly the chunk objects embedInput sees:
+//
+//   1. KEYED framing. Every surviving property renders `key: value` (camelCase,
+//      values comma-joined; groups period-separated) instead of a bare value bag.
+//      Keys re-supply the TYPE that a terse note body lacks (`pageType: people`
+//      tells the model an alias/entity note is a person) — the whole win. On a
+//      cleaned channel keying and pruning are SUBSTITUTES, so we keep+key the
+//      type facets rather than name-blind-dropping them (no classifier, Q1-safe).
+//   2. PER-CHUNK, TITLE+BODY dedup. buildDenseSuffix seeds its dedup on the note
+//      title only; here every value's depluralized tokens are deduped against the
+//      per-chunk dense title ∪ THIS chunk's body — one uniform rule for aliases,
+//      enum facets and wikilinks (a value already spoken by title/body earns no
+//      pooled-vector mass). Corpus-preserving: only INJECTED metadata is pruned,
+//      never title/body tokens (the ISO-strip of the core was a wash and risked
+//      the corpus, so it is deliberately NOT done).
+//   3. TAGS → BM25 only. Tags monotonically diluted dense precision (more tags =
+//      worse), so they leave the suffix entirely and keep their dedicated boosted
+//      BM25 field. (extractProperties already excludes tags AND aliases from
+//      `properties`, so the tag guard below is belt-and-suspenders.)
+//
+// This is derived on the fly in embedInput from the chunk's stored fields, so the
+// counted text and the embedded text can never drift and split parts each dedup
+// against their own body. The note-level `denseSuffix` field is retained ONLY as
+// the chunk_id/budget proxy (chunkIdFor's 4th arg, splitChunk's budget reserve);
+// a change to THIS derivation is invisible to those and so MUST ride a
+// CHUNKER_VERSION bump to re-embed the fleet — which is already the convention.
+const KEYED_SUFFIX_CAP_TOKENS = 64;   // ~SUFFIX_CAP + room for `key: ` prefixes
+
+// Inverse of the two title-build sites in chunkContent (`Base | a1 | a2 > H1 > H2`)
+// and dense_strip_budget.peel_aliases: recover the bare base title by peeling the
+// heading breadcrumb then the hoisted aliases back off. Defensive — if a value
+// carrying the ` | ` / ` > ` separators breaks the expected suffix shape, it falls
+// back to the longest match it can prove rather than throwing (indexing must not
+// crash a whole note over one odd alias).
+function peelDenseTitle(title: string, aliases: string[], headingPath: string[]): { base: string; headTail: string } {
+    let headTail = '';
+    let twa = title;
+    if (headingPath.length > 0) {
+        headTail = ` > ${headingPath.join(' > ')}`;
+        if (title.endsWith(headTail)) twa = title.slice(0, -headTail.length);
+        else headTail = '';   // shape mismatch: treat whole title as base, no tail
+    }
+    let base = twa;
+    if (aliases.length > 0) {
+        const asfx = ` | ${aliases.join(' | ')}`;
+        if (twa.endsWith(asfx)) base = twa.slice(0, -asfx.length);
+    }
+    return { base, headTail };
+}
+
+// The per-chunk dense embed parts: an alias-deduped title and the keyed suffix.
+// Alias dedup (aggregate-neutral but fixes multi-chunk completeness): keep only
+// aliases with a token novel vs the base title or this chunk's body. Property
+// dedup then seeds on the REBUILT dense title (kept aliases + breadcrumb) ∪ body,
+// matching goforward_groups. Both stages reuse the existing shared primitives
+// (suffixDedupTokens / toDisplayForm / INERT_VALUE_RE / isShapeJunk /
+// SUFFIX_SKIP_KEYS) so the two channels agree on "the same word".
+export function goForwardDenseParts(c: Chunk): { title: string; suffix: string } {
+    const aliases = c.metadata.aliases ?? [];
+    const properties = c.metadata.properties ?? {};
+    const { base, headTail } = peelDenseTitle(c.title, aliases, c.heading_path);
+    const bodyToks = suffixDedupTokens(c.content);
+
+    // ── per-chunk alias dedup (seed = base title tokens ∪ body tokens) ──
+    let denseTitle: string;
+    if (aliases.length === 0) {
+        denseTitle = c.title;
+    } else {
+        const seen = new Set<string>([...suffixDedupTokens(base), ...bodyToks]);
+        const kept: string[] = [];
+        for (const a of aliases) {
+            const at = suffixDedupTokens(a);
+            if (at.length > 0 && at.every(tok => seen.has(tok))) continue;   // fully redundant
+            for (const tok of at) seen.add(tok);
+            kept.push(a);
+        }
+        const b = base.trim();
+        const twa = (b ? [b, ...kept] : kept).join(' | ');
+        denseTitle = twa ? twa + headTail : headTail.replace(/^\s*>\s*/, '').trim();
+    }
+
+    // ── keyed property suffix (seed = dense title tokens ∪ body tokens) ──
+    const seen = new Set<string>([...suffixDedupTokens(denseTitle), ...bodyToks]);
+    const groups: { key: string; vals: string[] }[] = [];
+    for (const [key, value] of Object.entries(properties)) {
+        const kl = key.toLowerCase();
+        if (SUFFIX_SKIP_KEYS.has(kl) || kl === 'tags') continue;   // machinery + aliases + tags→BM25
+        const items = Array.isArray(value) ? value : [value];
+        const vals: string[] = [];
+        for (const item of items) {
+            const t = toDisplayForm(String(item)).trim();
+            if (!t || INERT_VALUE_RE.test(t) || isShapeJunk(t)) continue;   // date/number/bool/url/asset
+            const toks = suffixDedupTokens(t);
+            if (toks.length > 0 && toks.every(tok => seen.has(tok))) continue;   // redundant vs title/body/kept
+            for (const tok of toks) seen.add(tok);
+            vals.push(t);
+        }
+        if (vals.length > 0) groups.push({ key, vals });
+    }
+    return { title: denseTitle, suffix: capKeyedGroups(groups) };
+}
+
+// Word-cap the keyed suffix at GROUP/VALUE boundaries (v12). v11 sliced the
+// joined string at the 64th whitespace word, which could leave a dangling
+// `key:` with no value or cut a multi-word value in half. Now: whole groups in
+// order while they fit; the first group that doesn't fit keeps as many whole
+// values as fit (if at least one does), then stop. Words are counted on the
+// rendered `key: v1, v2` text exactly as the old cap counted them.
+function capKeyedGroups(groups: { key: string; vals: string[] }[]): string {
+    const words = (s: string) => s.split(/\s+/).filter(Boolean).length;
+    const out: string[] = [];
+    let used = 0;
+    for (const { key, vals } of groups) {
+        // The '. ' joiner glues onto the prior group's last word: adds no word.
+        const full = `${key}: ${vals.join(', ')}`;
+        const w = words(full);
+        if (used + w <= KEYED_SUFFIX_CAP_TOKENS) {
+            out.push(full);
+            used += w;
+            continue;
+        }
+        const kept: string[] = [];
+        let gw = words(`${key}:`);
+        for (const v of vals) {
+            const vw = words(v);
+            if (used + gw + vw > KEYED_SUFFIX_CAP_TOKENS) break;
+            kept.push(v);
+            gw += vw;
+        }
+        if (kept.length) {
+            out.push(`${key}: ${kept.join(', ')}`);
+        } else {
+            // A single long free-text value (e.g. `description:`) that alone
+            // overflows: keep its leading words rather than lose the group.
+            const room = KEYED_SUFFIX_CAP_TOKENS - used - gw;
+            if (room > 0) {
+                const head = vals[0].split(/\s+/).filter(Boolean).slice(0, room).join(' ');
+                out.push(`${key}: ${head}`);
+            }
+        }
+        break;
+    }
+    return out.join('. ');
 }

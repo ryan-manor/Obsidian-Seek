@@ -88,6 +88,15 @@
     max-height: calc(var(--seek-vvh, 100vh) - var(--seek-top));
 }
 
+/* Phone themes commonly pad .modal-content (Baseline: `body.is-phone
+   .modal:not(.mod-sidebar-layout) .modal-content`, 0-4-1), which beats the
+   2-class `padding: 0` reset below. That insets the query row and pushes it
+   down, so the absolutely positioned X no longer lines up with the glyph row.
+   This 0-5-0 selector restores the edge-to-edge layout. */
+.modal-container .modal.seek-modal.seek-mobile .modal-content {
+    padding: 0;
+}
+
 /* The footer legend is all physical-keyboard hints (↑↓ / ↵ / ⌘↵ / tab / esc) —
    meaningless with a touch keyboard, and it steals vertical room from results.
    Drop the hint groups on mobile but keep the "N results" count + the spacer
@@ -1041,6 +1050,15 @@
 .seek-settings .seek-progress-row {
     padding: 10px 0;
 }
+/* Inside the Pause card: the meter takes the full info column, no extra padding. */
+.seek-settings .seek-progress-setting .setting-item-info {
+    flex: 1 1 auto;
+    min-width: 0;
+    margin-right: 16px;
+}
+.seek-settings .seek-progress-setting .seek-progress-row {
+    padding: 0;
+}
 .seek-settings .seek-progress-head {
     display: flex;
     justify-content: space-between;
@@ -1315,14 +1333,26 @@
     gap: 10px;
 }
 /* segmented: full width, options split evenly with bigger touch targets */
+/* Long option sets (Compute has 5) wrap onto extra rows instead of clipping.
+   Separators come from the 1px gap showing the border-colored track behind
+   the options, so they stay correct wherever a row breaks. */
 .is-phone .seek-settings .seek-seg {
     display: flex;
+    flex-wrap: wrap;
     width: 100%;
+    gap: 1px;
+    background: var(--background-modifier-border);
 }
 .is-phone .seek-settings .seek-seg-opt {
-    flex: 1 1 0;
-    padding: 9px 6px;
+    flex: 1 1 auto;
+    padding: 9px 10px;
     font-size: 13px;
+    white-space: nowrap;
+    border-right: none;
+    background: var(--background-primary);
+}
+.is-phone .seek-settings .seek-seg-opt.is-active {
+    background: var(--interactive-accent);
 }
 /* the recency row pairs a segmented + a date dropdown — each gets its own full line */
 .is-phone .seek-settings .setting-item-control .dropdown,

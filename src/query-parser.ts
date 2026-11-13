@@ -41,7 +41,7 @@
 // grouping, `match-case:`, line/block/section/task, `/regex/`.
 
 import type { ChunkMeta, QueryFilters, FilterContext, RecencyKeyChoice } from './types';
-import { parseDateMs } from './fusion';
+import { parseDateMs, recencyDate } from './fusion';
 import { toBindForm } from './prop-normalize';
 
 // Shared query-side tokenizer for `-term` negation (see tokenizeForMatch
@@ -167,20 +167,15 @@ export function periodBoundsMs(d: string): { start: number; end: number } | null
     return base === null ? null : { start: base, end: base };
 }
 
-// The date a date-FILTER reads for a chunk: the user's selected Recency field,
-// then mtime — and nothing else. Deliberately NARROWER than fusion.ts recencyDate
-// (the RANKING ladder), which also falls back to a filename date: parsing a date
-// out of a filename is too vault-specific to be a safe FILTER behavior (D4).
-// Missing both the selected property and mtime → null → the chunk is rejected.
+// The date a date-FILTER reads for a chunk: exactly the selected date field,
+// via the same resolver the ranker, recency arm and browse order use
+// (fusion.ts recencyDate). No mtime fallback in property mode (2026-11-11):
+// a note without the selected property has no date and is rejected.
 function filterDate(
     meta: ChunkMeta['metadata'] | undefined,
     dateField: { key: RecencyKeyChoice; createdProp: string },
 ): number | null {
-    const rawProp = dateField.createdProp === 'created' ? meta?.created : meta?.properties?.[dateField.createdProp];
-    const prop = dateField.key === 'modified'
-        ? meta?.modified
-        : (Array.isArray(rawProp) ? rawProp[0] : rawProp);
-    return parseDateMs(prop ?? meta?.modified);
+    return parseDateMs(recencyDate({ metadata: meta }, dateField.key, dateField.createdProp));
 }
 
 // Default date field for the permissive path (no ctx supplied): this vault's

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { hybridFusion, titleMatchBoost, theoreticalNormDense, theoreticalNormBm25, browseOrder, recencyDate, computeRecencyScore, parseDateMs } from './fusion';
+import { hybridFusion, titleMatchBoost, titlePrefixCredit, TITLE_PREFIX_CREDIT, titleFuzzyCredit, TITLE_FUZZY_CREDIT, editDistanceWithin,theoreticalNormDense, theoreticalNormBm25, browseOrder, recencyDate, computeRecencyScore, parseDateMs } from './fusion';
 
 describe('titleMatchBoost — token coverage (precision-scaled)', () => {
     const chunk = (note_path: string, aliases?: string[]) => ({ note_path, metadata: { aliases } });
@@ -133,6 +133,105 @@ describe('titleMatchBoost — token coverage (precision-scaled)', () => {
         const out = titleMatchBoost('coop co op', [chunk('Notes/Co-op.md')], B);
         expect(out[0]).toBeCloseTo(B, 10);
     });
+
+    describe('title fuzzy (typo tokens, caller-gated, partial credit)', () => {
+        // Caller contract: only OOV tokens get a budget; here "plannign" is the typo.
+        const budget = (tok: string) => (tok === 'plannign' ? 2 : 0);
+        const sdc = chunk('Example/FY27 SDC Planning.md');
+
+        it('a typo token fuzz-matches within its budget for 0.45·L/(L+d) credit', () => {
+            expect(TITLE_FUZZY_CREDIT).toBe(0.45);
+            const out = titleMatchBoost('fy27 plannign', [sdc], B, true, budget);
+            expect(out[0]).toBeCloseTo(B * ((1 + titleFuzzyCredit(8, 2)) / 3), 10);
+        });
+
+        it('no budget (fuzzy off or in-vocab token) keeps the exact gate', () => {
+            expect(titleMatchBoost('fy27 plannign', [sdc], B)[0]).toBe(0);
+            expect(titleMatchBoost('fy27 plannign', [sdc], B, true, () => 0)[0]).toBe(0);
+        });
+
+        it('the clean spelling still outranks the typo', () => {
+            const clean = titleMatchBoost('fy27 planning', [sdc], B)[0];
+            const typo = titleMatchBoost('fy27 plannign', [sdc], B, true, budget)[0];
+            expect(clean).toBeGreaterThan(typo);
+            expect(typo).toBeGreaterThan(0);
+        });
+
+        it('beyond the budget does not match', () => {
+            expect(titleMatchBoost('fy27 plnanign', [sdc], B, true, () => 1)[0]).toBe(0);
+        });
+
+        it('editDistanceWithin is plain Levenshtein with a cap', () => {
+            expect(editDistanceWithin('plannign', 'planning', 2)).toBe(2);   // transposition = 2
+            expect(editDistanceWithin('kinokunia', 'kinokuniya', 2)).toBe(1);
+            expect(editDistanceWithin('abc', 'xyz', 1)).toBe(2);             // capped at max + 1
+            expect(editDistanceWithin('same', 'same', 1)).toBe(0);
+        });
+    });
+
+    describe('title prefix (typeahead final token, 1-char floor, partial credit)', () => {
+        const title = chunk('Notes/Work/Evolving Infinity Search.md');
+        const P = titlePrefixCredit;
+
+        it('credit follows MiniSearch prefix weighting: 0.375 · L/(L + 0.3·d)', () => {
+            expect(TITLE_PREFIX_CREDIT).toBe(0.375);
+            expect(P(3, 3)).toBeCloseTo(0.375, 10);              // no unfinished tail
+            expect(P(3, 7)).toBeCloseTo(0.375 * 7 / 8.2, 10);    // "car" → "carboni"
+            expect(P(1, 5)).toBeLessThan(P(4, 5));               // more typed → more credit
+        });
+
+        it('a half-typed final token prefix-matches a title token for partial credit', () => {
+            expect(titleMatchBoost('evolving infini', [title], B)[0]).toBeCloseTo(B * ((1 + P(6, 8)) / 3), 10);
+        });
+
+        it('an exact longer title beats a one-word prefix title ("car")', () => {
+            const out = titleMatchBoost('car', [chunk("N/Cars and bikes.md"), chunk("N/Carboni's.md")], B);
+            expect(out[0]).toBeCloseTo(B / 3, 10);
+            expect(out[0]).toBeGreaterThan(out[1]);
+            expect(out[1]).toBeGreaterThan(0);
+        });
+
+        it('uses the best (shortest) completion among title tokens', () => {
+            const out = titleMatchBoost('x car', [chunk('N/X Carbonara Cart.md')], B)[0];
+            expect(out).toBeCloseTo(B * ((1 + P(3, 4)) / 3), 10);
+        });
+
+        it('an exact final token outranks a prefix one', () => {
+            const exact = titleMatchBoost('evolving infinity', [title], B)[0];
+            const partial = titleMatchBoost('evolving infini', [title], B)[0];
+            expect(exact).toBeCloseTo(B * (2 / 3), 10);
+            expect(exact).toBeGreaterThan(partial);
+            // "… ai": an `AI` title beats an `Aim` title of the same length.
+            const out = titleMatchBoost('alex ai', [chunk('N/Alex AI.md'), chunk('N/Alex Aim.md')], B);
+            expect(out[0]).toBeGreaterThan(out[1]);
+            expect(out[1]).toBeGreaterThan(0);
+        });
+
+        it('a single char after a finished token prefix-matches', () => {
+            const ganci = chunk('Meetings/Andrei Ganci 1x1 2026-10-13.md');
+            expect(titleMatchBoost('andrei g', [ganci], B)[0]).toBeGreaterThan(0);
+            expect(titleMatchBoost('andrei g', [chunk('People/Andrei Stefan.md')], B)[0]).toBe(0);
+        });
+
+        it('prefix = false is exact-only', () => {
+            expect(titleMatchBoost('evolving infini', [title], B, false)[0]).toBe(0);
+        });
+
+        it('only the final token may prefix-match', () => {
+            expect(titleMatchBoost('evolv infinity', [title], B)[0]).toBe(0);
+        });
+
+        it('a lone token under 3 chars never prefix-matches', () => {
+            expect(titleMatchBoost('e', [title], B)[0]).toBe(0);
+            expect(titleMatchBoost('ev', [title], B)[0]).toBe(0);
+            expect(titleMatchBoost('evo', [title], B)[0]).toBeCloseTo(B * (P(3, 8) / 3), 10);
+        });
+
+        it('applies to aliases too', () => {
+            const out = titleMatchBoost('agentic retr', [chunk('Notes/X.md', ['Agentic Retrieval Mode'])], B);
+            expect(out[0]).toBeCloseTo(B * ((1 + P(4, 9)) / 3), 10);
+        });
+    });
 });
 
 describe('theoreticalNormDense — fixed-endpoint cosine normalization', () => {
@@ -226,12 +325,12 @@ describe('browseOrder — filter-only fast-path ordering (audit 2026-06-09 §1)'
         expect(backward).toEqual(forward);
     });
 
-    it('falls back to modified when created is missing', () => {
+    it('does NOT fall back to modified when created is missing (undated sorts last)', () => {
         const input = [
-            chunk('Notes/CreatedOld.md', '2025-01-01'),
             chunk('Notes/ModifiedNew.md', null, { modified: '2026-01-01' }),
+            chunk('Notes/CreatedOld.md', '2025-01-01'),
         ];
-        expect(paths(browseOrder(input))).toEqual(['Notes/ModifiedNew.md', 'Notes/CreatedOld.md']);
+        expect(paths(browseOrder(input))).toEqual(['Notes/CreatedOld.md', 'Notes/ModifiedNew.md']);
     });
 
     it('keeps undated chunks, after all dated ones, sorted by path', () => {
@@ -273,16 +372,16 @@ describe('browseOrder — filter-only fast-path ordering (audit 2026-06-09 §1)'
         expect(browseOrder.length).toBe(1);
     });
 
-    it("key 'modified' sorts by mtime and falls back to created", () => {
+    it("key 'modified' sorts by mtime only", () => {
         const input = [
             chunk('Notes/CreatedNew.md', '2026-06-01', { modified: '2025-01-01' }), // newest created, oldest mtime
             chunk('Notes/ModifiedNew.md', '2024-01-01', { modified: '2026-01-01' }),
-            chunk('Notes/OnlyCreated.md', '2025-06-01'), // no mtime → created fallback
+            chunk('Notes/OnlyCreated.md', '2025-06-01'), // no mtime → undated, last
         ];
         expect(paths(browseOrder(input, 'modified'))).toEqual([
             'Notes/ModifiedNew.md', // 2026-01-01 (mtime)
-            'Notes/OnlyCreated.md', // 2025-06-01 (created fallback)
             'Notes/CreatedNew.md',  // 2025-01-01 (mtime — created date deliberately ignored)
+            'Notes/OnlyCreated.md', // no mtime → undated
         ]);
     });
 });
@@ -291,42 +390,28 @@ describe('recencyDate — the shared recency accessor (arm ⇄ scorer ⇄ browse
     const c = (metadata: { created?: string | null; modified?: string | null; properties?: Record<string, string> }, note_path?: string) =>
         ({ note_path, metadata });
 
-    it("'created' prefers created, falls back to modified", () => {
+    it("'created' reads created only — no mtime fallback", () => {
         expect(recencyDate(c({ created: '2025-01-01', modified: '2026-01-01' }), 'created')).toBe('2025-01-01');
-        expect(recencyDate(c({ created: null, modified: '2026-01-01' }), 'created')).toBe('2026-01-01');
+        expect(recencyDate(c({ created: null, modified: '2026-01-01' }), 'created')).toBeNull();
     });
-    it("'modified' prefers modified, falls back to created", () => {
+    it("'modified' reads modified only — no created fallback", () => {
         expect(recencyDate(c({ created: '2025-01-01', modified: '2026-01-01' }), 'modified')).toBe('2026-01-01');
-        expect(recencyDate(c({ created: '2025-01-01', modified: null }), 'modified')).toBe('2025-01-01');
+        expect(recencyDate(c({ created: '2025-01-01', modified: null }), 'modified')).toBeNull();
     });
     it('undefined chunk/metadata → null (neutral under the additive ε term)', () => {
         expect(recencyDate(undefined, 'created')).toBeNull();
         expect(recencyDate(c({}), 'modified')).toBeNull();
     });
-
-    // ---- Portability ladder (createdProp + filename date) ----
     it('a custom createdProp reads the indexed properties map (read-side, no reindex)', () => {
         const chunk = c({ created: null, modified: '2026-01-01', properties: { 'date created': '2025-03-10' } });
         expect(recencyDate(chunk, 'created', 'date created')).toBe('2025-03-10');
     });
-    it('custom prop missing → falls back to the canonical created field, then filename', () => {
-        expect(recencyDate(c({ created: '2025-03-10', properties: {} }), 'created', 'dateCreated')).toBe('2025-03-10');
-        expect(recencyDate(c({ properties: {} }, 'Daily/2026-06-02.md'), 'created', 'dateCreated')).toBe('2026-06-02');
+    it('custom prop missing → null: never substitutes `created`, a filename date, or mtime', () => {
+        expect(recencyDate(c({ created: '2025-03-10', modified: '2026-01-01', properties: {} }), 'created', 'dateCreated')).toBeNull();
+        expect(recencyDate(c({ properties: {} }, 'Daily/2026-06-02.md'), 'created', 'dateCreated')).toBeNull();
     });
-    it('no frontmatter at all → YYYY-MM-DD in the filename (daily / dated series notes)', () => {
-        expect(recencyDate(c({}, 'Daily/2026-06-11.md'), 'created')).toBe('2026-06-11');
-        expect(recencyDate(c({}, 'Notes/Alex 1x1 2026-05-19.md'), 'created')).toBe('2026-05-19');
-    });
-    it('filename date requires the full dashed form with valid month/day — bare years and Jira tokens never count', () => {
-        expect(recencyDate(c({}, 'Notes/PROJ-2018 rollout.md'), 'created')).toBeNull();
-        expect(recencyDate(c({}, 'Notes/Plans 2026.md'), 'created')).toBeNull();
-        expect(recencyDate(c({}, 'Notes/2026-13-99 weird.md'), 'created')).toBeNull();
-    });
-    it('frontmatter property outranks the filename date', () => {
-        expect(recencyDate(c({ created: '2024-01-01' }, 'Notes/Meeting 2026-05-19.md'), 'created')).toBe('2024-01-01');
-    });
-    it("the ladder backs the 'modified' key too (mtime missing → created ladder)", () => {
-        expect(recencyDate(c({}, 'Daily/2026-06-11.md'), 'modified')).toBe('2026-06-11');
+    it('no frontmatter → null, even with a YYYY-MM-DD filename', () => {
+        expect(recencyDate(c({ modified: '2026-11-07' }, 'Daily/2026-06-11.md'), 'created')).toBeNull();
     });
 });
 

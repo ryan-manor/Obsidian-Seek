@@ -9,7 +9,7 @@
 // the inline-filter query string the search pipeline already parses.
 
 import { App, Modal, Notice, Platform, TFile, MarkdownView, MarkdownRenderer, Component, setIcon } from 'obsidian';
-import type { ScoredChunk, SearchEntry, ClickEntry, SeekSettings } from './types';
+import type { ScoredChunk, SearchEntry, ClickEntry, SeekSettings, OpenMethod } from './types';
 import type { RecentSearches } from './recents';
 import { nextRecentIndex } from './recents';
 import { MATCH_STRENGTH_MIN_NOTES } from './types';
@@ -22,6 +22,7 @@ import { buildPassageTerms, markPattern } from './passage';
 import { matchStrength } from './dense-stats';
 import { SuggestEngine } from './suggest';
 import { PillQueryField } from './query-field';
+import { scrollEditorToLine } from './chunk-scroll';
 import {
     buildNoteLink,
     insertLinkInEditor,
@@ -33,7 +34,7 @@ import {
 // render thread (iframe = same event loop) and on iOS the stage-1 binary scan is
 // synchronous too, so every fired search is costly. A wider debounce drops the
 // count of wasted in-flight embeds while the user is still typing.
-const DEBOUNCE_MS = Platform.isMobile ? 400 : 200;
+const DEBOUNCE_MS = Platform.isMobile ? 400 : 150;
 
 // How long after the last keystroke (with results showing) we consider the query
 // "settled" and signal the plugin to drain catch-up indexing — the safest mobile
@@ -228,6 +229,55 @@ export interface ResultOpenInfo {
     // already builds — the companion doesn't have to re-derive them for Seek opens.
     searchId: string;
     dwellMs: number;
+    // Which gesture opened it (see OpenMethod). Lets the harvest tell a keyboard
+    // open from a pointer open; additive, so older consumers ignore it.
+    openMethod: OpenMethod;
+}
+
+// How a result was opened from the modal:
+//   click      plain mouse click (desktop)
+//   mod-click  ⌘/Ctrl+click → alt-open target
+//   tap        touch tap on a result row (mobile; no modifiers exist there)
+//   enter      Enter on the keyboard-selected row (arrows/hover move the selection)
+//   mod-enter  ⌘/Ctrl+Enter → alt-open target
+// Every open path funnels through openResult with one of these, so each emits
+// exactly one ClickEntry + one relay event with the same schema.
+export type { OpenMethod };
+
+export function openMethodFor(source: 'pointer' | 'key', accel: boolean, mobile: boolean): OpenMethod {
+    if (source === 'key') return accel ? 'mod-enter' : 'enter';
+    if (mobile && !accel) return 'tap';
+    return accel ? 'mod-click' : 'click';
+}
+
+// Window inside which a second open of the SAME result is treated as the same
+// gesture (a double-click, Enter key-repeat, or a click and an Enter landing on
+// one row together), so it is neither re-opened nor re-logged.
+export const DUPLICATE_OPEN_MS = 600;
+
+// Admission gate for openResult. A plain open replaces the active tab and closes
+// the modal, so once one has started every later open in this modal is a
+// duplicate (the close is async; a second click/Enter can land before it). Alt-
+// opens keep the modal up for deliberate fan-out, so only a repeat of the same
+// chunk within DUPLICATE_OPEN_MS is dropped there.
+export class OpenGate {
+    private plainStarted = false;
+    private last: { chunkId: string; at: number } | null = null;
+
+    admit(chunkId: string, newTab: boolean, now: number): boolean {
+        if (this.plainStarted) return false;
+        if (this.last && this.last.chunkId === chunkId && now - this.last.at < DUPLICATE_OPEN_MS) return false;
+        this.last = { chunkId, at: now };
+        if (!newTab) this.plainStarted = true;
+        return true;
+    }
+
+    // A plain open that bailed before opening anything (result no longer on
+    // disk) must not lock the modal: re-arm so the user can pick another row.
+    release(): void {
+        this.plainStarted = false;
+        this.last = null;
+    }
 }
 
 export class SeekSearchModal extends Modal {
@@ -295,6 +345,8 @@ export class SeekSearchModal extends Modal {
     private latestSearchEntry: SearchEntry | null = null;
     private latestResultsShown: ScoredChunk[] = [];
     private latestSearchCompletedAt = 0;
+    // Dedups opens across the pointer and keyboard paths (see OpenGate).
+    private openGate = new OpenGate();
 
     // Snippet-mark matcher for the CURRENT query, cached on the cleanedQuery
     // string (applyRow runs once per row per search — rebuilding the regex per
@@ -334,7 +386,7 @@ export class SeekSearchModal extends Modal {
     private onQueryInFlight?: (inFlight: boolean) => void;
     private inFlight = 0;
 
-    // Debounce for the post-query "settled" signal (separate from the 200 ms search
+    // Debounce for the post-query "settled" signal (separate from the DEBOUNCE_MS search
     // debounce). Reset on every keystroke; fires onSearchActivity(false) on idle.
     private settleTimer: number | null = null;
 
@@ -671,7 +723,7 @@ export class SeekSearchModal extends Modal {
         if (!query.trim()) {
             // Invalidate any in-flight search, not just the debounce timer:
             // runSearch's stale check is `id !== currentSearch`, so without the
-            // bump a search dispatched 200 ms ago would paint results over the
+            // bump a search dispatched a debounce ago would paint results over the
             // empty state the user just cleared to. Drop the search context too
             // so a click/capture can't reference results that aren't shown.
             this.currentSearch++;
@@ -1098,7 +1150,9 @@ export class SeekSearchModal extends Modal {
                 this.insertResultLink(row.data);
                 return;
             }
-            void this.openResult(row.data, this.rows.indexOf(row) + 1, e.metaKey || e.ctrlKey);
+            const accel = e.metaKey || e.ctrlKey;
+            void this.openResult(row.data, this.rows.indexOf(row) + 1, accel,
+                openMethodFor('pointer', accel, Platform.isMobile));
         });
         el.addEventListener('mousemove', () => {
             const idx = this.rows.indexOf(row);
@@ -1284,7 +1338,7 @@ export class SeekSearchModal extends Modal {
         // open a note — so it's ignored.
         if (this.currentResults.length === 0) { this.runSelectedRecent(); return; }
         const r = this.currentResults[this.selectedIndex];
-        if (r) void this.openResult(r, this.selectedIndex + 1, newTab);
+        if (r) void this.openResult(r, this.selectedIndex + 1, newTab, openMethodFor('key', newTab, Platform.isMobile));
     }
 
     // ---- resting-state recent-search keyboard model ----
@@ -1375,7 +1429,22 @@ export class SeekSearchModal extends Modal {
         return titleNavCoverage(r, this.settings.navTitleBoost);
     }
 
-    private async openResult(r: ScoredChunk, rank: number, newTab: boolean): Promise<void> {
+    private async openResult(r: ScoredChunk, rank: number, newTab: boolean, method: OpenMethod): Promise<void> {
+        // One gesture, one open: drop a duplicate (double-click, key-repeat, or a
+        // pointer + keyboard handler both firing) before it opens or logs anything.
+        if (!this.openGate.admit(r.chunk_id, newTab, performance.now())) return;
+        try {
+            await this.openAdmitted(r, rank, newTab, method);
+        } catch (e) {
+            // A failed open (file vanished mid-read, a view plugin threw) must not
+            // leave the gate latched, or every later pick in this modal is dropped.
+            this.openGate.release();
+            console.error('[seek] result open failed', e);
+        }
+    }
+
+    private async openAdmitted(r: ScoredChunk, rank: number, newTab: boolean, method: OpenMethod): Promise<void> {
+
         // Known-item lookup? See TITLE_NAV_COVERAGE_MIN. Decided up front so the
         // click log records which open behavior the user actually got.
         const titleNav = this.titleCoverage(r) >= TITLE_NAV_COVERAGE_MIN;
@@ -1383,11 +1452,11 @@ export class SeekSearchModal extends Modal {
         // Emit click event BEFORE opening the file — the file-open switches
         // workspace state and might cancel pending work. We don't await the
         // logger write so click latency stays imperceptible.
-        this.emitClick(r, rank, titleNav, newTab, newTab ? this.altOpenTarget() : 'same');
+        this.emitClick(r, rank, titleNav, newTab, newTab ? this.altOpenTarget() : 'same', method);
         this.captureRecent();
 
         const file = this.app.vault.getAbstractFileByPath(r.note_path);
-        if (!(file instanceof TFile)) return;
+        if (!(file instanceof TFile)) { this.openGate.release(); return; }
 
         // A .base is a saved query/view, not editable text. Skip the markdown
         // highlight + scroll path (buildMatchHighlight/scrollLeafToChunk assume a
@@ -1489,17 +1558,13 @@ export class SeekSearchModal extends Modal {
     }
 
     // Move the leaf's editor cursor to the matched chunk's start line and scroll
-    // it into view. Works on a background (active: false) leaf too, so a fanned-
-    // out new tab still lands on the right chunk.
+    // that line to the top of the viewport (see ./chunk-scroll for why start
+    // line only, top-aligned). Works on a background (active: false) leaf too,
+    // so a fanned-out new tab still lands on the right chunk.
     private scrollLeafToChunk(leaf: { view: unknown }, r: ScoredChunk): void {
         const view = leaf.view;
         if (view instanceof MarkdownView && r.start_line > 0) {
-            const editor = view.editor;
-            editor.setCursor({ line: Math.max(0, r.start_line - 1), ch: 0 });
-            editor.scrollIntoView({
-                from: { line: r.start_line - 1, ch: 0 },
-                to: { line: r.end_line, ch: 0 },
-            }, true);
+            scrollEditorToLine(view.editor, r.start_line);
         }
     }
 
@@ -1516,7 +1581,7 @@ export class SeekSearchModal extends Modal {
         }
     }
 
-    private emitClick(r: ScoredChunk, rank: number, titleNavOpen: boolean, newTab: boolean, openTarget: 'same' | 'tab' | 'split' | 'window'): void {
+    private emitClick(r: ScoredChunk, rank: number, titleNavOpen: boolean, newTab: boolean, openTarget: 'same' | 'tab' | 'split' | 'window', openMethod: OpenMethod): void {
         const entry = this.latestSearchEntry;
         if (!entry) return; // stale render or no search context — drop
         const dwellMs = this.latestSearchCompletedAt > 0
@@ -1527,7 +1592,8 @@ export class SeekSearchModal extends Modal {
             timestamp: new Date().toISOString(),
             searchId: entry.searchId,
             query: entry.query,
-            chunk_id: r.chunk_id,
+            chunk_id: r.rank_chunk_id ?? r.chunk_id,
+            ...(r.rank_chunk_id && { displayChunkId: r.chunk_id }),
             note_path: r.note_path,
             rank,
             score: r.score,
@@ -1537,11 +1603,12 @@ export class SeekSearchModal extends Modal {
             title_boost: r.ranking_signals.title_boost,
             titleNavOpen,
             dwellMs: parseFloat(dwellMs.toFixed(0)),
-            shownTop10: this.latestResultsShown.slice(0, 10).map(c => c.chunk_id),
+            shownTop10: this.latestResultsShown.slice(0, 10).map(c => c.rank_chunk_id ?? c.chunk_id),
+            openMethod,
         };
         // Fire-and-forget; click latency matters more than a guaranteed write.
         this.logger.append(click).catch(e => console.error('[seek] click log failed:', e));
         // Relay to the companion logger with the open modifiers (no-op if absent).
-        this.onResultOpen?.({ r, rank, titleNavOpen, newTab, openTarget, searchId: click.searchId, dwellMs: click.dwellMs });
+        this.onResultOpen?.({ r, rank, titleNavOpen, newTab, openTarget, searchId: click.searchId, dwellMs: click.dwellMs, openMethod });
     }
 }

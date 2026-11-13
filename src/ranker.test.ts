@@ -91,7 +91,9 @@ describe('rank — recency ε-tiebreaker (2026-06-11, [[Seek Rel]] §Recency Pla
     // The shipped default is Off (ε=0), under which every assertion here would be
     // vacuous — pin the Recency "Default" stage (settings-tab.ts RECENCY_VALUE)
     // so these tests exercise the tiebreaker as a user who turns it on gets it.
-    const tiebreaker = { ...DEFAULT_RANKING_CONFIG, recencyEpsilon: 0.04, recencyHalfLifeDays: 180 };
+    // recencyKey 'created': the fixtures carry created dates only, and since
+    // 2026-11-11 'modified' no longer falls back to created (fusion.ts recencyDate).
+    const tiebreaker = { ...DEFAULT_RANKING_CONFIG, recencyEpsilon: 0.04, recencyHalfLifeDays: 180, recencyKey: 'created' as const };
 
     it('breaks an exact score tie newest-first (the dated-series case)', () => {
         // Two series siblings: identical dense + bm25 (the realistic near-tie:

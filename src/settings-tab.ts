@@ -41,8 +41,9 @@ const RESUME_LABEL_DELAY_MS = 3000;
 // here and correctly says CPU. Deliberately just the two outcomes: WHY a device is
 // on CPU (override / post-crash demote / off the allowlist / failed init) belongs to
 // the compute control in Model & performance, not to a progress bar.
-function backendLine(backend: Device | null): string {
+function backendLine(backend: Device | null, engine: 'ort' | 'wgsl' | null = null): string {
     if (backend === null) return 'Loading the model…';
+    if (engine === 'wgsl') return 'Indexing on GPU (Seek engine)';
     return backend === 'webgpu' ? 'Indexing on GPU (WebGPU)' : 'Indexing on CPU';
 }
 
@@ -73,14 +74,17 @@ function fmtStamp(iso: string): string {
 // ---- segmented (pill) stages ------------------------------------------------------
 type Stage = 'Off' | 'Default' | 'High';
 
-// Title bonus maps the navTitleBoost scalar onto three stages. The eval-swept knee is
-// 0.8 (now reachable as High); the 2026-06-19 ratification ships Default=0.5 (see
-// types.ts navTitleBoost). titleStageOf() snaps any persisted/off-grid value to the
-// nearest stage so a hand-tuned legacy value still selects something sensible.
-const TITLE_VALUE: Record<Stage, number> = { Off: 0, Default: 0.5, High: 0.8 };
+// Title bonus maps the navTitleBoost scalar onto three stages, matching Recency.
+// Off=0 / Default=0.25 / High=0.5 (2026-11-11 re-sweep, see types.ts navTitleBoost:
+// the boost saturates by ~0.5, so High needs no more headroom, and Default sits low
+// enough that a title hit doesn't jump body-relevant notes on exploratory queries).
+// titleStageOf() snaps any persisted/off-grid value to the nearest stage so a
+// hand-tuned legacy value still selects something sensible.
+const TITLE_STAGES: Stage[] = ['Off', 'Default', 'High'];
+const TITLE_VALUE: Record<Stage, number> = { Off: 0, Default: 0.25, High: 0.5 };
 function titleStageOf(v: number): Stage {
     let best: Stage = 'Default';
-    for (const stage of ['Off', 'Default', 'High'] as Stage[]) {
+    for (const stage of TITLE_STAGES) {
         if (Math.abs(TITLE_VALUE[stage] - v) < Math.abs(TITLE_VALUE[best] - v)) best = stage;
     }
     return best;
@@ -129,10 +133,12 @@ function recencyStageOf(eps: number): Stage {
     return Math.abs(eps - RECENCY_VALUE.Default.eps) <= Math.abs(eps - RECENCY_VALUE.High.eps) ? 'Default' : 'High';
 }
 
-// Search strategy: Balanced (denseWeight 0.8) vs Keyword focused (0.3). Concept-focused
-// (0.9) was cut. Split at the midpoint so a legacy denseWeight still resolves a side.
+// Search strategy: Balanced (the shipped default denseWeight) vs Keyword focused (0.3).
+// Concept-focused (0.9) was cut. Split at the midpoint so a legacy denseWeight still
+// resolves a side. Balanced reads DEFAULT_SETTINGS so it can't drift from the default
+// again (it was hard-coded 0.8 after rev 8 raised the default to 0.85; see rev 13).
 type Strategy = 'balanced' | 'keyword';
-const STRATEGY_VALUE: Record<Strategy, number> = { balanced: 0.8, keyword: 0.3 };
+const STRATEGY_VALUE: Record<Strategy, number> = { balanced: DEFAULT_SETTINGS.denseWeight, keyword: 0.3 };
 function strategyOf(denseWeight: number): Strategy {
     return denseWeight <= 0.55 ? 'keyword' : 'balanced';
 }
@@ -417,7 +423,12 @@ export class SeekSettingTab extends PluginSettingTab {
             const label = resuming
                 ? (this.resumeSlow && !this.resumeProgressed ? 'Resuming…' : 'Indexing…')
                 : 'Reindexing…';
-            const row = containerEl.createDiv({ cls: 'seek-progress-row' });
+            // The meter lives inside a native Setting card: progress fills the info
+            // (left) side and Pause sits in the control (right) side, so the row reads
+            // as one card instead of a free-floating bar over an empty button card.
+            const setting = new Setting(containerEl);
+            setting.settingEl.addClass('seek-progress-setting');
+            const row = setting.infoEl.createDiv({ cls: 'seek-progress-row' });
             const head = row.createDiv({ cls: 'seek-progress-head' });
             head.createDiv({ cls: 'setting-item-name', text: label });
             this.progressLabelEl = head.createDiv({ cls: 'seek-progress-count' });
@@ -433,7 +444,7 @@ export class SeekSettingTab extends PluginSettingTab {
             // → themed for free (no custom CSS). "Pausing…" bridges the gap between the
             // click and the pass returning (it finishes its in-flight file first).
             if (!resuming) {
-                new Setting(containerEl).addButton(b => {
+                setting.addButton(b => {
                     b.setButtonText(this.pausing ? 'Pausing…' : 'Pause');
                     if (this.pausing) b.setDisabled(true);
                     else b.onClick(() => this.pauseReindex());
@@ -605,7 +616,7 @@ export class SeekSettingTab extends PluginSettingTab {
         if (this.progressLabelEl) {
             this.progressLabelEl.setText(`${this.reindexDone.toLocaleString()} / ${this.reindexTotal.toLocaleString()} notes · ${pct}%`);
         }
-        if (this.progressBackendEl) this.progressBackendEl.setText(backendLine(this.plugin.activeBackend));
+        if (this.progressBackendEl) this.progressBackendEl.setText(backendLine(this.plugin.activeBackend, this.plugin.activeEngine));
     }
 
     // ---- Relevance -----------------------------------------------------------------
@@ -722,13 +733,14 @@ export class SeekSettingTab extends PluginSettingTab {
         const title = new Setting(adv)
             .setName('Title bonus')
             .setDesc("Gives a score bonus to notes which have matching terms in their title. This can help a note that represents an entity or topic outrank pages that merely mention it.");
-        this.addSegmented(title, ['Off', 'Default', 'High'], titleStageOf(this.s.navTitleBoost), (pick) => {
+        this.addSegmented(title, TITLE_STAGES, titleStageOf(this.s.navTitleBoost), (pick) => {
             void (async () => {
                 this.s.navTitleBoost = TITLE_VALUE[pick as Stage];
                 await this.save();
                 this.rerender(); // re-bold the pipeline "title" sub-label
             })();
         });
+
     }
 
     // ---- Display -------------------------------------------------------------------
@@ -787,11 +799,13 @@ export class SeekSettingTab extends PluginSettingTab {
 
         // Compute backend — PER-DEVICE (localStorage), never synced. Auto / Force CPU /
         // Force WebGPU map to the platform.ts override values auto / wasm / webgpu.
+        // The GPU path is the Seek engine (Seek's own WebGPU encoder), falling back
+        // to ONNX Runtime; see platform.ts resolveDevice for the per-device default.
         const computeLabel: Record<BackendChoice, string> = { auto: 'Auto', wasm: 'Force CPU', webgpu: 'Force WebGPU' };
         const labelToChoice: Record<string, BackendChoice> = { Auto: 'auto', 'Force CPU': 'wasm', 'Force WebGPU': 'webgpu' };
         const compute = new Setting(containerEl)
             .setName('Compute')
-            .setDesc('How the embedding model runs on this device (this option is not synced to other devices). Auto uses WebGPU when available and falls back to CPU. Changing this setting is not recommended.');
+            .setDesc('How the embedding model runs on this device (this option is not synced to other devices). Auto runs on the GPU with Seek\'s built-in WebGPU engine where supported, and falls back to CPU otherwise. Force WebGPU tries the GPU even where Auto would not. Takes effect the next time the model loads. Changing this setting is not recommended.');
         this.addSegmented(compute, ['Auto', 'Force CPU', 'Force WebGPU'], computeLabel[getBackendOverride()], (pick) => {
             setBackendOverride(labelToChoice[pick]);
             this.rerender(); // forcing WebGPU clears a prior sticky demote; reflect it

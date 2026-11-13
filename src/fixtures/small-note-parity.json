@@ -1,0 +1,95 @@
+{
+  "counter": "whitespace words + 2",
+  "cases": [
+    {
+      "name": "three one-line h2s collapse",
+      "path": "Notes/Standup.md",
+      "markdown": "## Yesterday\nShipped the tokenizer fix and closed two review threads.\n\n## Today\nPairing on the sidecar compaction path with the mobile build.\n\n## Blockers\nWaiting on the eval harness rerun before promoting.\n",
+      "expected": [
+        {
+          "title": "Standup",
+          "content": "Yesterday\nShipped the tokenizer fix and closed two review threads.\n\nToday\nPairing on the sidecar compaction path with the mobile build.\n\nBlockers\nWaiting on the eval harness rerun before promoting.",
+          "heading_path": []
+        }
+      ]
+    },
+    {
+      "name": "frontmatter, aliases, empty h1 parent written once",
+      "path": "Notes/Alex 1x1 2026-05-20.md",
+      "markdown": "---\naliases: [Alex sync]\npageType: meetings\ncontext: work\n---\n# Alex 1x1\n\n## Agenda\nRoadmap review for the second half and hiring plan.\n\n## Actions\nSend the planning doc and book the follow up session.\n",
+      "expected": [
+        {
+          "title": "Alex 1x1 2026-05-20 | Alex sync",
+          "content": "Alex 1x1\nAgenda\nRoadmap review for the second half and hiring plan.\n\nActions\nSend the planning doc and book the follow up session.",
+          "heading_path": []
+        }
+      ]
+    },
+    {
+      "name": "preamble before the first heading",
+      "path": "Notes/Trip.md",
+      "markdown": "Packing list and loose plans for the long weekend away.\n\n## Friday\nDrive up after lunch and check in before dinner time.\n\n## Saturday\nHike the ridge trail early then the market in town.\n",
+      "expected": [
+        {
+          "title": "Trip",
+          "content": "Packing list and loose plans for the long weekend away.\n\nFriday\nDrive up after lunch and check in before dinner time.\n\nSaturday\nHike the ridge trail early then the market in town.",
+          "heading_path": []
+        }
+      ]
+    },
+    {
+      "name": "same heading text twice under different parents",
+      "path": "Notes/Retro.md",
+      "markdown": "# Sprint 12\n## Notes\nVelocity held steady and the release went out clean.\n\n# Sprint 13\n## Notes\nTwo incidents slowed review and one rollback was needed.\n",
+      "expected": [
+        {
+          "title": "Retro",
+          "content": "Sprint 12\nNotes\nVelocity held steady and the release went out clean.\n\nSprint 13\nNotes\nTwo incidents slowed review and one rollback was needed.",
+          "heading_path": []
+        }
+      ]
+    },
+    {
+      "name": "bigger note keeps its small sections",
+      "path": "Notes/Design.md",
+      "markdown": "## Summary\nOne line summary of the design goes right here today.\n\n## Detail\nword0 word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26 word27 word28 word29 word30 word31 word32 word33 word34 word35 word36 word37 word38 word39 word40 word41 word42 word43 word44 word45 word46 word47 word48 word49 word50 word51 word52 word53 word54 word55 word56 word57 word58 word59 word60 word61 word62 word63 word64 word65 word66 word67 word68 word69 word70 word71 word72 word73 word74 word75 word76 word77 word78 word79\n\n## Open\nOne open question still remains about the storage tier choice.\n",
+      "expected": [
+        {
+          "title": "Design > Summary",
+          "content": "One line summary of the design goes right here today.",
+          "heading_path": [
+            "Summary"
+          ]
+        },
+        {
+          "title": "Design > Detail",
+          "content": "word0 word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26 word27 word28 word29 word30 word31 word32 word33 word34 word35 word36 word37 word38 word39 word40 word41 word42 word43 word44 word45 word46 word47 word48 word49 word50 word51 word52 word53 word54 word55 word56 word57 word58 word59 word60 word61 word62 word63 word64 word65 word66 word67 word68 word69 word70 word71 word72 word73 word74 word75 word76 word77 word78 word79",
+          "heading_path": [
+            "Detail"
+          ]
+        },
+        {
+          "title": "Design > Open",
+          "content": "One open question still remains about the storage tier choice.",
+          "heading_path": [
+            "Open"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "single section note is untouched",
+      "path": "Notes/Idea.md",
+      "markdown": "## Idea\nA single short section with nothing else in the whole note.\n",
+      "expected": [
+        {
+          "title": "Idea > Idea",
+          "content": "A single short section with nothing else in the whole note.",
+          "heading_path": [
+            "Idea"
+          ]
+        }
+      ]
+    }
+  ]
+}

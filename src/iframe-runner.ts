@@ -12,6 +12,7 @@
 
 import type { Device, RequestedDevice, Dtype } from './types';
 import { ACTIVE_MODEL_SPEC } from './model-registry';
+import { WGSL_SELFTEST } from './wgsl-selftest';
 
 declare const __BUILD_TS__: string;
 
@@ -78,6 +79,18 @@ export const SEQ_BUCKETS = [32, 48, 64, 96, 128, 192, 256, 384, 512];
 // live iframeEmbedMs, not assumed.
 export const QUERY_SEQ_BUCKETS = [8, 16, 32, 48, 64, 96, 128];
 
+// WGSL_MAX_ROWS: the Seek engine's activation sizing, B*S rows per forward.
+// GPU memory = 17.8 MB weights + ~24.6 KB/row, allocated once at load (1024 ->
+// ~43 MB; the old 4096 was ~119 MB, ~85% never touched). The indexer's largest
+// dispatch is rollingBatchFor(b)*b over SEQ_BUCKETS (576 today); bigger inputs
+// are split by the shim's greedy sub-batcher, so this also caps the worst
+// non-preemptible GPU pass. Must stay >= 512 (one max-length chunk).
+// Single source of truth: injected into the iframe template below.
+export const WGSL_MAX_ROWS = 1024;
+
+// Which shape grid a WebGPU load warms — see IframeRunner.load.
+export type WarmupProfile = 'full' | 'query';
+
 // Parent-side CHAR-ESTIMATE bucket selector — legacy fallback only. The
 // ceil(chars/4.5) estimate under-buckets dense text (URLs, paths, numbers,
 // code run ~3.6 chars/token), silently truncating BELOW the 512 cap — the
@@ -143,6 +156,12 @@ export interface IframeInit {
 
 export interface LoadResult {
     device: Device;
+    // Which inference engine runs the model: 'ort' (transformers.js/ONNX
+    // Runtime, the default) or 'wgsl' (EXPERIMENTAL hand-written WebGPU encoder,
+    // compute option 'wgsl'). device is 'webgpu' for both GPU engines.
+    engine?: 'ort' | 'wgsl';
+    // Why a requested 'wgsl' load fell back to ORT (null when not requested or OK).
+    wgslError?: string | null;
     dtype: Dtype;
     coldStartMs: number;
     // Wall-time of the WebGPU warmup loop only (40 forced dispatches that
@@ -370,8 +389,13 @@ export class IframeRunner {
     // (see embedder.ts). If true AND the WebGPU path succeeds, the iframe
     // bypasses the 40-dispatch shader-compile loop entirely. Always pay the
     // warmup on the WASM path or on a fingerprint miss.
-    load(modelId: string, device: RequestedDevice, dtype: Dtype, skipWarmup: boolean, revision?: string | null): Promise<LoadResult> {
-        return this.send<LoadResult>('load', { modelId, device, dtype, skipWarmup, revision: revision ?? null }, LOAD_RPC_TIMEOUT_MS);
+    // warmupProfile: 'full' warms the whole indexer grid (WARMUP_BATCH_SIZES ×
+    // SEQ_BUCKETS + query floors, ~74 shapes). 'query' (EXPERIMENTAL, the
+    // query-only-GPU mode) warms just batch 1 × QUERY_SEQ_BUCKETS (7 shapes):
+    // a session that never runs an indexing batch on WebGPU shouldn't pay the
+    // compile time, or grow the ORT buffer/shader pool, for shapes it won't use.
+    load(modelId: string, device: RequestedDevice, dtype: Dtype, skipWarmup: boolean, revision?: string | null, warmupProfile: WarmupProfile = 'full'): Promise<LoadResult> {
+        return this.send<LoadResult>('load', { modelId, device, dtype, skipWarmup, revision: revision ?? null, warmupProfile }, LOAD_RPC_TIMEOUT_MS);
     }
 
     embed(text: string): Promise<EmbedResult> {
@@ -396,7 +420,7 @@ export class IframeRunner {
         return this.send<number[]>('token-counts', { texts });
     }
 
-    // Load ONLY the tokenizer (vocab/merges JSON, a few MB) — no ONNX model
+    // Load ONLY the tokenizer (vocab/merges JSON, 25 MB for ml97) — no ONNX model
     // weights. Lets the sidecar hydrate reproduce the token-budget chunk splits
     // (and therefore exact chunk_ids) without the ~250 MB model load it exists
     // to avoid on mobile. Idempotent in the child; tokenCounts() then works
@@ -460,6 +484,11 @@ export class IframeRunner {
 // Exported for testing only — the string content of the RPC dispatch handler
 // (e.g. the source-origin check) can't be exercised via a real srcdoc iframe
 // in the node test env, so tests assert on the emitted script text instead.
+// EXPERIMENTAL WGSL engine bundle (esbuild define; see esbuild.config.mjs).
+// Absent under vitest, where the child script is only inspected as text.
+declare const __WGSL_ENGINE_SRC__: string | undefined;
+const WGSL_ENGINE_SRC = typeof __WGSL_ENGINE_SRC__ === 'string' ? __WGSL_ENGINE_SRC__ : '';
+
 export function buildChildScript(cdnUrl: string, outputDim: number): string {
     // Script body runs INSIDE the iframe. It imports transformers.js from CDN,
     // owns pipeline state, and responds to postMessage RPCs from the parent.
@@ -469,13 +498,16 @@ export function buildChildScript(cdnUrl: string, outputDim: number): string {
     // template literal in the parent — code inside it must NOT use backticks or
     // ${} (single-quote concatenation only), or the parent will eval it.
     return `
+${WGSL_ENGINE_SRC}
 const CDN_URL = ${JSON.stringify(cdnUrl)};
 const WARMUP_BATCH_SIZES = ${JSON.stringify(WARMUP_BATCH_SIZES)};
 const SEQ_BUCKETS = ${JSON.stringify(SEQ_BUCKETS)};
 const QUERY_SEQ_BUCKETS = ${JSON.stringify(QUERY_SEQ_BUCKETS)};
+const WGSL_MAX_ROWS = ${JSON.stringify(WGSL_MAX_ROWS)};
+const WGSL_SELFTEST = ${JSON.stringify(WGSL_SELFTEST)};
 let pipeline = null;
 // Standalone tokenizer (no model weights) for the sidecar hydrate's chunk-id
-// reproduction. Independent of pipeline — survives recycle.
+// reproduction. Released once a model load succeeds (the pipeline has its own).
 let standaloneTokenizer = null;
 // EP of the loaded pipeline ('webgpu' | 'wasm'). Drives the padding mode:
 // bucket-padding exists ONLY for Dawn's shape-keyed shader cache (one WGSL
@@ -679,10 +711,13 @@ async function freshTransformers(modelId) {
 // files resolve identically to a full load. No webInitChain risk: AutoTokenizer
 // never creates an ORT session. Idempotent — a second call no-ops.
 async function loadTokenizer(modelId, revision) {
-    if (standaloneTokenizer) return { ok: true, cached: true };
+    if (standaloneTokenizer || pipeline) return { ok: true, cached: true };
     const { AutoTokenizer } = await freshTransformers(modelId);
     if (!AutoTokenizer) throw new Error('transformers.js export missing AutoTokenizer — API changed?');
-    standaloneTokenizer = await AutoTokenizer.from_pretrained(modelId, revision ? { revision } : {});
+    const tok = await AutoTokenizer.from_pretrained(modelId, revision ? { revision } : {});
+    // A model load that landed during the parse brought its own tokenizer;
+    // keeping this one would recreate the duplicate the load handler drops.
+    if (!pipeline) standaloneTokenizer = tok;
     return { ok: true, cached: false };
 }
 
@@ -701,7 +736,8 @@ async function loadTokenizer(modelId, revision) {
 // plain glue for a reason (ORT #26827-class WASM-compile hangs are the
 // suspect), so this runs only on the WebGPU attempt path, which mobile only
 // reaches on the 'auto' device (iPad by default, or a forced-WebGPU override —
-// see platform.ts resolveDevice; iPhone + Android stay on WASM).
+// see platform.ts resolveDevice; iPhone + Android use the Seek engine with a
+// WASM fallback and never reach this path).
 function overrideWebkitGlueForWebgpu(env) {
     const wp = env.backends.onnx.wasm.wasmPaths;
     if (!wp || typeof wp !== 'object' || !wp.mjs) return null;
@@ -786,11 +822,159 @@ async function tryWebgpu(modelId, preferredDtype, revision) {
     throw new Error('all WebGPU dtypes failed: ' + errors.join(' | '));
 }
 
-async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, revision) {
+// ── Seek engine (WGSL, compute option 'wgsl') ─────────────────────────────
+// The hand-written WebGPU encoder (src/wgsl-engine), inlined above as
+// globalThis.__seekWgsl. loadWgsl() returns a stand-in for the transformers.js
+// FeatureExtractionPipeline covering exactly what embedText / embedBatch /
+// tokenCounts call: shim(texts, opts) -> { dims, data, dispose } of normalized
+// CLS vectors, plus shim.tokenizer. Parity vs the ORT pipeline (WebGPU and
+// WASM): cos >= 0.9999997, identical top-10 rankings on a 400-chunk vault
+// sample (2026-11-09). Any load failure falls back to the normal ORT ladder.
+// (Inside the srcdoc template literal: no backticks or backslashes here.)
+const WGSL_MAX_S = 512;       // engine max sequence (= TOKEN_BUDGET)
+// WGSL_MAX_ROWS (B*S per forward; bigger batches are split) is injected above.
+let lastWgslError = null;
+
+async function wgslFetch(modelId, revision, file) {
+    // Same URL transformers.js caches under, so a model already downloaded for
+    // ORT is reused byte-for-byte (no second download, no second artifact).
+    const isLocal = modelId.includes('://') && !modelId.includes('huggingface.co');
+    const url = isLocal
+        ? (modelId.endsWith('/') ? modelId : modelId + '/') + file
+        : 'https://huggingface.co/' + modelId + '/resolve/' + (revision || 'main') + '/' + file;
+    let cache = null;
+    if (!isLocal) { try { cache = await caches.open('transformers-cache'); } catch (_) { cache = null; } }
+    let resp = cache ? await cache.match(url) : null;
+    if (!resp) {
+        resp = await fetch(url);
+        if (!resp.ok) throw new Error('fetch ' + file + ' -> HTTP ' + resp.status);
+        if (cache) { try { await cache.put(url, resp.clone()); } catch (_) { /* best-effort */ } }
+    }
+    return new Uint8Array(await resp.arrayBuffer());
+}
+
+// A WebGPU call that hangs instead of rejecting (seen class: mixed Android
+// WebView drivers) must not strand the load until the parent's 180 s RPC
+// timeout: bound each GPU step so a hang throws and loadModel falls back to
+// ORT. Weight download is NOT bounded (network speed is not a GPU fault).
+const WGSL_GPU_STEP_MS = 20000;
+function gpuStep(p, label, ms) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('WGSL ' + label + ' timed out after ' + (ms || WGSL_GPU_STEP_MS) + ' ms')), ms || WGSL_GPU_STEP_MS);
+    });
+    return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function loadWgsl(modelId, revision, dtype) {
+    const W = globalThis.__seekWgsl;
+    if (!W) throw new Error('WGSL engine not bundled');
+    if (dtype !== 'q4') throw new Error('WGSL engine supports q4 only, got ' + dtype);
+    if (!navigator.gpu) throw new Error('navigator.gpu not present');
+    const adapter = await gpuStep(navigator.gpu.requestAdapter(), 'requestAdapter');
+    if (!adapter) throw new Error('requestAdapter returned null');
+    const deviceP = adapter.requestDevice();
+    let device;
+    try {
+        device = await gpuStep(deviceP, 'requestDevice');
+    } catch (e) {
+        // A device that arrives after the timeout is ours to release.
+        deviceP.then((d) => { try { d.destroy(); } catch (_) {} }, () => {});
+        throw e;
+    }
+    try {
+        const { AutoTokenizer } = await freshTransformers(modelId);
+        const tokenizer = await AutoTokenizer.from_pretrained(modelId, revision ? { revision } : {});
+        const config = JSON.parse(new TextDecoder().decode(await wgslFetch(modelId, revision, 'config.json')));
+        let weights = W.loadGraniteWeights(await wgslFetch(modelId, revision, 'onnx/model_' + dtype + '.onnx'), config);
+        // Buffer upload + 4 pipeline compiles: slow phones take seconds, so a longer bound.
+        const enc = await gpuStep(W.WgslEncoder.create(weights, config, { device, maxRows: WGSL_MAX_ROWS, maxS: WGSL_MAX_S }), 'encoder create', 60000);
+        // Only the token-embedding table is needed CPU-side after the upload;
+        // detach it so the ~60 MB model buffer can be collected.
+        enc.weights = { emb: W.detachEmbedding(weights.emb) };
+        weights = null;
+        const H = config.hidden_size;
+        // Load-time self-test (pinned model only): one fixed input vs ORT's
+        // fp32 vector. A driver that miscompiles a shader fails here and the
+        // load falls back to ORT, instead of writing wrong vectors to the index.
+        if (modelId === WGSL_SELFTEST.modelId && (revision || 'main') === WGSL_SELFTEST.revision) {
+            const got = (await gpuStep(enc.embed([WGSL_SELFTEST.ids]), 'self-test'))[0];
+            const ref = WGSL_SELFTEST.vec;
+            let dot = 0, na = 0, nb = 0;
+            for (let i = 0; i < ref.length; i++) { dot += got[i] * ref[i]; na += got[i] * got[i]; nb += ref[i] * ref[i]; }
+            const cos = dot / Math.sqrt(na * nb);
+            if (!(cos >= WGSL_SELFTEST.minCos)) throw new Error('self-test failed: cos ' + cos + ' < ' + WGSL_SELFTEST.minCos);
+        }
+        // enc.embed shares fixed GPU buffers + one readback buffer: serialize
+        // callers (a search can arrive mid-index-batch).
+        let chain = Promise.resolve();
+        const forward = (seqs) => {
+            const p = chain.then(() => enc.embed(seqs));
+            chain = p.catch(() => {});
+            return p;
+        };
+        const shim = async function (input, _opts) {
+            const texts = Array.isArray(input) ? input : [input];
+            // tx.js's pipeline ignores max_length (verified 2026-11-09: it embeds
+            // the full text), so match it: no bucket truncation. Only the
+            // engine's hard cap applies, keeping the trailing SEP.
+            const seqs = texts.map((t) => {
+                const ids = Array.from(tokenizer(t).input_ids.data, Number);
+                return ids.length > WGSL_MAX_S ? ids.slice(0, WGSL_MAX_S - 1).concat([ids[ids.length - 1]]) : ids;
+            });
+            const data = new Float32Array(texts.length * H);
+            let i = 0;
+            while (i < seqs.length) {
+                // Greedy sub-batch: grow while B * maxLen fits WGSL_MAX_ROWS.
+                let j = i + 1;
+                let maxLen = seqs[i].length;
+                while (j < seqs.length && (j - i + 1) * Math.max(maxLen, seqs[j].length) <= WGSL_MAX_ROWS) {
+                    maxLen = Math.max(maxLen, seqs[j].length);
+                    j++;
+                }
+                const vecs = await forward(seqs.slice(i, j));
+                vecs.forEach((v, k) => data.set(v, (i + k) * H));
+                i = j;
+            }
+            return { dims: [texts.length, H], data, dispose() {} };
+        };
+        shim.tokenizer = tokenizer;
+        shim.model = null;   // profileRuntime (diagnostics) is ORT-only
+        return shim;
+    } catch (e) {
+        try { device.destroy(); } catch (_) { /* already gone */ }
+        throw e;
+    }
+}
+
+async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, revision, warmupProfile) {
     const t0 = performance.now();
 
     let webgpuAttempted = false;
     let webgpuError = null;
+
+    lastWgslError = null;
+    // 'wgsl' = Seek engine, falling back to the ORT ladder (WebGPU then CPU).
+    // 'wgsl-wasm' = Seek engine, falling back straight to CPU: devices where
+    // ORT's own WebGPU path is unsafe (iPhone jetsam, ORT #26827).
+    if (requestedDevice === 'wgsl' || requestedDevice === 'wgsl-wasm') {
+        const fallback = requestedDevice === 'wgsl-wasm' ? 'wasm' : 'auto';
+        try {
+            pipeline = await loadWgsl(modelId, revision, requestedDtype);
+            return {
+                device: 'webgpu', dtype: requestedDtype, engine: 'wgsl',
+                coldStartMs: performance.now() - t0,
+                warmupMs: null, warmupSkipped: false,   // nothing to warm: no per-shape compile
+                webgpuAttempted: true, webgpuError: null,
+                glue: null,
+                proxy: false, proxyAttempted: false, proxyError: null,
+            };
+        } catch (e) {
+            // Fall back to ORT; the cause rides the LoadResult.
+            lastWgslError = String(e);
+            requestedDevice = fallback;
+        }
+    }
 
     if (requestedDevice === 'webgpu' || requestedDevice === 'auto') {
         webgpuAttempted = true;
@@ -830,7 +1014,22 @@ async function loadModel(modelId, requestedDevice, requestedDtype, skipWarmup, r
                         // — same behavior as the try/catch around each
                         // warmup dispatch already implies.
                         let warmupMs = null;
-                        if (!skipWarmup) {
+                        if (!skipWarmup && warmupProfile === 'query') {
+                            // Query-only-GPU profile: batch 1 on the query ladder
+                            // only. Indexing batches never reach this session
+                            // (the parent swaps to wasm first), so the full grid
+                            // would be compile time + pool growth for nothing.
+                            const warmupStart = performance.now();
+                            for (const bucket of QUERY_SEQ_BUCKETS) {
+                                try {
+                                    await pipeline(['warmup'], {
+                                        pooling: 'cls', normalize: true,
+                                        padding: 'max_length', truncation: true, max_length: bucket,
+                                    });
+                                } catch (_) { /* non-fatal — live call compiles on first use */ }
+                            }
+                            warmupMs = performance.now() - warmupStart;
+                        } else if (!skipWarmup) {
                             const warmupStart = performance.now();
                             for (const n of WARMUP_BATCH_SIZES) {
                                 const batch = Array(n).fill('warmup');
@@ -1196,8 +1395,16 @@ window.addEventListener('message', async (event) => {
                 data.payload.dtype,
                 data.payload.skipWarmup,
                 data.payload.revision,
+                data.payload.warmupProfile === 'query' ? 'query' : 'full',
             );
             currentDevice = result.device;
+            // The pipeline carries its own tokenizer (tokenCounts prefers it), so a
+            // standalone one from an earlier hydrate is now a dead duplicate: drop
+            // it. Only on success: a failed load leaves pipeline null and the
+            // standalone copy is still the only tokenizer.
+            standaloneTokenizer = null;
+            if (!result.engine) result.engine = 'ort';
+            result.wgslError = lastWgslError;
         } else if (data.type === 'embed') {
             result = await embedText(data.payload.text);
         } else if (data.type === 'embed-batch') {

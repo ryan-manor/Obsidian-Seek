@@ -53,3 +53,13 @@ describe('selectIndexBucket (WS2.3) — index path buckets by EXACT token count'
         }
     });
 });
+
+describe('WGSL_MAX_ROWS (Seek engine GPU sizing)', () => {
+    it('fits every indexer dispatch in one forward pass, and one max-length chunk', async () => {
+        const { rollingBatchFor } = await import('./search');
+        const { WGSL_MAX_ROWS } = await import('./iframe-runner');
+        // Raising ROLLING_BUDGET past this would silently split passes; fail loud instead.
+        for (const b of SEQ_BUCKETS) expect(rollingBatchFor(b) * b).toBeLessThanOrEqual(WGSL_MAX_ROWS);
+        expect(WGSL_MAX_ROWS).toBeGreaterThanOrEqual(Math.max(...SEQ_BUCKETS));
+    });
+});

@@ -66,6 +66,26 @@ describe('Tier-2 scenario harness', () => {
         expect(spy).not.toHaveBeenCalled();                    // contentHash gate: computeDelta → dirty:[]
     });
 
+    // The live-enqueue half of the same gate (main.ts enqueueIfDirty consults
+    // classifyLiveFile on every vault 'modify'). It used to be mtime-only, so a
+    // mass iCloud re-stamp queued every unchanged note into one bulk pass that
+    // held the index lock ~20 s on iPhone (2026-11-10 report).
+    it('classifyLiveFile: re-stamp of unchanged bytes is clean, a real edit is dirty', async () => {
+        const s = await boot();
+        s.vault.write('a.md', 'stable content that does not change', 1000);
+        await s.coldStart();
+        const live = () => s.vault.getAbstractFileByPath('a.md')!;
+        const rec = async () => s.store.getFileRecord('a.md');
+
+        expect(await s.orch.classifyLiveFile(live(), await rec())).toBe('clean');   // untouched
+        s.vault.touch('a.md', 9999);
+        expect(await s.orch.classifyLiveFile(live(), await rec())).toBe('clean');   // mtime-only
+        s.vault.write('a.md', 'stable content that DID change', 10000);
+        expect(await s.orch.classifyLiveFile(live(), await rec())).toBe('dirty');   // real edit
+        s.vault.write('new.md', 'never indexed', 10000);
+        expect(await s.orch.classifyLiveFile(s.vault.getAbstractFileByPath('new.md')!, undefined)).toBe('dirty');
+    });
+
     // ── Scenario 3 — end-to-end search returns the right note rank-1 ─────────
     // Proves the harness asserts RESULTS, not just index state: the full
     // chunk→embed→store→binary-scan→int8-rerank→BM25-fuse→rank pipeline runs on
@@ -196,5 +216,41 @@ describe('Tier-2 scenario harness', () => {
         await s.edit('notes.md', 'see Query Understanding twice, no links here', 2000);
         const on2 = await s.orch.search(q, 10, undefined, { synonymsV2: true });
         expect(on2.entry.phraseMatesFired).toBe(0);
+    });
+    // ── Scenario 7 — BM25F knobs are query-time only ─────────────────────────
+    // A weight change (the seek:search per-query override) must reach
+    // the very next search through the SAME BM25 cache: no reindex, no refit, and
+    // the Σ UB(t) bound recomputed under the new weights (never a memoized bound
+    // from the old ones).
+    it('bm25f weights: a CLI override applies to the next search with no refit', async () => {
+        const s = await boot();
+        s.vault.write('cheer.md', '---\nplaceType: bars\nplaceLoc: "[[Austin]]"\n---\nOutdoor patio, live music most nights.', 1000);
+        s.vault.write('kino.md', '# Kinokuniya Austin\nJapanese bookstore with stationery.', 1000);
+        s.vault.write('austin.md', 'Austin is a city in Texas with many bars downtown.', 1000);
+        for (let i = 0; i < 6; i++) s.vault.write(`f${i}.md`, `filler note ${i} about gardening`, 1000);
+        await s.coldStart();
+        const q = 'bars in austin';
+        const cacheOf = () => (s.orch as unknown as { bm25Cache: object | null }).bm25Cache;
+
+        const a = await s.orch.search(q, 10);
+        const cache = cacheOf();
+        expect(cache).not.toBeNull();
+        expect(a.entry.lexicalModel).toBe('bm25f');
+        expect(a.entry.bm25fKnobs).toEqual({ title: 10, aliases: 6, properties: 4, body: 1, k1: 5 });
+
+        const b = await s.orch.search(q, 10, undefined, { bm25fKnobs: { properties: 10 } });   // CLI props=10
+        expect(cacheOf()).toBe(cache);             // same index instance: nothing refit
+        expect(b.entry.bm25CacheHit).toBe(true);
+        expect(b.entry.bm25fKnobs?.properties).toBe(10);
+        expect(b.entry.bm25Bound).not.toBe(a.entry.bm25Bound);   // UB(bar) re-derived under props 10
+
+        const c = await s.orch.search(q, 10);      // no override: back to the default bound
+        expect(c.entry.bm25Bound).toBe(a.entry.bm25Bound);
+        expect(c.results.map(r => r.note_path)).toEqual(a.results.map(r => r.note_path));
+
+        const e = await s.orch.search(q, 10, undefined, { bm25f: false });                    // CLI bm25f=false
+        expect(e.entry.lexicalModel).toBe('sum');
+        expect(e.entry.bm25fKnobs).toBeUndefined();
+        expect(cacheOf()).toBe(cache);
     });
 });

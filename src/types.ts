@@ -2,7 +2,9 @@
 // so the same generator/reader code can be reused with minimal changes.
 
 export type Device = 'webgpu' | 'wasm';
-export type RequestedDevice = Device | 'auto';
+// 'wgsl' = Seek engine (hand-written WebGPU encoder), falling back to the ORT
+// ladder. 'wgsl-wasm' = Seek engine, falling back straight to CPU (iPhone, Android).
+export type RequestedDevice = Device | 'auto' | 'wgsl' | 'wgsl-wasm';
 export type Dtype = 'q4f16' | 'q4' | 'q8' | 'fp32';
 
 // Bumped whenever any LogEntry shape changes incompatibly. The report
@@ -68,7 +70,14 @@ export type Dtype = 'q4f16' | 'q4' | 'q8' | 'fp32';
 // harness; on the fidelity-fixed harness the gold@1 delta is exactly 0 on every
 // real-usage set — it only reorders positions 2-10 downward). The optional field
 // is gone from the type, rows that carry it still parse.
-export const LOG_SCHEMA_VERSION = 18;
+// v19: display-chunk selection. SearchEntry.displaySwaps (rank → display chunk
+// per swapped result) and ClickEntry.displayChunkId. ClickEntry.chunk_id and
+// shownTop10 keep meaning the RANKING chunk. Additive/forward-only.
+// v20: SearchEntry.lexicalModel ('bm25f' | 'sum') — which lexical model scored the
+// search (settings.bm25f / the seek:search bm25f override) — and, under bm25f,
+// SearchEntry.bm25fKnobs (the field weights + k1 used). Additive/forward-only;
+// absent ⇒ 'sum'.
+export const LOG_SCHEMA_VERSION = 20;
 
 // ---- chunk model ----
 
@@ -177,18 +186,19 @@ export interface Chunk {
     // (falling back to `title`) so the part marker stays visible without leaking
     // into the index. Optional → pre-existing chunks read it as undefined.
     displayTitle?: string;
-    // Note-level frontmatter VALUES folded into the DENSE channel only. Appended
-    // to the EMBED input by token-budget.ts embedInput (`title\n\ncontent\n\n
-    // denseSuffix`) and to NOTHING else — bm25.ts's `content` field stays the raw
-    // body, the validated dense-only decoupling (+0.0031 dense-only vs +0.0010
-    // both-channels; tags already have their own BM25 field, so injecting there
-    // just dilutes). Built once per note (chunker.ts buildDenseSuffix: keys
-    // dropped, wikilinks→basename, aliases excluded, date/number/boolean values
-    // type-dropped) and carried on EVERY chunk of the note — the same convention
-    // by which aliases are hoisted into every chunk's title. Folded into chunk_id
-    // (chunkIdFor's 4th arg) so the hashed bytes still equal the embedded bytes;
-    // a CHUNKER_VERSION bump rides with it. Absent (undefined) when the note has
-    // no qualifying values. See [[Seek Domain Agnostic LoRA]] (locked 2026-06-18).
+    // Note-level frontmatter VALUES, dense-channel only. Built once per note
+    // (chunker.ts buildDenseSuffix: keys dropped, wikilinks→basename, aliases
+    // excluded, date/number/boolean values type-dropped) and carried on EVERY
+    // chunk of the note — the same convention by which aliases are hoisted into
+    // every chunk's title. Folded into chunk_id (chunkIdFor's 4th arg) and
+    // reserved by splitChunk's budget math. As of CHUNKER_VERSION 11 this is a
+    // chunk_id/budget PROXY only: the text actually embedded is the PER-CHUNK
+    // keyed suffix that embedInput derives via chunker.ts goForwardDenseParts
+    // (`key: value`, deduped vs title+body, tags→BM25) — NOT this string. bm25.ts's
+    // `content` field stays the raw body (the validated dense-only decoupling:
+    // +0.0031 dense-only vs +0.0010 both-channels). Absent (undefined) when the
+    // note has no qualifying values. See [[Seek Domain Agnostic LoRA]] and
+    // [[seek-dense-keyed-clean-2026-07-21]].
     denseSuffix?: string;
     // Lexical reclamation (v10, 2026-07-02): the raw substrings cleanDenseBody
     // DROPPED from this chunk's section — wikilink targets behind aliases,
@@ -261,6 +271,13 @@ export interface SeekSettings {
     // 0.5 in the 2026-06-19 settings ratification (the Title-bonus "Default" stage),
     // with the 0.8 knee one click away as "High" (segmented Off=0/Default=0.5/High=0.8).
     // NOT comparable to the old exact-only 0.025; precision-scaling makes high values safe.
+    // 2026-11-11 re-sweep (seek512/v11 caches, + the 1-char title prefix): the boost
+    // saturates early — Off→0.2 is +0.06 nDCG@10 on the 483-q personal set, 0.3→0.5 is
+    // −0.001 (CI spans 0, 2/483 top-1 changes), and 0.5/0.6/0.8 tie on every set. Past
+    // the knee, a bigger boost only lets a title hit (incl. a partial prefix hit, e.g.
+    // "car" → Carboni's) jump body-relevant notes on exploratory queries, which no judged
+    // set measures. So the stages moved down: Off=0 / Default=0.25 / High=0.5 (rev 12);
+    // High sits at the saturation point — more headroom buys nothing measurable.
     navTitleBoost: number;
 
     // Which per-chunk date "recent" means, vault-wide — the GLOBAL definition
@@ -271,7 +288,7 @@ export interface SeekSettings {
     // guaranteed to carry, so it's the only generic default we can bank on
     // across vaults — at the cost of being edit-recency, silently churned by
     // vault copies, iCloud sync, and bulk plugin edits. 'created' = a frontmatter
-    // date property (createdProp, with filename-date then mtime fallback) —
+    // date property (createdProp; strict since 2026-11-11, no fallback) —
     // copy-proof and matches the dated-instance semantics episodic queries want,
     // but it assumes the vault carries such a property, so it's an explicit
     // opt-in via the date-field picker, not the default. (Briefly the default on
@@ -290,9 +307,10 @@ export interface SeekSettings {
     // via main.ts enumerateDatePropertyNames) — never free text, so a typo'd
     // ("craated") or non-date (tags…) choice is unselectable by construction.
     // Resolved READ-side: all scalar frontmatter is already indexed per chunk
-    // (metadata.properties), so changing this needs no reindex. Notes without
-    // the property fall back to a YYYY-MM-DD in the filename (daily notes /
-    // dated series notes), then mtime — fusion.ts recencyDate ladder.
+    // (metadata.properties), so changing this needs no reindex. Strict since
+    // 2026-11-11: notes without the property have no date (no recency, sorted
+    // last in browse, rejected by before:/after:), with no filename-date or
+    // mtime fallback (fusion.ts recencyDate).
     createdProp: string;
 
     // Recency WEIGHT (ε): the magnitude of the additive recency term in
@@ -440,6 +458,23 @@ export interface SeekSettings {
     // on in ensureBm25() — otherwise the headings boost is inert (no postings).
     // Refit-on-toggle, no embedding reindex; same contract as headingsField.
     boostedBm25: boolean;
+
+    // BM25F lexical model (bm25f.ts) — ON by default (2026-11-12). Replaces
+    // MiniSearch's per-field sum (an independent BM25 per field — own IDF, own
+    // saturation — boosted and summed, Elasticsearch `most_fields`) with BM25F
+    // (Robertson, Zaragoza & Taylor 2004): weighted, length-normalized tf merged
+    // across fields, ONE saturation (k1 5), ONE document-level IDF. Weights title 10 /
+    // aliases 6 / properties 4 (2026-11-12 ml97 sweep) / content, tags, headings 1. The Σ UB(t) bound,
+    // (m/T)² coverage, nav title term, fuzzy/prefix/synonym derivation are unchanged,
+    // just fed by BM25F scores. Harness (2026-11-11 investigation, `k5-props2`):
+    // miss sets +0.039/+0.048/+0.049 nDCG@10, captures +0.171, faceted place queries
+    // 0.337 → 0.550, usage −0.004..−0.009 (CI spans 0), personal flat. OFF = the old
+    // per-field sum, kept for A/B (also per query: seek:search bm25f=false).
+    // Score-time only — both models read the same MiniSearch index, so the toggle
+    // needs no reindex or refit. Hidden (no settings-tab control), same posture as
+    // synonymsV2. New key, no migration: Object.assign backfills the default and no
+    // install has ever persisted it (see migrateSettings).
+    bm25f: boolean;
 
     // BM25 coverage weighting — the SOFT-AND fix for OR's looseness. MiniSearch
     // combines query terms with OR, so a doc that saturates ONE query term (a
@@ -611,9 +646,9 @@ export type SidecarIndexLocation = 'config' | 'visible';
 
 export const DEFAULT_SETTINGS: SeekSettings = {
     denseWeight: 0.85,         // BOUND-NORM scale dense weight; mirrors DEFAULT_RANKING_CONFIG.alpha. Raised 0.80→0.85 (2026-06-27 re-eval): de-franken made BM25 more assertive, so a fixed α=0.80 over-weighted lexical; 0.85 is a cross-corpus win (Example Vault flat-to-+, BEIR +0.01–0.02). Migrated via rev 8. (NOT the 0.92 empirical-max point)
-    navTitleBoost: 0.5,        // Title-bonus "Default" stage (segmented 0=Off / 0.5=Default / 0.8=High); softened from the 0.8 swept knee per the 2026-06-19 settings ratification — see field comment
+    navTitleBoost: 0.25,       // Title-bonus "Default" stage (segmented 0=Off / 0.25=Default / 0.5=High); 0.8→0.5 (2026-06-19 ratification) →0.25 (2026-11-11 re-sweep) — see field comment
     recencyKey: 'modified',    // global definition of "recent" (ε-tiebreaker + recency arm + browse sort + before:/after:); mtime is the only universally-present date → the generic default; 'created' (a frontmatter date prop, see createdProp) is an opt-in. Briefly 'created' 2026-09-02 → reverted: that was the reference vault's own convention, not a generic default
-    createdProp: 'created',    // frontmatter property holding the creation date (vault convention; falls back to filename date, then mtime)
+    createdProp: 'created',    // frontmatter property holding the creation date (vault convention). Strict: a note without it has no date — no recency credit, excluded by before:/after: — never a filename-date or mtime fallback
     recencyEpsilon: 0,         // ships Off (Recency segmented Off=ε0 / Default=ε0.04·180d / High=ε0.1·90d); was a 0.02 tiebreaker pre-2026-06-19 ratification — additive ε in final = hybrid + ε·recency + titleBoost (see field comment)
     recencyHalfLifeDays: 180,  // recency decay HALF-LIFE in days (0.5^(daysOld/HL)); 180 = 06-04 operating point. Do NOT shorten to 7–30: it hijacks flat no-opinion pools (see the field comment above — that advice was measured wrong and reversed 2026-07-16). The Recency High stage is the supported lean, at 90.
     fuzzyEnabled: true,        // typo tolerance ON by default (edit dist scales by term length, ≤3 exact; see bm25.ts FUZZY_BY_LENGTH); +3–4/40 gold@1 on typo'd entity queries, ns cost on clean
@@ -623,6 +658,7 @@ export const DEFAULT_SETTINGS: SeekSettings = {
     searchableProperties: true, // frontmatter values as a BM25 field; ON as of 2026-06-25 — My-Vault channel eval measured +0.05 nDCG@10 (place-note recall: austin 22→3, zurich 33→7; combo_eval). Migrated on via rev 7; see field comment
     headingsField: true,       // ON (hidden) per the 2026-06-19 ratification; heading path as a BM25 field; BM25 refit, no reindex — see field comment
     boostedBm25: false,        // "Boosted BM25" preset (aliases 9 / tags 2 / headings 4); OFF — opt-in field-weight lever, implies heading indexing; see field comment
+    bm25f: true,               // BM25F lexical model (k1 5, title 10 / aliases 6 / properties 4); OFF = legacy per-field sum for A/B. New key, no migration: Object.assign backfills — see field comment
     bm25Coverage: true,        // soft-AND: scale BM25 by matched-query-term fraction (multi-term only); see field comment
     honorIgnoredFolders: true, // Archive et al. are soft-deletes by default
     indexBases: true,          // ON: index .base files (Obsidian Bases) as synthetic docs; preserves the feature's unconditional pre-toggle behavior
@@ -634,7 +670,7 @@ export const DEFAULT_SETTINGS: SeekSettings = {
     searchEventRelay: false,   // OFF (hidden): workspace-event relay for a companion logger plugin; set true in data.json to enable — see field comment
     sidecarEnabled: true,      // ON (hidden) per the 2026-06-19 ratification; vault-file index persistence for iOS-eviction survival + cross-device sync; only Index location stays user-facing; seeds on next reindex — see field comment
     sidecarIndexLocation: 'config', // hidden literal '.obsidian/plugins/seek/index'; 'visible' = vault-root 'Seek Index/' for split-config Obsidian Sync; see field comment
-    settingsRev: 11,           // current schema rev; bump alongside a migration in main.ts onload (rev 11 = 2026-09-08 specificity-boost removal drops the orphan specificityBoost key)
+    settingsRev: 13,           // current schema rev; bump alongside a migration in main.ts onload (rev 13 = 2026-11-12 Balanced dropdown 0.80 → 0.85 repair)
 };
 
 // One-time settings migrations, keyed on the persisted settingsRev. Applied to the
@@ -646,6 +682,8 @@ export const DEFAULT_SETTINGS: SeekSettings = {
 // (The rev-4 sidecar FILE move is NOT here — it does disk I/O and needs the plugin's
 // resolved paths, so it stays in onload, gated on a `migrateSidecarPath` flag captured
 // from the original settingsRev before this runs.)
+const LEGACY_BM25F_KNOB_KEYS = ['bm25fTitle', 'bm25fAliases', 'bm25fProperties', 'bm25fBody', 'bm25fK1'] as const;
+
 export function migrateSettings(raw: Partial<SeekSettings>): Partial<SeekSettings> {
     const fromRev = raw.settingsRev ?? 1; // a data.json without the key is pre-bound (rev 1)
     // Rev 2 (2026-06-09 bound-norm switch): a denseWeight persisted on the old
@@ -725,11 +763,36 @@ export function migrateSettings(raw: Partial<SeekSettings>): Partial<SeekSetting
     // rev 11 — same shape for the specificity boost: the feature is gone, so the
     // persisted S is an orphan key that would otherwise sit in data.json forever.
     if (fromRev < 11) delete (raw as { specificityBoost?: number }).specificityBoost;
+    // Rev 12 (2026-11-11 title-bonus re-sweep): the stages move Default 0.5 → 0.25 and
+    // High 0.8 → 0.5 (see the navTitleBoost field comment). settings-tab.ts is the only
+    // writer and only ever persisted stage values, so the exact old values are a precise
+    // "picked that stage" signature: map each to its new value so a Default user lands on
+    // the new Default and a High user stays High (titleStageOf would otherwise snap a
+    // stale 0.5 to High). Anything else is hand-tuned and survives. Score-time only.
+    if (fromRev < 12) {
+        // else-if: the old High's new value (0.5) IS the old Default's old value.
+        if (raw.navTitleBoost === 0.5) raw.navTitleBoost = 0.25;
+        else if (raw.navTitleBoost === 0.8) raw.navTitleBoost = 0.5;
+    }
+    // Rev 13 (2026-11-12): the Search strategy dropdown wrote a hard-coded 0.8 for
+    // Balanced, so any pick silently undid rev 8's 0.80 → 0.85. Rev 8 already moved
+    // every pre-rev-8 0.80, so a persisted 0.80 now is that bug's signature (the
+    // dropdown is the only writer). Anything else is hand-tuned and survives.
+    // Runs on every load stamped <= 13, not just < 13: an older build on a synced device
+    // can still write 0.8 under a rev-13 stamp, and the dropdown stays the only
+    // writer of denseWeight, so a 0.80 is always the bug. Idempotent.
+    if (fromRev <= 13 && raw.denseWeight === 0.8) raw.denseWeight = 0.85;
+    // BM25F knob keys (bm25fTitle/Aliases/Properties/Body/K1) were a short-lived
+    // prototype settings section, removed 2026-11-12: ranking now uses
+    // BM25F_KNOB_DEFAULTS, tunable per query only (seek:search title= aliases= props=
+    // body= k1=). Drop any persisted copy so a stale hand-tuned value can't linger
+    // invisibly in data.json. Unconditional and idempotent, so no rev of its own.
+    for (const k of LEGACY_BM25F_KNOB_KEYS) delete (raw as Record<string, unknown>)[k];
     // Never DOWNGRADE the stamp: a data.json synced from a device running a newer
-    // Seek (rev 12+) must keep its rev, or this older build stamps it back to 11 and
+    // Seek (rev 14+) must keep its rev, or this older build stamps it back to 13 and
     // the newer device re-runs its migrations on next load (conditional default
     // moves misfire on second application).
-    raw.settingsRev = Math.max(fromRev, 11);
+    raw.settingsRev = Math.max(fromRev, 13);
     return raw;
 }
 
@@ -762,6 +825,10 @@ export interface ScoredChunk extends Chunk {
         confidence?: number;
     };
     snippet?: string;
+    // Set when display-chunk selection swapped this row's chunk (content,
+    // heading_path, start_line, chunk_id now the displayed sibling's): the id of
+    // the chunk that actually ranked the note. score/ranking_signals stay its.
+    rank_chunk_id?: string;
 }
 
 // ---- heap + memory ----
@@ -903,6 +970,10 @@ export interface LoadEntry {
     timestamp: string;
     requestedDevice: RequestedDevice;
     actualDevice: Device;
+    // Inference engine that loaded ('ort' default, 'wgsl' experimental) and why
+    // a requested 'wgsl' load fell back (absent on entries logged before 2026-11).
+    engine?: 'ort' | 'wgsl';
+    wgslError?: string | null;
     dtype: Dtype;
     // Output vector dimension AFTER MRL slicing (the on-the-wire / on-disk
     // shape). EmbeddingGemma's native output is 768; we slice + L2-renormalize
@@ -940,6 +1011,10 @@ export interface LoadEntry {
     proxy: boolean;
     proxyAttempted: boolean;
     proxyError: string | null;
+    // EXPERIMENTAL query-only-GPU mode: present only on the replacement wasm
+    // load an indexing batch forced off WebGPU. swapMs = dispose + rebuild +
+    // wasm load wall time (the cost of entering indexing from a GPU session).
+    gpuQuerySwap?: { from: Device; swapMs: number };
     pass: boolean;
     checks: string[];
 }
@@ -1176,12 +1251,23 @@ export interface SearchEntry {
     // Whether the heading path was indexed as a BM25 field this search.
     // Optional so logs predating the lever (2026-06-12) still parse; absent ⇒ false.
     headingsField?: boolean;
+    // v20: the lexical model that scored this search — 'bm25f' (bm25f.ts, default
+    // since 2026-11-12) or 'sum' (MiniSearch's per-field sum). Absent ⇒ 'sum' (every
+    // row predating BM25F). Lets a click-log harvest tell which ranker produced the
+    // shown list, so usage golds are not silently all from one model.
+    lexicalModel?: 'bm25f' | 'sum';
+    // v20: the BM25F knobs this search used (written only under bm25f), so a log
+    // harvest can tell hand-tuned sessions apart.
+    bm25fKnobs?: { title: number; aliases: number; properties: number; body: number; k1: number };
     // Per-query theoretical BM25 bound (bm25.getQueryBound) the fusion divided
     // by; 0 ⇒ the bound had no opinion (fully-OOV query, or MiniSearch internals
     // unavailable) and fusion fell back to the empirical max. max(rawBm25)/bound
     // is the lexical channel's per-query confidence — the weak-lexical diagnostic.
     // Optional so logs predating the bound norm still parse.
     bm25Bound?: number;
+    // v19: results whose displayed chunk differs from the ranking chunk
+    // (display-chunk.ts). Written only when non-empty; absent ⇒ no swaps.
+    displaySwaps?: Array<{ note_path: string; rank_chunk_id: string; display_chunk_id: string }>;
     // Search-level identifier so click events can be correlated back to
     // the originating search row. Time-based since we don't have a UUID
     // generator hot path and the timestamp+query pair is already unique
@@ -1200,7 +1286,8 @@ export interface ClickEntry {
     timestamp: string;
     searchId: string;       // matches SearchEntry.searchId
     query: string;
-    chunk_id: string;
+    chunk_id: string;        // the RANKING chunk (joins fusedTop50), even when another was displayed
+    displayChunkId?: string; // v19: present only when the shown/opened chunk differed
     note_path: string;
     rank: number;            // 1-based rank in the deduped result list shown
     score: number;
@@ -1211,7 +1298,11 @@ export interface ClickEntry {
     titleNavOpen: boolean;   // open landed at doc top via the title-nav intent gate
     dwellMs: number;         // ms between search completion and the click
     shownTop10: string[];    // chunk_ids the user passed over (or chose from)
+    openMethod?: OpenMethod; // gesture that opened it (absent in logs before 2026-11-12)
 }
+
+// How a search-modal result was opened (search-modal.ts openMethodFor).
+export type OpenMethod = 'click' | 'mod-click' | 'tap' | 'enter' | 'mod-enter';
 
 export interface ErrorEntry {
     type: 'error';
@@ -1299,6 +1390,9 @@ export interface ModelLifecycleEntry {
     timestamp: string;
     event: 'unload';
     reason: 'idle' | 'background';
+    // What was resident: the model, or a hydrate-only standalone tokenizer
+    // (unloadable since 2026-10-13). Absent on older log lines (= 'model').
+    scope?: 'model' | 'tokenizer';
     heapMB: number | null;
 }
 

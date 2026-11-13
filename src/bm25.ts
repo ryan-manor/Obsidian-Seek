@@ -42,6 +42,10 @@ export const ANALYZER_VERSION: string =
 import type { ChunkMeta } from './chunker';
 import { seekTokenize, hasCjk } from './tokenize';
 import { toDisplayForm } from './prop-normalize';
+import {
+    BM25F_PARAMS, Bm25fScratch, bm25fFieldB, bm25fFieldWeight, bm25fParamsKey, bm25fScoreTerm,
+    type Bm25fFieldStats, type Bm25fParams,
+} from './bm25f';
 
 // Per-field BM25 term-frequency multipliers. Eval-tuned 2026-06-08 on the
 // 482-q old-log personal eval (with the coverage navigational boost active):
@@ -123,8 +127,21 @@ export const BM25_COVERAGE_POW = 2 as const;
 // FINISHED; only the final token is plausibly still being typed.
 // Like fuzzy, derived terms score with their own idf, so they're
 // numerator-only against the exact-term bound (fusion clips at 1).
-export const PREFIX_LAST_TOKEN = (term: string, i: number, terms: string[]): boolean =>
-    i === terms.length - 1 && term.length >= 3;
+export const PREFIX_MIN_CHARS_DEFAULT = 3;
+
+// Floor-parameterized variant (2026-11-11): BM25 uses the eval-tuned 3 above;
+// the title-boost gate (fusion.ts) uses 1. Below 3 chars a LONE token never
+// expands (a bare "g" would fan out to every g-word); it must follow at least
+// one finished token, which is what anchors precision.
+export function prefixLastTokenFor(minChars: number) {
+    const min = Math.max(1, Math.floor(minChars));
+    return (term: string, i: number, terms: string[]): boolean =>
+        i === terms.length - 1
+        && term.length >= min
+        && (term.length >= PREFIX_MIN_CHARS_DEFAULT || terms.length > 1);
+}
+
+export const PREFIX_LAST_TOKEN = prefixLastTokenFor(PREFIX_MIN_CHARS_DEFAULT);
 
 // Fuzzy typo-tolerance predicate, scaled by TERM length (audit 2026-06-18 §1)
 // with two exemptions. Returns the absolute max edit distance MiniSearch may
@@ -181,6 +198,78 @@ export interface SearchOverrides {
         // space and are terms the query actually contains.
         phraseMates?: Array<{ mate: string; sources: string[] }>;
     };
+    // BM25F field model (bm25f.ts; settings.bm25f, default ON). Present ⇒ score
+    // with BM25F under these params instead of MiniSearch's per-field sum: the
+    // scores, the coverage and the Σ UB(t) bound ALL come from the BM25F scorer,
+    // and `boosts` is ignored (BM25F reads `weights`). Absent ⇒ the legacy
+    // per-field-sum path, byte-identical to before the flag existed (the A/B arm).
+    bm25f?: Bm25fParams;
+}
+
+// MiniSearch's default derived-term weights (dist v7.2.0 defaultSearchOptions
+// .weights) and fuzzy-fraction cap (maxFuzzy). Seek never overrides them, so the
+// BM25F path — which runs the query specs itself — uses the same constants to
+// derive prefix/fuzzy terms exactly as mini.search() would.
+const MS_PREFIX_WEIGHT = 0.375;
+const MS_FUZZY_WEIGHT = 0.45;
+const MS_MAX_FUZZY = 6;
+
+// MiniSearch termToQuerySpec + executeQuerySpec's fuzzy resolution (dist v7.2.0):
+// the absolute max edit distance a fuzzy spec allows for `term`, 0 = exact only.
+// Shared by the BM25F query loop and the fuzzy-aware bound so both derive the
+// same term set.
+function fuzzyMaxDist(spec: SearchOverrides['fuzzy'], term: string, i: number, terms: string[]): number {
+    const fz = typeof spec === 'function' ? spec(term, i, terms) : (spec || false);
+    if (!fz) return 0;
+    const f = fz === true ? 0.2 : fz;
+    return f < 1 ? Math.min(MS_MAX_FUZZY, Math.round(term.length * f)) : f;
+}
+
+// The slice of MiniSearch 7.2.0 internals the BM25F path reads (all private in the
+// typings; verified in dist). Same defensive posture as termDocFraction /
+// indexedQueryTerms: each access is checked, and a shape mismatch (a future
+// MiniSearch rename) drops getScoresWithCoverage back to the legacy per-field path
+// (one console warning) rather than throwing or zeroing the lexical channel.
+type Postings = Map<number, Map<number, number>>;   // fieldId → shortId → tf
+interface MiniInternals {
+    _index: {
+        get(term: string): Postings | undefined;
+        atPrefix(prefix: string): Iterable<[string, Postings]>;
+        fuzzyGet(term: string, maxDist: number): Map<string, [Postings, number]>;
+        [Symbol.iterator](): Iterator<[string, Postings]>;
+    };
+    _fieldIds: Record<string, number>;
+    _documentIds: Map<number, string>;
+    _idToShortId: Map<string, number>;
+    _documentCount: number;
+    _nextId: number;
+}
+function popcount32(x: number): number {
+    x = x - ((x >>> 1) & 0x55555555);
+    x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+    return (Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24);
+}
+
+function miniInternals(mini: unknown): MiniInternals | null {
+    const m = mini as Partial<MiniInternals> | null;
+    if (!m || !m._index || typeof m._index.get !== 'function'
+        || typeof m._index.atPrefix !== 'function' || typeof m._index.fuzzyGet !== 'function'
+        || !m._fieldIds || !(m._documentIds instanceof Map) || !(m._idToShortId instanceof Map)
+        || typeof m._documentCount !== 'number' || typeof m._nextId !== 'number') return null;
+    return m as MiniInternals;
+}
+
+// BM25F corpus state, keyed by MiniSearch SHORT doc id (the postings' key space):
+// the per-field processed-token lengths (bm25f.ts UNITS) + their running sums, and
+// the short-id → frame-row map. Lengths are built lazily from the postings on the
+// first BM25F use after a fit/fromJSON, then maintained INCREMENTALLY by add /
+// remove / removeExact (a delta never pays the full pass). The row map is cheap
+// (O(live docs)) and simply rebuilt after any mutation.
+interface Bm25fState {
+    len: Float64Array[];        // by fieldId, indexed by short id
+    lenSum: number[];           // by fieldId, over live docs
+    rowOf: Int32Array;          // short id → frame row; -2 = live but unplaced (tolerant-load ghost); -1 = dead
+    rowsDirty: boolean;
 }
 
 // Lucene/Elasticsearch default English stoplist (the 33-word `_english_` set).
@@ -517,6 +606,17 @@ export class MultiFieldBM25 {
     // vacuum) so the bound always reflects live postings; a fresh search-based
     // recompute then honors discard() tombstones synchronously, no vacuum needed.
     private termUpperBounds = new Map<string, number>();
+    // The BM25F twin of termUpperBounds: params key (bm25fParamsKey) → term → max
+    // BM25F single-term score over the live index. Keyed by params VALUE so a weight
+    // change (settings or a seek:search override) never reads a bound computed under
+    // other weights; a few param sets are kept so an A/B can alternate without
+    // thrashing. Cleared with termUpperBounds on every mutation (clearBounds).
+    private bm25fUpperBounds = new Map<string, Map<string, number>>();
+    // BM25F corpus state (lengths + row map), null until first BM25F use after a
+    // fit/fromJSON — see Bm25fState. The scratch buffers are reused across queries.
+    private bf: Bm25fState | null = null;
+    private readonly bfScratch = new Bm25fScratch();
+    private warnedBm25fInternals = false;
     // Cumulative 'version_conflict' warnings from MiniSearch (see the logger in
     // buildMiniOptions): a removeExact() whose reconstructed doc disagreed with
     // what was indexed. removeExact snapshots this around mini.remove() to report
@@ -578,7 +678,8 @@ export class MultiFieldBM25 {
         this.mapChunkIds(chunks);
         const mini = new MiniSearch<IndexedDoc>(this.buildMiniOptions(this.withProps, this.withHeadings));
         this.mini = mini;
-        this.termUpperBounds.clear();   // fresh index → drop memoized per-term UBs
+        this.clearBounds();   // fresh index → drop memoized per-term UBs
+        this.bf = null;       // BM25F lengths rebuild lazily from the new postings
         return { mini, docs: chunks.map(c => this.buildDoc(c, bodies.get(c.chunk_id) ?? '')) };
     }
 
@@ -724,7 +825,8 @@ export class MultiFieldBM25 {
         this.withHeadings = opts?.headingsField === true;
         this.mapChunkIds(chunks);
         this.mini = MiniSearch.loadJSON<IndexedDoc>(json, this.buildMiniOptions(this.withProps, this.withHeadings));
-        this.termUpperBounds.clear();   // loaded index → drop any memoized UBs
+        this.clearBounds();   // loaded index → drop any memoized UBs
+        this.bf = null;       // BM25F lengths are not persisted: rebuilt from the loaded postings
         return this;
     }
 
@@ -786,22 +888,97 @@ export class MultiFieldBM25 {
     // bare prefix like "rearch") has bound 0 with nonzero derived scores — fusion
     // falls back to /max for that query. Fuzzy side validated on the D&D typo slice
     // (2026-06-09); prefix side on the harness prefix arm (2026-06-10).
-    getQueryBound(query: string, boosts?: Record<string, number>): number {
-        if (!this.mini || !query.trim()) return 0;
+    //
+    // BM25F (`bm25f` passed): the SAME Σ_t UB(t) over the same token occurrences, with
+    // UB(t) = the max BM25F single-term score (bm25fUpperBound) — the bound measures
+    // term rarity again instead of "appears in some short title" (shipped UB(`bar`)
+    // 158, title-driven; BM25F k1 5: 23, near its idf·(k1+1+δ) ceiling).
+    //
+    // Fuzzy-aware OOV terms (`fuzzy` passed, 2026-11-12): an OOV term that fuzzy
+    // derivation CAN reach is bounded by its best derived term, w·UB(t'), with
+    // w = 0.45·L/(L+dist) the same weight the scorer applies. Without this a MIXED
+    // typo query ("fy27 plannign") was bounded by its indexed terms alone, so every
+    // doc holding fy27 + fuzzy "planning" overshot the bound, clipped to 1.0 and
+    // tied, leaving dense + recency to order the whole head. In-vocab terms are
+    // untouched (clean queries are bit-identical), and a fully-OOV query that fuzzy
+    // reaches now gets a real bound instead of the /max fallback. The max over
+    // derived terms (not their sum) keeps the "best correction" reading; a doc
+    // holding several variants can still exceed it and clip, as before.
+    getQueryBound(
+        query: string,
+        boosts?: Record<string, number>,
+        bm25f?: Bm25fParams,
+        fuzzy?: SearchOverrides['fuzzy'],
+        prefix?: SearchOverrides['prefix'],
+    ): number {
+        return this.queryBoundAndTerms(query, boosts, bm25f, fuzzy, prefix).bound;
+    }
+
+    // True when the prefix spec fires for terms[i] and the index holds a longer
+    // term starting with it (the scorer's atPrefix derivation would apply).
+    private hasPrefixExtension(
+        m: MiniInternals,
+        prefix: SearchOverrides['prefix'],
+        term: string, i: number, terms: string[],
+    ): boolean {
+        const px = typeof prefix === 'function' ? prefix(term, i, terms) : prefix === true;
+        if (!px) return false;
+        for (const [t] of m._index.atPrefix(term)) if (t.length > term.length) return true;
+        return false;
+    }
+
+    // One pass for the bound AND the coverage denominator, so the two can never
+    // disagree about which query terms are matchable: `matchable` = the distinct
+    // processed terms with a positive (exact or fuzzy-reached) UB.
+    private queryBoundAndTerms(
+        query: string,
+        boosts: Record<string, number> | undefined,
+        bm25f: Bm25fParams | undefined,
+        fuzzy: SearchOverrides['fuzzy'],
+        prefix?: SearchOverrides['prefix'],
+    ): { bound: number; matchable: Set<string> } {
+        const matchable = new Set<string>();
+        if (!this.mini || !query.trim()) return { bound: 0, matchable };
         const fieldBoosts = boosts ?? this.fieldBoosts;
         // All-stopword fallback (S2): bound the kept literal terms via the same
         // keep-stopword processing the fallback search uses, so e.g. "will" bounds
         // against the exempt index instead of riding the empirical-/max path.
         const allStopword = isAllStopwordQuery(query);
-        let perTermSum = 0;
+        const terms: string[] = [];
         for (const raw of seekTokenize(query)) {
             const term = allStopword ? keepStopwordsProcessTerm(raw) : processTerm(raw);
-            if (!term) continue;
-            const ub = this.termUpperBound(term, fieldBoosts, allStopword);
-            if (ub <= 0) continue;            // OOV in every field → can't score
-            perTermSum += ub;                 // per-occurrence (mirrors the OR sum)
+            if (term) terms.push(term);
         }
-        return perTermSum;
+        const ubOf = (t: string): number => bm25f
+            ? this.bm25fUpperBound(t, bm25f)
+            : this.termUpperBound(t, fieldBoosts, allStopword);
+        const m = fuzzy && !allStopword ? miniInternals(this.mini) : null;
+        let perTermSum = 0;
+        for (let i = 0; i < terms.length; i++) {
+            const term = terms[i];
+            let ub = ubOf(term);
+            // A prefix-eligible OOV term with prefix extensions ("amster" mid-type
+            // before "amsterdam") is scored mainly through those extensions, which
+            // this fuzzy bound doesn't model. Leave it unbounded (and out of the
+            // coverage denominator), so a lone half-typed token keeps the /max
+            // fallback instead of a fuzzy-neighbour bound ("master") that clips the
+            // head to ties. Matches the pre-2026-11-12 behaviour for typeahead.
+            if (ub <= 0 && m && !this.hasPrefixExtension(m, prefix, term, i, terms)) {
+                const maxDist = fuzzyMaxDist(fuzzy, term, i, terms);
+                if (maxDist) {
+                    for (const [t, [, dist]] of m._index.fuzzyGet(term, maxDist)) {
+                        if (!dist) continue;
+                        const w = MS_FUZZY_WEIGHT * t.length / (t.length + dist);
+                        const u = w * ubOf(t);
+                        if (u > ub) ub = u;
+                    }
+                }
+            }
+            if (ub <= 0) continue;            // unreachable in every field → can't score
+            perTermSum += ub;                 // per-occurrence (mirrors the OR sum)
+            matchable.add(term);
+        }
+        return { bound: perTermSum, matchable };
     }
 
     // Max achievable EXACT single-term candidate score for `term` over the live
@@ -835,10 +1012,337 @@ export class MultiFieldBM25 {
         return mx;
     }
 
+    private clearBounds(): void {
+        this.termUpperBounds.clear();
+        this.bm25fUpperBounds.clear();
+    }
+
+    // ── BM25F (bm25f.ts) ─────────────────────────────────────────────────────
+    // Hand-rolled over MiniSearch's per-field postings rather than a MiniSearch
+    // fork: the postings (term → field → doc → tf), the radix tree (prefix /
+    // fuzzy derivation) and the liveness map are everything BM25F needs, and none
+    // of it changes shape — the persisted blob, the analyzer and the incremental
+    // add/remove contract are untouched, so the legacy path stays one flag away.
+
+    // UB(t) under BM25F: the max BM25F single-term score for the EXACT term over the
+    // live index (incl. a tolerant-load ghost, as the legacy search-based UB does).
+    // Memoized per params value (see bm25fUpperBounds), cleared with the legacy UBs
+    // on every mutation. 0 for an OOV term. Public for the parity test + telemetry.
+    bm25fUpperBound(term: string, p: Bm25fParams = BM25F_PARAMS): number {
+        const m = miniInternals(this.mini);
+        if (!m) return 0;
+        const pk = bm25fParamsKey(p);
+        let memo = this.bm25fUpperBounds.get(pk);
+        if (!memo) {
+            if (this.bm25fUpperBounds.size >= 8) {   // oldest param set out
+                this.bm25fUpperBounds.delete(this.bm25fUpperBounds.keys().next().value as string);
+            }
+            memo = new Map();
+            this.bm25fUpperBounds.set(pk, memo);
+        }
+        const hit = memo.get(term);
+        if (hit !== undefined) return hit;
+        let mx = 0;
+        const data = m._index.get(term);
+        if (data) {
+            const st = this.bm25fState(m);
+            const n = bm25fScoreTerm(data, this.bm25fFieldStats(m, st, p), st.rowOf,
+                m._documentCount, p.k1, p.d, this.bfScratch);
+            const sc = this.bfScratch.score;
+            for (let i = 0; i < n; i++) if (sc[i] > mx) mx = sc[i];
+        }
+        memo.set(term, mx);
+        return mx;
+    }
+
+    // Per-row BM25F single-term scores for one processed term (the parity test's
+    // per-term check; not on the search path). Rows without the term stay 0.
+    bm25fTermScores(term: string, p: Bm25fParams = BM25F_PARAMS): Float64Array {
+        const out = new Float64Array(this.chunkCount);
+        const m = miniInternals(this.mini);
+        const data = m?._index.get(term);
+        if (!m || !data) return out;
+        const st = this.bm25fState(m);
+        const n = bm25fScoreTerm(data, this.bm25fFieldStats(m, st, p), st.rowOf,
+            m._documentCount, p.k1, p.d, this.bfScratch);
+        const { touched, score } = this.bfScratch;
+        for (let i = 0; i < n; i++) {
+            const row = st.rowOf[touched[i]];
+            if (row >= 0) out[row] = score[i];
+        }
+        return out;
+    }
+
+    // Corpus statistics the BM25F scorer reads (diagnostics + the parity test):
+    // N, and per field the average processed length and each row's length.
+    bm25fStats(): { n: number; avgLen: Record<string, number>; lenOf(row: number, field: string): number } | null {
+        const m = miniInternals(this.mini);
+        if (!m) return null;
+        const st = this.bm25fState(m);
+        const n = m._documentCount;
+        const avgLen: Record<string, number> = {};
+        for (const [field, fid] of Object.entries(m._fieldIds)) avgLen[field] = n > 0 ? st.lenSum[fid] / n : 0;
+        const sidOfRow = new Map<number, number>();
+        for (let sid = 0; sid < st.rowOf.length; sid++) if (st.rowOf[sid] >= 0) sidOfRow.set(st.rowOf[sid], sid);
+        return {
+            n, avgLen,
+            lenOf: (row, field) => {
+                const sid = sidOfRow.get(row);
+                const fid = m._fieldIds[field];
+                return sid === undefined || fid === undefined ? 0 : st.len[fid][sid];
+            },
+        };
+    }
+
+    // Build the lazy BM25F state now (the full lengths pass + row map) instead of on
+    // the first BM25F query. Optional — the state builds itself on demand — but lets
+    // a caller pay it where it already pays the fit/load (search.ts ensureBm25).
+    warmBm25f(): void {
+        const m = miniInternals(this.mini);
+        if (m) this.bm25fState(m);
+    }
+
+    private bm25fState(m: MiniInternals): Bm25fState {
+        let st = this.bf;
+        if (!st) {
+            st = this.buildBm25fLengths(m);
+            this.bf = st;
+        }
+        if (st.rowsDirty) this.rebuildBm25fRows(m, st);
+        this.bfScratch.ensure(m._nextId);   // every kernel caller goes through here
+        return st;
+    }
+
+    // The one full pass: every field's processed-token length per live doc is the
+    // sum of its tf over the postings (MiniSearch's addTerm increments tf once per
+    // processed token), so no body re-fetch or re-tokenization is needed — which is
+    // what lets a fromJSON-loaded index (no bodies in hand) get exact lengths.
+    // O(total postings); runs once per fit/load, never per delta.
+    private buildBm25fLengths(m: MiniInternals): Bm25fState {
+        const nf = Object.keys(m._fieldIds).length;
+        const cap = m._nextId;
+        const alive = new Uint8Array(cap);
+        for (const sid of m._documentIds.keys()) if (sid < cap) alive[sid] = 1;
+        const len: Float64Array[] = [];
+        const lenSum: number[] = [];
+        for (let f = 0; f < nf; f++) { len.push(new Float64Array(cap)); lenSum.push(0); }
+        for (const [, data] of m._index) {
+            for (const [fid, docs] of data) {
+                const L = len[fid];
+                if (!L) continue;
+                let s = 0;
+                for (const [sid, tf] of docs) {
+                    if (alive[sid] !== 1) continue;
+                    L[sid] += tf;
+                    s += tf;
+                }
+                lenSum[fid] += s;
+            }
+        }
+        return { len, lenSum, rowOf: new Int32Array(0), rowsDirty: true };
+    }
+
+    private rebuildBm25fRows(m: MiniInternals, st: Bm25fState): void {
+        const cap = m._nextId;
+        const rowOf = st.rowOf.length >= cap ? st.rowOf : new Int32Array(Math.max(cap, Math.ceil(st.rowOf.length * 1.5)));
+        rowOf.fill(-1);
+        for (const [sid, ext] of m._documentIds) {
+            const row = this.idToIdx.get(ext);
+            rowOf[sid] = row === undefined ? -2 : row;
+        }
+        st.rowOf = rowOf;
+        st.rowsDirty = false;
+    }
+
+    private bm25fFieldStats(m: MiniInternals, st: Bm25fState, p: Bm25fParams): Array<Bm25fFieldStats | undefined> {
+        const n = m._documentCount;
+        const out: Array<Bm25fFieldStats | undefined> = [];
+        for (const [field, fid] of Object.entries(m._fieldIds)) {
+            const avg = n > 0 ? st.lenSum[fid] / n : 0;
+            out[fid] = {
+                weight: bm25fFieldWeight(p, field),
+                b: bm25fFieldB(p, field),
+                avg: avg || 1,                   // harness `avg_len[f] or 1.0`
+                len: st.len[fid],
+            };
+        }
+        return out;
+    }
+
+    // Incremental length maintenance (only once the lazy state exists — before
+    // that, the full pass will see the change in the postings anyway).
+    // bm25fForget: BEFORE the doc leaves MiniSearch (its short id is still mapped).
+    private bm25fForget(id: string): void {
+        const st = this.bf;
+        if (!st) return;
+        st.rowsDirty = true;
+        const m = miniInternals(this.mini);
+        const sid = m?._idToShortId.get(id);
+        if (sid === undefined) return;
+        for (let f = 0; f < st.len.length; f++) {
+            const L = st.len[f];
+            if (sid < L.length) {
+                st.lenSum[f] -= L[sid];
+                L[sid] = 0;
+            }
+        }
+    }
+
+    // bm25fLearn: AFTER mini.add(doc). Counts the doc's processed tokens per field
+    // exactly as MiniSearch's add() emits postings — tokenize (seekTokenize, the
+    // wrapper ignores the field) then processTerm(term, field), truthy only — so
+    // the result equals what the full postings pass would compute for it.
+    private bm25fLearn(id: string, doc: IndexedDoc): void {
+        const st = this.bf;
+        if (!st) return;
+        st.rowsDirty = true;
+        const m = miniInternals(this.mini);
+        const sid = m?._idToShortId.get(id);
+        if (!m || sid === undefined) return;
+        for (let f = 0; f < st.len.length; f++) {
+            if (st.len[f].length <= sid) {
+                const grown = new Float64Array(Math.max(sid + 1, Math.ceil(st.len[f].length * 1.5), 64));
+                grown.set(st.len[f]);
+                st.len[f] = grown;
+            }
+        }
+        for (const [field, fid] of Object.entries(m._fieldIds)) {
+            const v = (doc as unknown as Record<string, unknown>)[field];
+            if (v == null || !st.len[fid]) continue;
+            let count = 0;
+            for (const tok of seekTokenize(String(v))) if (processTerm(tok, field)) count++;
+            st.len[fid][sid] = count;
+            st.lenSum[fid] += count;
+        }
+    }
+
+    // The BM25F query loop. Runs the query exactly as MiniSearch's executeQuery /
+    // executeQuerySpec would — same tokenize + processTerm (incl. the synonym
+    // wrapper that emits mates BEFORE their source), same per-term predicates
+    // (termToQuerySpec), same derivation (exact, then atPrefix extensions at
+    // 0.375·L/(L+0.3Δ) taking precedence over fuzzyGet matches at 0.45·L/(L+dist),
+    // distance-0 skipped), same boostTerm discount on mates — but each (derived)
+    // term is scored by the BM25F kernel instead of the per-field sum. A derived term
+    // contributes weight × its OWN BM25F score (own postings, own doc-level IDF),
+    // the harness's `add(d, w, src)`, and fills its SOURCE term's coverage slot (a
+    // mate fills every source it stands in for). No `quality` multiplier is ever
+    // applied, so the stored score is the pure additive sum the legacy path only
+    // reaches by dividing MiniSearch's ×quality back out.
+    private scoreBm25f(
+        query: string,
+        p: Bm25fParams,
+        m: MiniInternals,
+        q: {
+            processTerm: (raw: string) => string | string[] | null;
+            fuzzy: SearchOverrides['fuzzy'];
+            prefix: SearchOverrides['prefix'];
+            m2s: Map<string, string[]> | undefined;
+            synWeight: number;
+            totalTerms: number;
+        },
+        scores: Float64Array,
+        coverage: Float64Array,
+    ): void {
+        const st = this.bm25fState(m);
+        const fields = this.bm25fFieldStats(m, st, p);
+        const scratch = this.bfScratch;
+        const nDocs = m._documentCount;
+        const rowOf = st.rowOf;
+
+        const terms: string[] = [];
+        for (const raw of seekTokenize(query)) {
+            const t = q.processTerm(raw);
+            if (Array.isArray(t)) { for (const x of t) if (x) terms.push(x); }
+            else if (t) terms.push(t);
+        }
+
+        // Coverage slots: one per distinct SOURCE term. ≤32 ride a per-row bitmask
+        // (the common case by far); any beyond spill to a per-row Set.
+        const slotOf = new Map<string, number>();
+        const slot = (src: string): number => {
+            let s = slotOf.get(src);
+            if (s === undefined) { s = slotOf.size; slotOf.set(src, s); }
+            return s;
+        };
+        const mask = new Uint32Array(this.chunkCount);
+        const overflow = new Map<number, Set<number>>();
+        const hitRows: number[] = [];
+
+        const apply = (data: Postings | undefined, weight: number, slots: number[]): void => {
+            if (!data) return;
+            const n = bm25fScoreTerm(data, fields, rowOf, nDocs, p.k1, p.d, scratch);
+            const { touched, score } = scratch;
+            for (let i = 0; i < n; i++) {
+                const s = score[i];
+                if (!(s > 0)) continue;
+                const row = rowOf[touched[i]];
+                if (row < 0) continue;            // ghost: counts in N/df, has no frame row
+                if (scores[row] === 0) hitRows.push(row);
+                scores[row] += weight * s;
+                for (const sl of slots) {
+                    if (sl < 32) mask[row] |= 1 << sl;
+                    else {
+                        let set = overflow.get(row);
+                        if (!set) { set = new Set(); overflow.set(row, set); }
+                        set.add(sl);
+                    }
+                }
+            }
+        };
+
+        for (let i = 0; i < terms.length; i++) {
+            const term = terms[i];
+            // termToQuerySpec (dist v7.2.0)
+            const px = typeof q.prefix === 'function' ? q.prefix(term, i, terms) : q.prefix === true;
+            const termBoost = q.m2s?.has(term) ? q.synWeight : 1;
+            const slots = (q.m2s?.get(term) ?? [term]).map(slot);
+
+            apply(m._index.get(term), termBoost, slots);
+            // executeQuerySpec (dist v7.2.0)
+            let fuzzyMatches: Map<string, [Postings, number]> | undefined;
+            const maxDist = fuzzyMaxDist(q.fuzzy, term, i, terms);
+            if (maxDist) fuzzyMatches = m._index.fuzzyGet(term, maxDist);
+            if (px) {
+                for (const [t, data] of m._index.atPrefix(term)) {
+                    const dist = t.length - term.length;
+                    if (!dist) continue;                 // the exact term, scored above
+                    fuzzyMatches?.delete(t);             // prefix takes precedence
+                    apply(data, termBoost * MS_PREFIX_WEIGHT * t.length / (t.length + 0.3 * dist), slots);
+                }
+            }
+            if (fuzzyMatches) {
+                for (const [t, [data, dist]] of fuzzyMatches) {
+                    if (!dist) continue;
+                    apply(data, termBoost * MS_FUZZY_WEIGHT * t.length / (t.length + dist), slots);
+                }
+            }
+        }
+
+        // Coverage (soft-AND, applied ^BM25_COVERAGE_POW downstream): matched
+        // distinct source terms / indexed query terms, clamped at 1 (a fuzzy-matched
+        // OOV source can push the count past the indexed denominator).
+        const total = q.totalTerms;
+        for (const row of hitRows) {
+            let cnt = popcount32(mask[row]);
+            const extra = overflow.get(row);
+            if (extra) cnt += extra.size;
+            coverage[row] = total > 1 ? Math.min(1, cnt / total) : 1;
+        }
+    }
+
     // Fraction of docs containing `term` in ANY field (max over fields) —
     // feeds the synonym dictionary's df ceiling (synonyms.ts). Same defensive
     // internals-reach as getQueryBound; 0 when unavailable, which makes the
     // df guard a no-op rather than a false positive.
+    // True when the processed `term` has postings in the index (any field). The
+    // title gate's fuzzy eligibility check (search.ts → fusion.ts TitleFuzzy): only
+    // an OOV token is treated as a typo. True when internals are unavailable, which
+    // makes the caller fall back to exact-only (never fuzzes a real word).
+    hasIndexedTerm(term: string): boolean {
+        const m = miniInternals(this.mini);
+        return m ? m._index.get(term) !== undefined : true;
+    }
+
     termDocFraction(term: string): number {
         const mini = this.mini as unknown as {
             _index?: { get(term: string): Map<number, Map<number, number>> | undefined };
@@ -856,31 +1360,14 @@ export class MultiFieldBM25 {
         return maxDf / n;
     }
 
-    // Coverage denominator: the distinct processed query terms that are
-    // INDEXED (present in MiniSearch's term index at all). Mirrors
-    // getQueryBound's indexed-terms-only design (its D factor): a term absent
-    // from the index can never be matched by ANY doc, so counting it would
-    // uniformly cap every doc's coverage at (T−1)/T — attenuating the whole
-    // BM25 channel vs dense for one OOV query term, contradicting the bound.
-    // Aligning the two means a doc matching every MATCHABLE term keeps full
-    // lexical weight. (482-q eval revalidation of this alignment is pending —
-    // harness session in flight.) Same defensive internals-reach as
-    // getQueryBound; if the internals are missing we fall back to the
-    // unfiltered count — the pre-fix behavior, which only ever UNDER-credits
-    // coverage, never inflates it.
-    private indexedQueryTerms(query: string): Set<string> {
-        const all = distinctQueryTerms(query);
-        const mini = this.mini as unknown as {
-            _index?: { get(term: string): unknown };
-        } | null;
-        const index = mini?._index;
-        if (!index || typeof index.get !== 'function') return all;
-        const out = new Set<string>();
-        for (const t of all) {
-            if (index.get(t) !== undefined) out.add(t);
-        }
-        return out;
-    }
+    // Coverage denominator (queryBoundAndTerms `matchable`): the distinct
+    // processed query terms with a positive UB, exact or fuzzy-reached. Mirrors
+    // the bound by construction: a term NO doc can match would uniformly cap
+    // every doc's coverage at (T−1)/T, attenuating the whole BM25 channel vs
+    // dense for one unreachable query term, contradicting the bound. Aligning the
+    // two means a doc matching every MATCHABLE term keeps full lexical weight.
+    // (Replaced indexedQueryTerms / bm25fIndexedTermCount 2026-11-12; UB > 0 also
+    // drops a term whose every posting is a discard() tombstone.)
 
     // As getScores, but also returns a per-doc COVERAGE weight in [0,1]: the
     // fraction of distinct query terms the doc matched (MiniSearch's own
@@ -899,13 +1386,25 @@ export class MultiFieldBM25 {
         const scores = new Float64Array(this.chunkCount);
         const coverage = new Float64Array(this.chunkCount);
         if (!this.mini || !query.trim()) return { scores, coverage, bound: 0 };
-        const bound = this.getQueryBound(query, opts?.boosts);
-
-        // Distinct INDEXED query terms = coverage denominator (see
-        // indexedQueryTerms for why OOV terms are excluded). >1 ⇒ a genuine
-        // multi-term query where partial matches should be discounted; ≤1 ⇒ every
-        // match covers the whole matchable query, so weight is a flat 1 (no-op).
-        const totalTerms = this.indexedQueryTerms(query).size;
+        // BM25F (opts.bm25f) reads MiniSearch internals; if their shape ever changes
+        // (a MiniSearch upgrade) it degrades to the legacy per-field path with one
+        // warning instead of silently zeroing the lexical channel.
+        const bfParams = opts?.bm25f;
+        const bfMini = bfParams ? miniInternals(this.mini) : null;
+        if (bfParams && !bfMini && !this.warnedBm25fInternals) {
+            this.warnedBm25fInternals = true;
+            console.warn('[seek] BM25F: MiniSearch internals unavailable; using the per-field BM25 path');
+        }
+        const bm25f = bfMini ? bfParams : undefined;
+        // Bound + coverage denominator from one pass (queryBoundAndTerms). The
+        // denominator = distinct MATCHABLE query terms: indexed, or OOV but reached
+        // by fuzzy derivation (see indexedQueryTerms for why unreachable OOV terms
+        // are excluded). >1 ⇒ a genuine multi-term query where partial matches
+        // should be discounted; ≤1 ⇒ every match covers the whole matchable query,
+        // so weight is a flat 1 (no-op). A fuzzy-reached typo now holds its own
+        // slot, so "fy27 plannign" discounts a doc that only has fy27.
+        const { bound, matchable } = this.queryBoundAndTerms(query, opts?.boosts, bm25f, opts?.fuzzy, opts?.prefix);
+        const totalTerms = matchable.size;
 
         // ---- synonym expansion plumbing (per-call; dictionary from synonyms.ts)
         // Native MiniSearch path: a query-time processTerm may return an
@@ -1002,6 +1501,18 @@ export class MultiFieldBM25 {
         // the v0.0.1 contract (every chunk gets a score; misses are 0).
         // The `cond && {key}` spreads are no-ops when the override is absent,
         // so an empty object falls through to the baked-in defaults.
+        if (bm25f && bfMini) {
+            this.scoreBm25f(query, bm25f, bfMini, {
+                processTerm: synProcessTerm ?? (allStopword ? keepStopwordsProcessTerm : processTerm),
+                fuzzy: fuzzyOverride,
+                prefix: opts?.prefix,
+                m2s,
+                synWeight,
+                totalTerms,
+            }, scores, coverage);
+            return { scores, coverage, bound };
+        }
+
         const results = this.mini.search(query, {
             ...(opts?.boosts && { boost: opts.boosts }),
             ...(fuzzyOverride !== undefined && { fuzzy: fuzzyOverride }),
@@ -1090,9 +1601,14 @@ export class MultiFieldBM25 {
     add(chunk: ChunkMeta, body: string): number {
         if (!this.mini) throw new Error('MultiFieldBM25.add() before fit()');
         const row = this.chunkCount;
-        if (!this.idToIdx.has(chunk.chunk_id) && this.mini.has(chunk.chunk_id)) this.mini.discard(chunk.chunk_id);
-        this.mini.add(this.buildDoc(chunk, body));
-        this.termUpperBounds.clear();   // corpus changed → recompute UBs on next bound
+        if (!this.idToIdx.has(chunk.chunk_id) && this.mini.has(chunk.chunk_id)) {
+            this.bm25fForget(chunk.chunk_id);
+            this.mini.discard(chunk.chunk_id);
+        }
+        const doc = this.buildDoc(chunk, body);
+        this.mini.add(doc);
+        this.bm25fLearn(chunk.chunk_id, doc);
+        this.clearBounds();   // corpus changed → recompute UBs on next bound
         this.idToIdx.set(chunk.chunk_id, row);
         this.chunkCount = row + 1;
         return row;
@@ -1111,11 +1627,12 @@ export class MultiFieldBM25 {
     remove(id: string): void {
         if (!this.mini || !this.idToIdx.has(id)) return;
         this.idToIdx.delete(id);
+        this.bm25fForget(id);
         try { this.mini.discard(id); } catch { /* ghost posting from a tolerant load — already absent */ }
         // Drop memoized UBs: the next getQueryBound re-searches the live index,
         // whose results already exclude the discarded doc — so the bound honors
         // this tombstone synchronously, with no vacuum (the incremental contract).
-        this.termUpperBounds.clear();
+        this.clearBounds();
     }
 
     // Exact synchronous removal (issue #5): remove a chunk's postings IMMEDIATELY
@@ -1144,14 +1661,18 @@ export class MultiFieldBM25 {
         const id = chunk.chunk_id;
         if (!this.mini || !this.idToIdx.has(id)) return 'noop';
         this.idToIdx.delete(id);
-        this.termUpperBounds.clear();
+        this.clearBounds();
         // The blob-missing tolerance (see remove()): an id tracked by the live
         // row space but absent from a tolerantly-loaded blob's postings. Checked
         // EXPLICITLY rather than via catch — MiniSearch only throws before
         // touching postings for its two id guards; a throw anywhere later
         // (tokenizer, per-term removal) happens MID-mutation, and reporting that
         // as a clean 'noop' would let the caller commit a half-removed index.
-        if (!this.mini.has(id)) return 'noop';
+        if (!this.mini.has(id)) {
+            if (this.bf) this.bf.rowsDirty = true;   // the row left idToIdx all the same
+            return 'noop';
+        }
+        this.bm25fForget(id);
         const before = this.removalMismatchCount;
         try {
             this.mini.remove(this.buildDoc(chunk, body));
@@ -1178,7 +1699,7 @@ export class MultiFieldBM25 {
     async vacuum(): Promise<void> {
         if (!this.mini) return;
         await this.mini.vacuum();
-        this.termUpperBounds.clear();   // postings compacted → recompute UBs
+        this.clearBounds();   // postings compacted → recompute UBs
     }
 
     // Drift-detector / compaction surface. size = chunkCount = R (rows incl
