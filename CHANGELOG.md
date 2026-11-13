@@ -2,6 +2,40 @@
 
 All notable changes to Seek are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## 1.3.0
+
+Seek 1.3 brings two big improvements: Search quality and **SPEED**.
+
+**This update needs a one-time reindex!**
+
+If you use Seek on several devices, reindex on one desktop and the others pick up its index through your vault sync instead of rebuilding. A reindex can be paused from settings.
+
+### Added
+- Seek's own GPU engine! On desktop and mobile Seek now embeds with a purpose-built WebGPU encoder instead of ONNX Runtime's WebGPU path. A full write up on what was changed is on my blog.
+
+### Changed
+- If you set Recency to use a date property, notes without that property no longer get a recency boost.
+- Better keyword ranking in notes with multiple properties
+- Title bonus stages are lower. As a result of the property changes, title boosting is slightly lowered in absolute terms. It's still there, and no changes are required here from you.
+- Typos are handled much better. A query with a misspelled word ("budget plannign") used to rank poorly, because the misspelled word couldn't count toward the score's ceiling and couldn't match titles. Both now account for close spellings, and in our typo evaluations the right note comes first noticeably more often.
+- Typing a name finds it sooner. The last word you type now matches the start of a title or alias from its first letter ("jane d" finds Jane Doe), and an exact title still ranks above a longer title that merely starts with your word.
+- Small notes with several headings are indexed as one piece, so a short note isn't split into fragments that each match only part of a query.
+- Long sections are split more accurately, so no part loses the end of its text to the model's length limit.
+- Search reacts a little faster on desktop (150 ms after you stop typing, was 200 ms).
+
+### Fixed
+- Mass file re-stamps no longer trigger reindexing. When iCloud or a vault reorganization updated thousands of modified times without changing content, Seek queued every one of those notes. It now checks whether the content actually changed.
+- When opening results in longer notes, sometimes the note would open in the middle of the section matching your query. It now opens to the top of the relevant section for better readability.
+- Full reindex on iPhone is far lighter. Edits detected during a full reindex were compared against the half-built index, so nearly every note was queued a second time. They now wait until the pass finishes.
+- Lower memory use while idle.
+- Choosing "Balanced" as the search strategy no longer silently resets the semantic weight to an older value. If yours was affected, it is repaired on update.
+- A double-click or a held Enter key no longer opens a result twice.
+- On phones, long option rows in settings wrap so every Compute option is reachable, and the search window's close button lines up correctly with themes that change modal padding.
+
+### Other
+- Logging report schema bumped to v20. It records how a result was opened, which section was shown, and which keyword model scored the search.
+- `seek:search` accepts per-query keyword-weight overrides (`title=`, `aliases=`, `props=`, `body=`, `k1=`) for experimentation.
+
 ## 1.2.1
 
 ### Added
